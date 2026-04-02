@@ -32,6 +32,8 @@ install_xray() {
         warn "Xray 已安装，跳过"
         return
     fi
+    apt-get update -qq
+    apt-get install -y -qq unzip curl
     curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
     bash /tmp/xray-install.sh install
     [[ $? -ne 0 ]] && error "安装失败，请检查网络" && exit 1
@@ -48,9 +50,8 @@ init_config() {
     touch "$USER_DB"
 
     # 生成 Reality 密钥对
-    KEYS=$($XRAY_BIN x25519)
-    PRIVATE_KEY=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
+    PRIVATE_KEY=$($XRAY_BIN x25519 | grep "Private" | awk '{print $3}')
+    PUBLIC_KEY=$($XRAY_BIN x25519 -i "$PRIVATE_KEY" | grep "Public" | awk '{print $3}')
 
     read -rp "监听端口 [默认 443]: " PORT
     PORT=${PORT:-443}
