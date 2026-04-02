@@ -1,6 +1,5 @@
 #!/bin/bash
-# VLESS+Reality 一键管理脚本 v2.0
-# 支持：安装/卸载 xray、添加/删除/禁用/启用用户、到期自动禁用、查看节点信息
+# VLESS+Reality 一键管理脚本 v3.0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -22,7 +21,7 @@ title() { echo -e "\n${CYAN}$1${NC}"; }
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
 
 # ============================================================
-# 修复 apt 源（Debian bullseye）
+# 修复 apt 源
 # ============================================================
 fix_apt() {
     if grep -q "bullseye" /etc/os-release 2>/dev/null; then
@@ -71,26 +70,35 @@ uninstall_xray() {
 
     systemctl stop xray 2>/dev/null
     systemctl disable xray 2>/dev/null
-
     curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
     bash /tmp/xray-install.sh remove
-
     rm -rf /usr/local/etc/xray
     rm -f /var/log/xray/access.log /var/log/xray/error.log
-    crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
-
+    # 清理所有相关 cron
+    crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray" | crontab -
     info "Xray 已完全卸载"
     exit 0
 }
 
 # ============================================================
-# 生成密钥对（兼容新版 xray 输出格式）
+# 生成密钥对
 # ============================================================
 gen_keypair() {
     local OUTPUT
     OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey\|Private" | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Password\|Public" | head -1 | awk '{print $NF}')
+}
+
+# ============================================================
+# 检查端口是否占用
+# ============================================================
+check_port() {
+    local PORT=$1
+    if ss -tlnp | grep -q ":${PORT} "; then
+        return 1
+    fi
+    return 0
 }
 
 # ============================================================
@@ -102,18 +110,23 @@ init_config() {
     touch "$USER_DB"
 
     gen_keypair
-
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         error "密钥生成失败，请检查 xray 是否正确安装"
         return
     fi
 
-    read -rp "监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
+    while true; do
+        read -rp "监听端口 [默认 443]: " PORT
+        PORT=${PORT:-443}
+        if check_port "$PORT"; then
+            break
+        else
+            warn "端口 ${PORT} 已被占用，请换一个"
+        fi
+    done
 
     read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
     SNI=${SNI:-www.microsoft.com}
-
     SHORTID=$(openssl rand -hex 4)
 
     cat > "$XRAY_CONFIG" <<EOF
@@ -158,6 +171,7 @@ EOF
     systemctl enable xray
     systemctl restart xray
 
+    sleep 1
     if systemctl is-active --quiet xray; then
         info "配置完成，Xray 已启动"
         info "公钥: ${PUBLIC_KEY}"
@@ -200,6 +214,36 @@ PYEOF
 }
 
 # ============================================================
+# 打印节点分享链接
+# ============================================================
+_print_link() {
+    local USERNAME=$1
+    local UUID=$2
+    local EXPIRE=$3
+    load_meta
+    local SERVER_IP
+    SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
+    local SHORTID
+    SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
+
+    echo ""
+    echo -e "${GREEN}===== 节点信息 =====${NC}"
+    echo -e "用户名 : ${USERNAME}"
+    echo -e "UUID   : ${UUID}"
+    echo -e "到期   : ${EXPIRE}"
+    echo -e "地址   : ${SERVER_IP}"
+    echo -e "端口   : ${PORT}"
+    echo -e "公钥   : ${PUBLIC_KEY}"
+    echo -e "SNI    : ${SNI}"
+    echo -e "ShortID: ${SHORTID}"
+    echo ""
+    local LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}"
+    echo -e "${CYAN}分享链接:${NC}"
+    echo "$LINK"
+    echo ""
+}
+
+# ============================================================
 # 添加用户
 # ============================================================
 add_user() {
@@ -214,33 +258,36 @@ add_user() {
         return
     fi
 
-    read -rp "到期天数 [默认 30 天]: " DAYS
-    DAYS=${DAYS:-30}
-    EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
-    UUID=$(cat /proc/sys/kernel/random/uuid)
+    echo "到期方式："
+    echo "  1. 输入天数（如 30）"
+    echo "  2. 输入具体日期（如 2026-12-31）"
+    read -rp "选择 [1/2，默认1]: " EXPIRE_MODE
+    EXPIRE_MODE=${EXPIRE_MODE:-1}
 
+    if [[ "$EXPIRE_MODE" == "2" ]]; then
+        read -rp "到期日期 (YYYY-MM-DD): " EXPIRE
+        if ! date -d "$EXPIRE" +%Y-%m-%d &>/dev/null; then
+            error "日期格式错误"
+            return
+        fi
+        EXPIRE=$(date -d "$EXPIRE" +%Y-%m-%d)
+    else
+        read -rp "到期天数 [默认 30 天]: " DAYS
+        DAYS=${DAYS:-30}
+        EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
+    fi
+
+    UUID=$(cat /proc/sys/kernel/random/uuid)
     echo "${USERNAME}:${UUID}:${EXPIRE}:active" >> "$USER_DB"
     _inject_user "$UUID" "$USERNAME" "$EXPIRE"
+
+    sleep 1
     systemctl restart xray
-
-    SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
-    SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
-
-    echo ""
-    echo -e "${GREEN}===== 节点信息 =====${NC}"
-    echo -e "用户名 : ${USERNAME}"
-    echo -e "UUID   : ${UUID}"
-    echo -e "到期   : ${EXPIRE}"
-    echo -e "地址   : ${SERVER_IP}"
-    echo -e "端口   : ${PORT}"
-    echo -e "公钥   : ${PUBLIC_KEY}"
-    echo -e "SNI    : ${SNI}"
-    echo -e "ShortID: ${SHORTID}"
-    echo ""
-    LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}"
-    echo -e "${CYAN}分享链接:${NC}"
-    echo "$LINK"
-    echo ""
+    if systemctl is-active --quiet xray; then
+        _print_link "$USERNAME" "$UUID" "$EXPIRE"
+    else
+        error "Xray 重启失败，请检查配置"
+    fi
 }
 
 # ============================================================
@@ -274,6 +321,53 @@ PYEOF
 
     systemctl restart xray
     info "用户 ${USERNAME} 已删除"
+}
+
+# ============================================================
+# 重置到期时间
+# ============================================================
+renew_user() {
+    title "重置到期时间"
+    list_users_brief
+
+    read -rp "输入用户名: " USERNAME
+    [[ -z "$USERNAME" ]] && return
+
+    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+        error "用户不存在"
+        return
+    fi
+
+    echo "到期方式："
+    echo "  1. 输入天数（如 30）"
+    echo "  2. 输入具体日期（如 2026-12-31）"
+    read -rp "选择 [1/2，默认1]: " EXPIRE_MODE
+    EXPIRE_MODE=${EXPIRE_MODE:-1}
+
+    if [[ "$EXPIRE_MODE" == "2" ]]; then
+        read -rp "新到期日期 (YYYY-MM-DD): " NEW_EXPIRE
+        if ! date -d "$NEW_EXPIRE" +%Y-%m-%d &>/dev/null; then
+            error "日期格式错误"
+            return
+        fi
+        NEW_EXPIRE=$(date -d "$NEW_EXPIRE" +%Y-%m-%d)
+    else
+        read -rp "续期天数 [默认 30 天]: " DAYS
+        DAYS=${DAYS:-30}
+        NEW_EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
+    fi
+
+    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    OLD_STATUS=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f4)
+
+    # 更新 db
+    sed -i "s/^${USERNAME}:${UUID}:.*$/${USERNAME}:${UUID}:${NEW_EXPIRE}:active/" "$USER_DB"
+
+    # 重新注入（确保已启用）
+    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE"
+    systemctl restart xray
+
+    info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}"
 }
 
 # ============================================================
@@ -356,6 +450,13 @@ PYEOF
 list_users() {
     title "用户列表"
     [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
+
+    local TOTAL ACTIVE DISABLED
+    TOTAL=$(wc -l < "$USER_DB")
+    ACTIVE=$(grep -c ":active$" "$USER_DB" 2>/dev/null || echo 0)
+    DISABLED=$(grep -c ":disabled$" "$USER_DB" 2>/dev/null || echo 0)
+    echo -e "共 ${TOTAL} 个用户  ${GREEN}活跃: ${ACTIVE}${NC}  ${RED}禁用: ${DISABLED}${NC}"
+    echo ""
     printf "%-15s %-38s %-12s %-10s\n" "用户名" "UUID" "到期日" "状态"
     echo "----------------------------------------------------------------------"
     while IFS=: read -r NAME UUID EXPIRE STATUS; do
@@ -381,11 +482,19 @@ list_users_brief() {
 show_info() {
     title "节点信息"
     load_meta
+    local SERVER_IP
     SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
+    local SHORTID
     SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
-    STATUS=$(systemctl is-active xray)
+    local XRAY_STATUS
+    XRAY_STATUS=$(systemctl is-active xray)
+    local USER_COUNT=0
+    [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+    local ACTIVE_COUNT=0
+    [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active$" "$USER_DB" 2>/dev/null || echo 0)
 
-    echo -e "状态   : $( [[ "$STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+    echo -e "状态   : $( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+    echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
     echo -e "IP     : ${SERVER_IP}"
     echo -e "端口   : ${PORT}"
     echo -e "公钥   : ${PUBLIC_KEY}"
@@ -399,9 +508,11 @@ show_info() {
 # ============================================================
 setup_cron() {
     SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    CRON_CMD="0 1 * * * bash <(curl -sL ${SCRIPT_URL}) --check-expire >> /var/log/xray-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$CRON_CMD") | crontab -
+    EXPIRE_CMD="0 1 * * * bash <(curl -sL ${SCRIPT_URL}) --check-expire >> /var/log/xray-expire.log 2>&1"
+    LOG_CMD="0 3 * * 0 truncate -s 0 /var/log/xray/access.log /var/log/xray/error.log"
+    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray"; echo "$EXPIRE_CMD"; echo "$LOG_CMD") | crontab -
     info "已设置每日 01:00 自动检查到期用户"
+    info "已设置每周日 03:00 自动清理日志"
 }
 
 # ============================================================
@@ -418,22 +529,30 @@ fi
 main_menu() {
     while true; do
         clear
+        XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
+        STATUS_STR=$( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )
+        USER_COUNT=0
+        [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+
         echo -e "${BLUE}╔══════════════════════════════════╗${NC}"
         echo -e "${BLUE}║   VLESS+Reality 用户管理工具     ║${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC} Xray: ${STATUS_STR}   用户数: ${USER_COUNT}"
         echo -e "${BLUE}╚══════════════════════════════════╝${NC}"
         echo -e " ${GREEN}1.${NC}  安装 Xray + 初始化配置"
         echo -e " ${GREEN}2.${NC}  添加用户"
         echo -e " ${GREEN}3.${NC}  删除用户"
         echo -e " ${GREEN}4.${NC}  禁用用户"
         echo -e " ${GREEN}5.${NC}  启用用户"
-        echo -e " ${GREEN}6.${NC}  查看所有用户"
-        echo -e " ${GREEN}7.${NC}  检查到期用户"
-        echo -e " ${GREEN}8.${NC}  查看节点信息"
-        echo -e " ${GREEN}9.${NC}  设置自动到期检查（cron）"
-        echo -e " ${RED}10.${NC} 卸载 Xray"
+        echo -e " ${GREEN}6.${NC}  重置到期时间"
+        echo -e " ${GREEN}7.${NC}  查看所有用户"
+        echo -e " ${GREEN}8.${NC}  检查到期用户"
+        echo -e " ${GREEN}9.${NC}  查看节点信息"
+        echo -e " ${GREEN}10.${NC} 设置自动到期检查（cron）"
+        echo -e " ${RED}11.${NC} 卸载 Xray"
         echo -e " ${RED}0.${NC}  退出"
         echo -e "${BLUE}──────────────────────────────────${NC}"
-        read -rp " 选择 [0-10]: " OPT
+        read -rp " 选择 [0-11]: " OPT
 
         case $OPT in
             1)  install_xray; init_config ;;
@@ -441,11 +560,12 @@ main_menu() {
             3)  delete_user ;;
             4)  toggle_user disable ;;
             5)  toggle_user enable ;;
-            6)  list_users ;;
-            7)  check_expire ;;
-            8)  show_info ;;
-            9)  setup_cron ;;
-            10) uninstall_xray ;;
+            6)  renew_user ;;
+            7)  list_users ;;
+            8)  check_expire ;;
+            9)  show_info ;;
+            10) setup_cron ;;
+            11) uninstall_xray ;;
             0)  exit 0 ;;
             *)  warn "无效选项" ;;
         esac
