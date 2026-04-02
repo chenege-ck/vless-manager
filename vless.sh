@@ -87,7 +87,7 @@ gen_keypair() {
     local OUTPUT
     OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey\|Private" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Password\|Public" | head -1 | awk '{print $NF}')
+    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "Public key" | awk '{print $NF}')
 }
 
 # ============================================================
@@ -278,6 +278,7 @@ _inject_user() {
     local UUID=$1
     local NAME=$2
     local EXPIRE=$3
+    load_meta
 
     python3 - <<PYEOF
 import json
@@ -285,9 +286,11 @@ with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
 clients = cfg["inbounds"][0]["settings"]["clients"]
 clients = [c for c in clients if c.get("id") != "$UUID"]
+# Reality 模式必须设置 flow，WS 模式不需要
+flow = "xtls-rprx-vision" if "$MODE" == "reality" else ""
 clients.append({
     "id": "$UUID",
-    "flow": "",
+    "flow": flow,
     "email": "$NAME",
     "comment": "$EXPIRE"
 })
@@ -333,7 +336,9 @@ _print_link() {
         echo -e "WS路径 : ${WS_PATH}"
         echo -e "TLS    : 开启"
         echo ""
-        local LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&path=${WS_PATH}&host=${DOMAIN}#${USERNAME}"
+        local ENCODED_PATH
+        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+        local LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&path=${ENCODED_PATH}&host=${DOMAIN}#${USERNAME}"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -514,7 +519,7 @@ check_expire() {
 
     while IFS=: read -r NAME UUID EXPIRE STATUS; do
         [[ "$STATUS" != "active" ]] && continue
-        if [[ "$EXPIRE" < "$TODAY" || "$EXPIRE" == "$TODAY" ]]; then
+        if [[ "$EXPIRE" < "$TODAY" ]]; then
             warn "用户 ${NAME} 已到期（${EXPIRE}），自动禁用"
             python3 - <<PYEOF
 import json
