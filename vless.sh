@@ -1,5 +1,6 @@
 #!/bin/bash
-# VLESS+Reality 一键管理脚本 v3.0
+# VLESS 一键管理脚本 v4.0
+# 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -74,7 +75,6 @@ uninstall_xray() {
     bash /tmp/xray-install.sh remove
     rm -rf /usr/local/etc/xray
     rm -f /var/log/xray/access.log /var/log/xray/error.log
-    # 清理所有相关 cron
     crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray" | crontab -
     info "Xray 已完全卸载"
     exit 0
@@ -94,35 +94,44 @@ gen_keypair() {
 # 检查端口是否占用
 # ============================================================
 check_port() {
-    local PORT=$1
-    if ss -tlnp | grep -q ":${PORT} "; then
-        return 1
-    fi
-    return 0
+    ss -tlnp | grep -q ":${1} " && return 1 || return 0
 }
 
 # ============================================================
-# 初始化配置
+# 初始化配置 - 选择协议
 # ============================================================
 init_config() {
     title "初始化配置..."
     mkdir -p /usr/local/etc/xray
     touch "$USER_DB"
 
+    echo ""
+    echo "请选择协议模式："
+    echo -e "  ${GREEN}1.${NC} VLESS + Reality（直连，抗封锁）"
+    echo -e "  ${GREEN}2.${NC} VLESS + WS + CF（套 Cloudflare CDN）"
+    echo ""
+    read -rp "选择 [1/2]: " MODE
+    case $MODE in
+        1) init_reality ;;
+        2) init_ws_cf ;;
+        *) error "无效选择" ;;
+    esac
+}
+
+# ============================================================
+# 初始化 Reality
+# ============================================================
+init_reality() {
     gen_keypair
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败，请检查 xray 是否正确安装"
+        error "密钥生成失败"
         return
     fi
 
     while true; do
         read -rp "监听端口 [默认 443]: " PORT
         PORT=${PORT:-443}
-        if check_port "$PORT"; then
-            break
-        else
-            warn "端口 ${PORT} 已被占用，请换一个"
-        fi
+        check_port "$PORT" && break || warn "端口 ${PORT} 已被占用，请换一个"
     done
 
     read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
@@ -163,18 +172,93 @@ init_config() {
 EOF
 
     cat > "$META" <<EOF
+MODE=reality
 PUBLIC_KEY=${PUBLIC_KEY}
 SNI=${SNI}
 PORT=${PORT}
+SHORTID=${SHORTID}
 EOF
 
+    _start_xray
+    info "Reality 配置完成"
+    info "公钥: ${PUBLIC_KEY}"
+}
+
+# ============================================================
+# 初始化 WS+CF
+# ============================================================
+init_ws_cf() {
+    while true; do
+        read -rp "监听端口 [默认 8080]: " PORT
+        PORT=${PORT:-8080}
+        check_port "$PORT" && break || warn "端口 ${PORT} 已被占用，请换一个"
+    done
+
+    read -rp "WS 路径 [默认 /ray]: " WS_PATH
+    WS_PATH=${WS_PATH:-/ray}
+
+    read -rp "你的域名（已在 CF 解析的域名）: " DOMAIN
+    [[ -z "$DOMAIN" ]] && error "域名不能为空" && return
+
+    cat > "$XRAY_CONFIG" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "${WS_PATH}"
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}
+EOF
+
+    cat > "$META" <<EOF
+MODE=ws
+PORT=${PORT}
+WS_PATH=${WS_PATH}
+DOMAIN=${DOMAIN}
+EOF
+
+    _start_xray
+    info "WS+CF 配置完成"
+    echo ""
+    echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
+    echo -e "1. CF 域名解析：${DOMAIN} → 本机 IP，开启橙云代理"
+    echo -e "2. CF SSL 模式设为 ${GREEN}弹性（Flexible）${NC} 或 ${GREEN}完全（Full）${NC}"
+    echo -e "3. 客户端配置："
+    echo -e "   地址   : ${DOMAIN}"
+    echo -e "   端口   : 443"
+    echo -e "   WS路径 : ${WS_PATH}"
+    echo -e "   TLS    : 开启"
+    echo ""
+}
+
+# ============================================================
+# 启动 xray
+# ============================================================
+_start_xray() {
     systemctl enable xray
     systemctl restart xray
-
     sleep 1
     if systemctl is-active --quiet xray; then
-        info "配置完成，Xray 已启动"
-        info "公钥: ${PUBLIC_KEY}"
+        info "Xray 已启动"
     else
         error "Xray 启动失败，运行 journalctl -u xray -n 20 查看日志"
     fi
@@ -203,7 +287,7 @@ clients = cfg["inbounds"][0]["settings"]["clients"]
 clients = [c for c in clients if c.get("id") != "$UUID"]
 clients.append({
     "id": "$UUID",
-    "flow": "xtls-rprx-vision",
+    "flow": "",
     "email": "$NAME",
     "comment": "$EXPIRE"
 })
@@ -221,25 +305,38 @@ _print_link() {
     local UUID=$2
     local EXPIRE=$3
     load_meta
-    local SERVER_IP
-    SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
-    local SHORTID
-    SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
 
     echo ""
     echo -e "${GREEN}===== 节点信息 =====${NC}"
     echo -e "用户名 : ${USERNAME}"
     echo -e "UUID   : ${UUID}"
     echo -e "到期   : ${EXPIRE}"
-    echo -e "地址   : ${SERVER_IP}"
-    echo -e "端口   : ${PORT}"
-    echo -e "公钥   : ${PUBLIC_KEY}"
-    echo -e "SNI    : ${SNI}"
-    echo -e "ShortID: ${SHORTID}"
-    echo ""
-    local LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}"
-    echo -e "${CYAN}分享链接:${NC}"
-    echo "$LINK"
+    echo -e "模式   : ${MODE}"
+
+    if [[ "$MODE" == "reality" ]]; then
+        local SERVER_IP
+        SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
+        local SHORTID
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
+        echo -e "地址   : ${SERVER_IP}"
+        echo -e "端口   : ${PORT}"
+        echo -e "公钥   : ${PUBLIC_KEY}"
+        echo -e "SNI    : ${SNI}"
+        echo -e "ShortID: ${SHORTID}"
+        echo ""
+        local LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$LINK"
+    else
+        echo -e "域名   : ${DOMAIN}"
+        echo -e "端口   : 443"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "TLS    : 开启"
+        echo ""
+        local LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&path=${WS_PATH}&host=${DOMAIN}#${USERNAME}"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$LINK"
+    fi
     echo ""
 }
 
@@ -358,15 +455,9 @@ renew_user() {
     fi
 
     UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
-    OLD_STATUS=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f4)
-
-    # 更新 db
     sed -i "s/^${USERNAME}:${UUID}:.*$/${USERNAME}:${UUID}:${NEW_EXPIRE}:active/" "$USER_DB"
-
-    # 重新注入（确保已启用）
     _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE"
     systemctl restart xray
-
     info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}"
 }
 
@@ -482,25 +573,31 @@ list_users_brief() {
 show_info() {
     title "节点信息"
     load_meta
-    local SERVER_IP
-    SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
-    local SHORTID
-    SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
-    local XRAY_STATUS
+    local XRAY_STATUS USER_COUNT ACTIVE_COUNT
     XRAY_STATUS=$(systemctl is-active xray)
-    local USER_COUNT=0
-    [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-    local ACTIVE_COUNT=0
-    [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active$" "$USER_DB" 2>/dev/null || echo 0)
+    USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+    ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active$" "$USER_DB" 2>/dev/null || echo 0)
 
     echo -e "状态   : $( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+    echo -e "模式   : ${MODE}"
     echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
-    echo -e "IP     : ${SERVER_IP}"
-    echo -e "端口   : ${PORT}"
-    echo -e "公钥   : ${PUBLIC_KEY}"
-    echo -e "SNI    : ${SNI}"
-    echo -e "ShortID: ${SHORTID}"
-    echo -e "协议   : VLESS+Reality+TCP (xtls-rprx-vision)"
+
+    if [[ "$MODE" == "reality" ]]; then
+        local SERVER_IP SHORTID
+        SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
+        echo -e "IP     : ${SERVER_IP}"
+        echo -e "端口   : ${PORT}"
+        echo -e "公钥   : ${PUBLIC_KEY}"
+        echo -e "SNI    : ${SNI}"
+        echo -e "ShortID: ${SHORTID}"
+        echo -e "协议   : VLESS+Reality+TCP"
+    else
+        echo -e "域名   : ${DOMAIN}"
+        echo -e "端口   : 443（CF 侧）/ ${PORT}（本地监听）"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "协议   : VLESS+WS+TLS（CF CDN）"
+    fi
 }
 
 # ============================================================
@@ -529,15 +626,18 @@ fi
 main_menu() {
     while true; do
         clear
+        load_meta
+        local XRAY_STATUS USER_COUNT MODE_STR
         XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
-        STATUS_STR=$( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )
-        USER_COUNT=0
-        [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+        USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+        [[ "$MODE" == "ws" ]] && MODE_STR="WS+CF" || MODE_STR="Reality"
 
         echo -e "${BLUE}╔══════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║   VLESS+Reality 用户管理工具     ║${NC}"
+        echo -e "${BLUE}║     VLESS 节点用户管理工具       ║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC} Xray: ${STATUS_STR}   用户数: ${USER_COUNT}"
+        printf "${BLUE}║${NC} Xray: %-8s 模式: %-8s 用户: %s\n" \
+            "$( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}停止${NC}" )" \
+            "${MODE_STR}" "${USER_COUNT}"
         echo -e "${BLUE}╚══════════════════════════════════╝${NC}"
         echo -e " ${GREEN}1.${NC}  安装 Xray + 初始化配置"
         echo -e " ${GREEN}2.${NC}  添加用户"
