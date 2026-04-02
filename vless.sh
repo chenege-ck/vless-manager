@@ -282,7 +282,7 @@ rebuild_config() {
         INBOUNDS="${INBOUNDS}
     {
       \"port\": ${WS_PORT},
-      \"listen\": \"127.0.0.1\",
+      \"listen\": \"0.0.0.0\",
       \"protocol\": \"vless\",
       \"settings\": { \"clients\": [], \"decryption\": \"none\" },
       \"streamSettings\": {
