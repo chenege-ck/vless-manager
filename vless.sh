@@ -32,7 +32,8 @@ install_xray() {
         warn "Xray 已安装，跳过"
         return
     fi
-    bash <(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) @ latest
+    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
+    bash /tmp/xray-install.sh install
     [[ $? -ne 0 ]] && error "安装失败，请检查网络" && exit 1
     info "Xray 安装成功"
 }
