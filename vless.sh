@@ -87,7 +87,8 @@ gen_keypair() {
     local OUTPUT
     OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey\|Private" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "Public key" | awk '{print $NF}')
+    PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
+    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Public" | awk '{print $NF}')
 }
 
 # ============================================================
