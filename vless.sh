@@ -328,7 +328,7 @@ check_expire() {
 
     while IFS=: read -r NAME UUID EXPIRE STATUS; do
         [[ "$STATUS" != "active" ]] && continue
-        if [[ "$EXPIRE" <= "$TODAY" ]]; then
+        if [[ "$EXPIRE" < "$TODAY" || "$EXPIRE" == "$TODAY" ]]; then
             warn "用户 ${NAME} 已到期（${EXPIRE}），自动禁用"
             python3 - <<PYEOF
 import json
