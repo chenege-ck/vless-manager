@@ -86,6 +86,7 @@ uninstall_xray() {
 gen_keypair() {
     local OUTPUT
     OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
+    PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey\|Private" | awk '{print $NF}')
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Public" | awk '{print $NF}')
 }
@@ -102,6 +103,24 @@ check_port() {
 # ============================================================
 init_config() {
     title "初始化配置..."
+
+    # 检查是否已有配置
+    if [[ -f "$META" ]]; then
+        load_meta
+        local USER_COUNT=0
+        [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+        echo ""
+        warn "检测到已有配置！"
+        echo -e "  当前模式 : ${MODE}"
+        echo -e "  当前端口 : ${PORT}"
+        echo -e "  用户数量 : ${USER_COUNT} 个"
+        echo ""
+        warn "重新初始化将覆盖所有配置，但不会删除用户数据库"
+        read -rp "确认继续？[y/N]: " CONFIRM
+        [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
+        echo ""
+    fi
+
     mkdir -p /usr/local/etc/xray
     touch "$USER_DB"
 
@@ -354,6 +373,10 @@ add_user() {
 
     read -rp "用户名（备注用）: " USERNAME
     [[ -z "$USERNAME" ]] && error "用户名不能为空" && return
+    if [[ "$USERNAME" =~ [:/\ ] ]]; then
+        error "用户名不能包含 : / 空格 等特殊字符"
+        return
+    fi
 
     if grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
         error "用户 ${USERNAME} 已存在"
@@ -514,30 +537,39 @@ check_expire() {
     title "检查到期用户..."
     TODAY=$(date +%Y-%m-%d)
     CHANGED=0
+    EXPIRED_UUIDS=""
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
+    # 第一步：找出所有到期用户，更新 users.db
     while IFS=: read -r NAME UUID EXPIRE STATUS; do
         [[ "$STATUS" != "active" ]] && continue
         if [[ "$EXPIRE" < "$TODAY" ]]; then
             warn "用户 ${NAME} 已到期（${EXPIRE}），自动禁用"
-            python3 - <<PYEOF
-import json
-with open("$XRAY_CONFIG", "r") as f:
-    cfg = json.load(f)
-clients = cfg["inbounds"][0]["settings"]["clients"]
-clients = [c for c in clients if c.get("id") != "$UUID"]
-cfg["inbounds"][0]["settings"]["clients"] = clients
-with open("$XRAY_CONFIG", "w") as f:
-    json.dump(cfg, f, indent=2)
-PYEOF
             sed -i "s/^${NAME}:${UUID}:${EXPIRE}:active$/${NAME}:${UUID}:${EXPIRE}:disabled/" "$USER_DB"
+            EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
             CHANGED=1
         fi
     done < "$USER_DB"
 
-    [[ $CHANGED -eq 1 ]] && systemctl restart xray && info "已重启 Xray"
-    [[ $CHANGED -eq 0 ]] && info "没有到期用户"
+    # 第二步：一次性从 config.json 移除所有到期用户
+    if [[ $CHANGED -eq 1 ]]; then
+        python3 - <<PYEOF
+import json
+expired = "$EXPIRED_UUIDS".split()
+with open("$XRAY_CONFIG", "r") as f:
+    cfg = json.load(f)
+clients = cfg["inbounds"][0]["settings"]["clients"]
+clients = [c for c in clients if c.get("id") not in expired]
+cfg["inbounds"][0]["settings"]["clients"] = clients
+with open("$XRAY_CONFIG", "w") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+        systemctl restart xray
+        info "已重启 Xray"
+    else
+        info "没有到期用户"
+    fi
 }
 
 # ============================================================
@@ -615,6 +647,46 @@ setup_cron() {
     (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray"; echo "$EXPIRE_CMD"; echo "$LOG_CMD") | crontab -
     info "已设置每日 01:00 自动检查到期用户"
     info "已设置每周日 03:00 自动清理日志"
+
+    # 配置 logrotate 自动轮转 xray-expire.log
+    cat > /etc/logrotate.d/xray-expire <<EOF
+/var/log/xray-expire.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 0640 root root
+}
+EOF
+    # 同时配置 xray 自身日志轮转
+    cat > /etc/logrotate.d/xray <<EOF
+/var/log/xray/*.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 0640 nobody root
+    postrotate
+        systemctl kill -s USR1 xray 2>/dev/null || true
+    endscript
+}
+EOF
+    info "已配置日志自动轮转（每周轮转，保留4周）"
+}
+
+# ============================================================
+# 安装快捷命令 c
+# ============================================================
+install_shortcut() {
+    SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+    cat > /usr/local/bin/c <<EOF
+#!/bin/bash
+bash <(curl -sL ${SCRIPT_URL})
+EOF
+    chmod +x /usr/local/bin/c
+    info "快捷命令已安装，输入 c 即可进入面板"
 }
 
 # ============================================================
@@ -679,5 +751,8 @@ main_menu() {
         read -rp "按 Enter 继续..." _
     done
 }
+
+# 每次运行自动安装快捷命令 c
+install_shortcut
 
 main_menu
