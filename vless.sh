@@ -200,7 +200,7 @@ EOF
 # ============================================================
 init_ws_cf() {
     while true; do
-        read -rp "监听端口 [默认 8080]: " WS_PORT
+        read -rp "本地监听端口 [默认 8080]: " WS_PORT
         WS_PORT=${WS_PORT:-8080}
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
     done
@@ -211,10 +211,23 @@ init_ws_cf() {
     read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
     [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
 
+    read -rp "客户端端口 [默认 443]: " WS_CF_PORT
+    WS_CF_PORT=${WS_CF_PORT:-443}
+
+    # 手动选择是否启用 TLS
+    read -rp "是否启用 TLS？[Y/n，默认Y]: " TLS_SEL
+    if [[ "$TLS_SEL" == "n" || "$TLS_SEL" == "N" ]]; then
+        WS_TLS="none"
+    else
+        WS_TLS="tls"
+    fi
+
     cat > "$META_WS" <<EOF
 WS_PORT=${WS_PORT}
 WS_PATH=${WS_PATH}
 WS_DOMAIN=${WS_DOMAIN}
+WS_CF_PORT=${WS_CF_PORT}
+WS_TLS=${WS_TLS}
 EOF
     chmod 600 "$META_WS"
 
@@ -228,9 +241,9 @@ EOF
     echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}"
     echo -e "3. 客户端配置："
     echo -e "   地址   : ${WS_DOMAIN}"
-    echo -e "   端口   : 443"
+    echo -e "   端口   : ${WS_CF_PORT}"
     echo -e "   WS路径 : ${WS_PATH}"
-    echo -e "   TLS    : 开启"
+    echo -e "   TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
     echo ""
 }
 
@@ -403,15 +416,20 @@ _print_link() {
 
     if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
         source "$META_WS"
+        WS_CF_PORT=${WS_CF_PORT:-443}
+        WS_TLS=${WS_TLS:-tls}
         local ENCODED_PATH
         ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+        local ENCODED_NAME
+        ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
         echo ""
         echo -e "${CYAN}── WS+CF 节点 ──${NC}"
         echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : 443"
+        echo -e "端口   : ${WS_CF_PORT}"
         echo -e "WS路径 : ${WS_PATH}"
-        echo -e "TLS    : 开启"
-        local LINK="vless://${UUID}@${WS_DOMAIN}:443?encryption=none&security=tls&type=ws&path=${ENCODED_PATH}&host=${WS_DOMAIN}#${USERNAME}-ws"
+        echo -e "TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
+        echo -e "SNI    : ${WS_DOMAIN}"
+        local LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT}/?type=ws&encryption=none&flow=&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=${WS_TLS}&sni=${WS_DOMAIN}#${ENCODED_NAME}"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -818,6 +836,309 @@ EOF
 }
 
 # ============================================================
+# 开启 BBR
+# ============================================================
+enable_bbr() {
+    title "开启 BBR 拥塞控制..."
+
+    # 检查内核是否支持 BBR
+    if ! modinfo tcp_bbr &>/dev/null; then
+        error "当前内核不支持 BBR，请升级内核（建议 4.9+）"
+        return
+    fi
+
+    # 已经是 BBR 就跳过
+    local CURRENT_CC
+    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$CURRENT_CC" == "bbr" ]]; then
+        info "BBR 已经是开启状态，无需重复设置"
+        return
+    fi
+
+    # 加载模块
+    modprobe tcp_bbr 2>/dev/null
+
+    # 写入 sysctl 持久化
+    cat >> /etc/sysctl.conf <<EOF
+
+# BBR
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+    sysctl -p &>/dev/null
+    local NEW_CC
+    NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$NEW_CC" == "bbr" ]]; then
+        info "BBR 开启成功！"
+    else
+        error "BBR 开启失败，请手动检查内核版本"
+    fi
+}
+
+# ============================================================
+# TCP 智能优化（根据网络测试结果动态调整）
+# ============================================================
+optimize_tcp() {
+    title "TCP 智能优化..."
+    echo -e "正在测试网络质量，请稍候...\n"
+
+    # 先测两个节点取平均延迟和丢包
+    local TOTAL_MS=0 TOTAL_FAIL=0 TOTAL_COUNT=0
+    local TARGETS=("v4-sc-ct.oojj.de:80" "v4-sc-cm.oojj.de:80")
+
+    for TARGET in "${TARGETS[@]}"; do
+        local HOST="${TARGET%%:*}"
+        local PORT="${TARGET##*:}"
+        for i in {1..20}; do
+            local MS
+            MS=$(curl -o /dev/null -s -w "%{time_connect}" \
+                --connect-timeout 3 --max-time 5 \
+                "http://${HOST}:${PORT}/" 2>/dev/null)
+            if [[ $? -eq 0 && -n "$MS" && "$MS" != "0.000000" ]]; then
+                local MS_INT
+                MS_INT=$(python3 -c "print(int(float('${MS}') * 1000))" 2>/dev/null)
+                TOTAL_MS=$((TOTAL_MS + MS_INT))
+                TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            else
+                TOTAL_FAIL=$((TOTAL_FAIL + 1))
+            fi
+        done
+    done
+
+    # 计算平均延迟和丢包率
+    local AVG_MS=999 LOSS_PCT=100
+    if [[ $TOTAL_COUNT -gt 0 ]]; then
+        AVG_MS=$((TOTAL_MS / TOTAL_COUNT))
+        LOSS_PCT=$(( TOTAL_FAIL * 100 / (TOTAL_COUNT + TOTAL_FAIL) ))
+    fi
+
+    echo -e "测试结果：平均延迟 ${CYAN}${AVG_MS}ms${NC}  丢包率 ${CYAN}${LOSS_PCT}%${NC}"
+    echo ""
+
+    # 避免重复写入
+    if grep -q "VLESS TCP优化" /etc/sysctl.conf 2>/dev/null; then
+        warn "检测到已有 TCP 优化配置，先清除旧配置..."
+        sed -i '/# VLESS TCP优化/,/^$/d' /etc/sysctl.conf
+    fi
+
+    # 根据延迟和丢包率选择优化策略
+    local STRATEGY=""
+    local STRATEGY_DESC=""
+
+    if [[ $AVG_MS -lt 80 && $LOSS_PCT -lt 5 ]]; then
+        # 延迟低、丢包低 → 线路优质，轻度优化即可
+        STRATEGY="good"
+        STRATEGY_DESC="线路优质，使用轻度优化"
+
+    elif [[ $AVG_MS -lt 80 && $LOSS_PCT -ge 5 ]]; then
+        # 延迟低、丢包高 → 线路不稳定，加强重传
+        STRATEGY="low_latency_high_loss"
+        STRATEGY_DESC="延迟低但丢包高，启用激进重传优化"
+
+    elif [[ $AVG_MS -ge 80 && $AVG_MS -lt 150 && $LOSS_PCT -lt 5 ]]; then
+        # 延迟中、丢包低 → 距离较远，加大缓冲区
+        STRATEGY="high_latency_low_loss"
+        STRATEGY_DESC="延迟较高但线路稳定，加大缓冲区"
+
+    else
+        # 延迟高、丢包高 → 线路很差，激进全套优化
+        STRATEGY="bad"
+        STRATEGY_DESC="线路较差，启用全套激进优化"
+    fi
+
+    info "优化策略：${STRATEGY_DESC}"
+    echo ""
+
+    case $STRATEGY in
+        good)
+            cat >> /etc/sysctl.conf <<EOF
+
+# VLESS TCP优化 - 策略:轻度(低延迟低丢包)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+            ;;
+
+        low_latency_high_loss)
+            cat >> /etc/sysctl.conf <<EOF
+
+# VLESS TCP优化 - 策略:重传优化(低延迟高丢包)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_tw_reuse = 1
+EOF
+            ;;
+
+        high_latency_low_loss)
+            cat >> /etc/sysctl.conf <<EOF
+
+# VLESS TCP优化 - 策略:大缓冲区(高延迟低丢包)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.netdev_max_backlog = 250000
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+EOF
+            ;;
+
+        bad)
+            cat >> /etc/sysctl.conf <<EOF
+
+# VLESS TCP优化 - 策略:全套激进(高延迟高丢包)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 8192
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 5
+EOF
+            ;;
+    esac
+
+    # 加载 BBR 模块
+    modprobe tcp_bbr 2>/dev/null
+    sysctl -p &>/dev/null
+    info "TCP 智能优化完成！策略：${STRATEGY_DESC}"
+}
+
+# ============================================================
+# 网络质量测试（测延迟 + 丢包率）
+# ============================================================
+network_test() {
+    title "网络质量测试..."
+    echo -e "测试服务器到国内各运营商的延迟和丢包率...\n"
+
+    # 测试节点：域名:端口
+    declare -A TARGETS=(
+        ["电信-四川"]="v4-sc-ct.oojj.de:80"
+        ["移动-四川"]="v4-sc-cm.oojj.de:80"
+    )
+
+    printf "%-15s %-30s %-12s %-10s\n" "线路" "节点" "延迟(ms)" "状态"
+    echo "──────────────────────────────────────────────────────"
+
+    for NAME in "${!TARGETS[@]}"; do
+        local TARGET="${TARGETS[$NAME]}"
+        local HOST="${TARGET%%:*}"
+        local PORT="${TARGET##*:}"
+
+        # 用 curl 测 HTTP 连接延迟，测5次取平均
+        local TOTAL=0 COUNT=0 FAIL=0
+        for i in {1..20}; do
+            local MS
+            MS=$(curl -o /dev/null -s -w "%{time_connect}" \
+                --connect-timeout 3 --max-time 5 \
+                "http://${HOST}:${PORT}/" 2>/dev/null)
+            if [[ $? -eq 0 && -n "$MS" && "$MS" != "0.000000" ]]; then
+                # 转换为毫秒整数
+                local MS_INT
+                MS_INT=$(python3 -c "print(int(float('${MS}') * 1000))" 2>/dev/null)
+                TOTAL=$((TOTAL + MS_INT))
+                COUNT=$((COUNT + 1))
+            else
+                FAIL=$((FAIL + 1))
+            fi
+        done
+
+        if [[ $COUNT -eq 0 ]]; then
+            printf "${RED}%-15s${NC} %-30s ${RED}%-12s${NC} ${RED}%s${NC}\n" \
+                "$NAME" "$TARGET" "超时" "全部失败"
+        else
+            local AVG=$((TOTAL / COUNT))
+            local LOSS_PCT=$(( FAIL * 100 / 20 ))
+            if [[ $AVG -lt 80 ]]; then
+                printf "${GREEN}%-15s${NC} %-30s ${GREEN}%-12s${NC} ${GREEN}丢包:${LOSS_PCT}%%${NC}\n" \
+                    "$NAME" "$TARGET" "${AVG}ms"
+            elif [[ $AVG -lt 150 ]]; then
+                printf "${YELLOW}%-15s${NC} %-30s ${YELLOW}%-12s${NC} ${YELLOW}丢包:${LOSS_PCT}%%${NC}\n" \
+                    "$NAME" "$TARGET" "${AVG}ms"
+            else
+                printf "${RED}%-15s${NC} %-30s ${RED}%-12s${NC} ${RED}丢包:${LOSS_PCT}%%${NC}\n" \
+                    "$NAME" "$TARGET" "${AVG}ms"
+            fi
+        fi
+    done
+    echo ""
+    echo -e "${GREEN}<80ms${NC} 优秀  ${YELLOW}80-150ms${NC} 一般  ${RED}>150ms${NC} 较差"
+}
+
+# ============================================================
+# 一键优化菜单
+# ============================================================
+optimize_menu() {
+    title "网络优化"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} 开启 BBR（推荐，提升吞吐量）"
+    echo -e "  ${GREEN}2.${NC} TCP 参数优化（缓冲区/队列调优）"
+    echo -e "  ${GREEN}3.${NC} 一键全部优化（BBR + TCP）"
+    echo -e "  ${GREEN}4.${NC} 网络质量测试（延迟 + 丢包）"
+    echo -e "  ${GREEN}0.${NC} 返回"
+    echo ""
+    read -rp "选择: " OPT
+    case $OPT in
+        1) enable_bbr ;;
+        2) optimize_tcp ;;
+        3) enable_bbr; optimize_tcp ;;
+        4) network_test ;;
+        0) return ;;
+        *) warn "无效选项" ;;
+    esac
+}
+
+# ============================================================
+# 一键更新 Xray
+# ============================================================
+update_xray() {
+    title "更新 Xray..."
+    local CURRENT_VER
+    CURRENT_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
+    info "当前版本: ${CURRENT_VER}"
+    info "正在检查最新版本..."
+    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
+    bash /tmp/xray-install.sh install
+    local NEW_VER
+    NEW_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
+    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
+        info "已是最新版本: ${NEW_VER}"
+    else
+        info "更新完成: ${CURRENT_VER} → ${NEW_VER}"
+        systemctl restart xray
+        info "Xray 已重启"
+    fi
+}
+
+# ============================================================
 # 安装快捷命令 c
 # ============================================================
 install_shortcut() {
@@ -868,10 +1189,12 @@ main_menu() {
         echo -e " ${GREEN}9.${NC}  检查到期用户"
         echo -e " ${GREEN}10.${NC} 查看节点信息"
         echo -e " ${GREEN}11.${NC} 设置自动到期检查（cron）"
-        echo -e " ${RED}12.${NC} 卸载 Xray"
+        echo -e " ${GREEN}12.${NC} 更新 Xray"
+        echo -e " ${GREEN}13.${NC} 网络优化（BBR / TCP / 测速）"
+        echo -e " ${RED}14.${NC} 卸载 Xray"
         echo -e " ${RED}0.${NC}  退出"
         echo -e "${BLUE}──────────────────────────────────${NC}"
-        read -rp " 选择 [0-12]: " OPT
+        read -rp " 选择 [0-14]: " OPT
 
         case $OPT in
             1)  install_xray; init_config ;;
@@ -885,7 +1208,9 @@ main_menu() {
             9)  check_expire ;;
             10) show_info ;;
             11) setup_cron ;;
-            12) uninstall_xray ;;
+            12) update_xray ;;
+            13) optimize_menu ;;
+            14) uninstall_xray ;;
             0)  exit 0 ;;
             *)  warn "无效选项" ;;
         esac
