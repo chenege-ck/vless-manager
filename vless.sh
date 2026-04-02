@@ -80,6 +80,7 @@ uninstall_xray() {
     crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
 
     info "Xray 已完全卸载"
+    exit 0
 }
 
 # ============================================================
