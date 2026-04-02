@@ -200,7 +200,7 @@ EOF
 # ============================================================
 init_ws_cf() {
     while true; do
-        read -rp "本地监听端口 [默认 8080]: " WS_PORT
+        read -rp "服务器监听端口 [默认 8080]: " WS_PORT
         WS_PORT=${WS_PORT:-8080}
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
     done
@@ -211,8 +211,13 @@ init_ws_cf() {
     read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
     [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
 
-    read -rp "客户端端口 [默认 443]: " WS_CF_PORT
-    WS_CF_PORT=${WS_CF_PORT:-443}
+    echo ""
+    echo -e "${YELLOW}CF 回源端口说明：${NC}"
+    echo -e "  CF 会把客户端流量转发到你服务器的某个端口（回源端口）"
+    echo -e "  如果 CF 回源端口 = 服务器监听端口（${WS_PORT}），直接回车即可"
+    echo -e "  如果你在 CF 设置了不同的回源端口，在这里填那个端口"
+    read -rp "CF 回源端口 [默认与监听端口相同 ${WS_PORT}]: " WS_CF_PORT
+    WS_CF_PORT=${WS_CF_PORT:-$WS_PORT}
 
     # 手动选择是否启用 TLS
     read -rp "是否启用 TLS？[Y/n，默认Y]: " TLS_SEL
@@ -239,7 +244,8 @@ EOF
     echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
     echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启橙云代理"
     echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}"
-    echo -e "3. 客户端配置："
+    echo -e "3. CF 回源端口设为 ${GREEN}${WS_CF_PORT}${NC}"
+    echo -e "4. 客户端配置："
     echo -e "   地址   : ${WS_DOMAIN}"
     echo -e "   端口   : ${WS_CF_PORT}"
     echo -e "   WS路径 : ${WS_PATH}"
