@@ -1,6 +1,6 @@
 #!/bin/bash
-# VLESS 一键管理脚本 v4.0
-# 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式
+# VLESS 一键管理脚本 v5.0
+# 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式，可同时运行
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,6 +12,9 @@ NC='\033[0m'
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 USER_DB="/usr/local/etc/xray/users.db"
 XRAY_BIN="/usr/local/bin/xray"
+META_REALITY="/usr/local/etc/xray/meta-reality.conf"
+META_WS="/usr/local/etc/xray/meta-ws.conf"
+# 兼容旧版单节点 meta.conf
 META="/usr/local/etc/xray/meta.conf"
 
 info()  { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -102,37 +105,55 @@ check_port() {
 # 初始化配置 - 选择协议
 # ============================================================
 init_config() {
-    title "初始化配置..."
-
-    # 检查是否已有配置
-    if [[ -f "$META" ]]; then
-        load_meta
-        local USER_COUNT=0
-        [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-        echo ""
-        warn "检测到已有配置！"
-        echo -e "  当前模式 : ${MODE}"
-        echo -e "  当前端口 : ${PORT}"
-        echo -e "  用户数量 : ${USER_COUNT} 个"
-        echo ""
-        warn "重新初始化将覆盖所有配置，但不会删除用户数据库"
-        read -rp "确认继续？[y/N]: " CONFIRM
-        [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
-        echo ""
-    fi
-
+    title "节点配置..."
     mkdir -p /usr/local/etc/xray
     touch "$USER_DB"
 
     echo ""
-    echo "请选择协议模式："
-    echo -e "  ${GREEN}1.${NC} VLESS + Reality（直连，抗封锁）"
-    echo -e "  ${GREEN}2.${NC} VLESS + WS + CF（套 Cloudflare CDN）"
+    echo "当前节点状态："
+    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_ws      && echo -e "  ${GREEN}✓${NC} WS+CF   已启用" || echo -e "  ${RED}✗${NC} WS+CF   未启用"
     echo ""
-    read -rp "选择 [1/2]: " MODE
-    case $MODE in
-        1) init_reality ;;
-        2) init_ws_cf ;;
+    echo "请选择要操作的节点："
+    echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
+    echo -e "  ${GREEN}2.${NC} 配置 VLESS + WS + CF"
+    has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
+    has_ws      && echo -e "  ${RED}4.${NC} 移除 WS+CF 节点"
+    echo ""
+    read -rp "选择: " MODE_SEL
+    case $MODE_SEL in
+        1)
+            if has_reality; then
+                warn "Reality 节点已存在，重新配置将覆盖"
+                read -rp "确认继续？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            fi
+            init_reality
+            ;;
+        2)
+            if has_ws; then
+                warn "WS+CF 节点已存在，重新配置将覆盖"
+                read -rp "确认继续？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            fi
+            init_ws_cf
+            ;;
+        3)
+            has_reality || { error "Reality 节点未启用"; return; }
+            read -rp "确认移除 Reality 节点？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            rm -f "$META_REALITY"
+            rebuild_config; _inject_all_users; _start_xray
+            info "Reality 节点已移除"
+            ;;
+        4)
+            has_ws || { error "WS+CF 节点未启用"; return; }
+            read -rp "确认移除 WS+CF 节点？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            rm -f "$META_WS"
+            rebuild_config; _inject_all_users; _start_xray
+            info "WS+CF 节点已移除"
+            ;;
         *) error "无效选择" ;;
     esac
 }
@@ -148,58 +169,29 @@ init_reality() {
     fi
 
     while true; do
-        read -rp "监听端口 [默认 443]: " PORT
-        PORT=${PORT:-443}
-        check_port "$PORT" && break || warn "端口 ${PORT} 已被占用，请换一个"
+        read -rp "监听端口 [默认 443]: " REALITY_PORT
+        REALITY_PORT=${REALITY_PORT:-443}
+        check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用，请换一个"
     done
 
-    read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
-    SNI=${SNI:-www.microsoft.com}
-    SHORTID=$(openssl rand -hex 4)
+    read -rp "伪装域名 [默认 www.microsoft.com]: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-www.microsoft.com}
+    local REALITY_SHORTID
+    REALITY_SHORTID=$(openssl rand -hex 4)
 
-    cat > "$XRAY_CONFIG" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": ${PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${SNI}:443",
-          "xver": 0,
-          "serverNames": ["${SNI}"],
-          "privateKey": "${PRIVATE_KEY}",
-          "shortIds": ["${SHORTID}"]
-        }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
-}
+    cat > "$META_REALITY" <<EOF
+REALITY_PRIVATE_KEY=${PRIVATE_KEY}
+REALITY_PUBLIC_KEY=${PUBLIC_KEY}
+REALITY_SNI=${REALITY_SNI}
+REALITY_PORT=${REALITY_PORT}
+REALITY_SHORTID=${REALITY_SHORTID}
 EOF
+    chmod 600 "$META_REALITY"
 
-    cat > "$META" <<EOF
-MODE=reality
-PUBLIC_KEY=${PUBLIC_KEY}
-SNI=${SNI}
-PORT=${PORT}
-SHORTID=${SHORTID}
-EOF
-
+    rebuild_config
+    _inject_all_users
     _start_xray
-    info "Reality 配置完成"
+    info "Reality 节点配置完成"
     info "公钥: ${PUBLIC_KEY}"
 }
 
@@ -208,38 +200,95 @@ EOF
 # ============================================================
 init_ws_cf() {
     while true; do
-        read -rp "监听端口 [默认 8080]: " PORT
-        PORT=${PORT:-8080}
-        check_port "$PORT" && break || warn "端口 ${PORT} 已被占用，请换一个"
+        read -rp "监听端口 [默认 8080]: " WS_PORT
+        WS_PORT=${WS_PORT:-8080}
+        check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
     done
 
     read -rp "WS 路径 [默认 /ray]: " WS_PATH
     WS_PATH=${WS_PATH:-/ray}
 
-    read -rp "你的域名（已在 CF 解析的域名）: " DOMAIN
-    [[ -z "$DOMAIN" ]] && error "域名不能为空" && return
+    read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
+    [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
+
+    cat > "$META_WS" <<EOF
+WS_PORT=${WS_PORT}
+WS_PATH=${WS_PATH}
+WS_DOMAIN=${WS_DOMAIN}
+EOF
+    chmod 600 "$META_WS"
+
+    rebuild_config
+    _inject_all_users
+    _start_xray
+    info "WS+CF 节点配置完成"
+    echo ""
+    echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
+    echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启橙云代理"
+    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}"
+    echo -e "3. 客户端配置："
+    echo -e "   地址   : ${WS_DOMAIN}"
+    echo -e "   端口   : 443"
+    echo -e "   WS路径 : ${WS_PATH}"
+    echo -e "   TLS    : 开启"
+    echo ""
+}
+
+# ============================================================
+# 根据已有 meta 重建 config.json（支持双节点）
+# ============================================================
+rebuild_config() {
+    local INBOUNDS=""
+
+    if has_reality; then
+        source "$META_REALITY"
+        INBOUNDS="${INBOUNDS}
+    {
+      \"port\": ${REALITY_PORT},
+      \"protocol\": \"vless\",
+      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
+      \"streamSettings\": {
+        \"network\": \"tcp\",
+        \"security\": \"reality\",
+        \"realitySettings\": {
+          \"show\": false,
+          \"dest\": \"${REALITY_SNI}:443\",
+          \"xver\": 0,
+          \"serverNames\": [\"${REALITY_SNI}\"],
+          \"privateKey\": \"${REALITY_PRIVATE_KEY}\",
+          \"shortIds\": [\"${REALITY_SHORTID}\"]
+        }
+      },
+      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
+      \"tag\": \"inbound-reality\"
+    },"
+    fi
+
+    if has_ws; then
+        source "$META_WS"
+        INBOUNDS="${INBOUNDS}
+    {
+      \"port\": ${WS_PORT},
+      \"listen\": \"127.0.0.1\",
+      \"protocol\": \"vless\",
+      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
+      \"streamSettings\": {
+        \"network\": \"ws\",
+        \"security\": \"none\",
+        \"wsSettings\": { \"path\": \"${WS_PATH}\" }
+      },
+      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
+      \"tag\": \"inbound-ws\"
+    },"
+    fi
+
+    # 去掉最后一个逗号
+    INBOUNDS="${INBOUNDS%,}"
 
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": ${PORT},
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {
-          "path": "${WS_PATH}"
-        }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
-    }
+  "inbounds": [${INBOUNDS}
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
@@ -247,26 +296,6 @@ init_ws_cf() {
   ]
 }
 EOF
-
-    cat > "$META" <<EOF
-MODE=ws
-PORT=${PORT}
-WS_PATH=${WS_PATH}
-DOMAIN=${DOMAIN}
-EOF
-
-    _start_xray
-    info "WS+CF 配置完成"
-    echo ""
-    echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
-    echo -e "1. CF 域名解析：${DOMAIN} → 本机 IP，开启橙云代理"
-    echo -e "2. CF SSL 模式设为 ${GREEN}弹性（Flexible）${NC} 或 ${GREEN}完全（Full）${NC}"
-    echo -e "3. 客户端配置："
-    echo -e "   地址   : ${DOMAIN}"
-    echo -e "   端口   : 443"
-    echo -e "   WS路径 : ${WS_PATH}"
-    echo -e "   TLS    : 开启"
-    echo ""
 }
 
 # ============================================================
@@ -284,39 +313,57 @@ _start_xray() {
 }
 
 # ============================================================
-# 读取元数据
+# 读取元数据（支持双节点）
 # ============================================================
 load_meta() {
-    [[ -f "$META" ]] && source "$META"
+    # 优先加载新版双节点配置
+    [[ -f "$META_REALITY" ]] && source "$META_REALITY"
+    [[ -f "$META_WS" ]] && source "$META_WS"
+    # 兼容旧版单节点
+    [[ ! -f "$META_REALITY" && ! -f "$META_WS" && -f "$META" ]] && source "$META"
 }
 
+# 检查哪些节点已启用
+has_reality() { [[ -f "$META_REALITY" ]]; }
+has_ws()      { [[ -f "$META_WS" ]]; }
+
 # ============================================================
-# 注入用户到 config.json
+# 注入用户到 config.json（指定节点类型）
 # ============================================================
 _inject_user() {
     local UUID=$1
     local NAME=$2
     local EXPIRE=$3
-    load_meta
+    local NODE=$4   # reality | ws | both
 
     python3 - <<PYEOF
 import json
 with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
-clients = cfg["inbounds"][0]["settings"]["clients"]
-clients = [c for c in clients if c.get("id") != "$UUID"]
-# Reality 模式必须设置 flow，WS 模式不需要
-flow = "xtls-rprx-vision" if "$MODE" == "reality" else ""
-clients.append({
-    "id": "$UUID",
-    "flow": flow,
-    "email": "$NAME",
-    "comment": "$EXPIRE"
-})
-cfg["inbounds"][0]["settings"]["clients"] = clients
+
+node = "$NODE"
+for inbound in cfg["inbounds"]:
+    tag = inbound.get("tag", "")
+    clients = inbound["settings"]["clients"]
+    clients = [c for c in clients if c.get("id") != "$UUID"]
+    if node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws"):
+        flow = "xtls-rprx-vision" if tag == "inbound-reality" else ""
+        clients.append({"id": "$UUID", "flow": flow, "email": "$NAME", "comment": "$EXPIRE"})
+    inbound["settings"]["clients"] = clients
+
 with open("$XRAY_CONFIG", "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
+}
+
+# 重建后将所有 active 用户按其节点类型重新注入
+_inject_all_users() {
+    [[ ! -f "$USER_DB" ]] && return
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+        [[ "$STATUS" != "active" ]] && continue
+        NODE=${NODE:-both}
+        _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE"
+    done < "$USER_DB"
 }
 
 # ============================================================
@@ -326,6 +373,7 @@ _print_link() {
     local USERNAME=$1
     local UUID=$2
     local EXPIRE=$3
+    local NODE=${4:-both}
     load_meta
 
     echo ""
@@ -333,31 +381,37 @@ _print_link() {
     echo -e "用户名 : ${USERNAME}"
     echo -e "UUID   : ${UUID}"
     echo -e "到期   : ${EXPIRE}"
-    echo -e "模式   : ${MODE}"
+    echo -e "节点   : ${NODE}"
 
-    if [[ "$MODE" == "reality" ]]; then
+    if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
+        source "$META_REALITY"
         local SERVER_IP
         SERVER_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
         local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); print(d['inbounds'][0]['streamSettings']['realitySettings']['shortIds'][0])" 2>/dev/null)
-        echo -e "地址   : ${SERVER_IP}"
-        echo -e "端口   : ${PORT}"
-        echo -e "公钥   : ${PUBLIC_KEY}"
-        echo -e "SNI    : ${SNI}"
-        echo -e "ShortID: ${SHORTID}"
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
         echo ""
-        local LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}"
+        echo -e "${CYAN}── Reality 节点 ──${NC}"
+        echo -e "地址   : ${SERVER_IP}"
+        echo -e "端口   : ${REALITY_PORT}"
+        echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
+        echo -e "SNI    : ${REALITY_SNI}"
+        echo -e "ShortID: ${SHORTID}"
+        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}-reality"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
-    else
-        echo -e "域名   : ${DOMAIN}"
+    fi
+
+    if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
+        source "$META_WS"
+        local ENCODED_PATH
+        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+        echo ""
+        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
+        echo -e "域名   : ${WS_DOMAIN}"
         echo -e "端口   : 443"
         echo -e "WS路径 : ${WS_PATH}"
         echo -e "TLS    : 开启"
-        echo ""
-        local ENCODED_PATH
-        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
-        local LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&path=${ENCODED_PATH}&host=${DOMAIN}#${USERNAME}"
+        local LINK="vless://${UUID}@${WS_DOMAIN}:443?encryption=none&security=tls&type=ws&path=${ENCODED_PATH}&host=${WS_DOMAIN}#${USERNAME}-ws"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -383,6 +437,29 @@ add_user() {
         return
     fi
 
+    # 节点选择
+    local NODE="both"
+    if has_reality && has_ws; then
+        echo ""
+        echo "请选择加入的节点："
+        echo -e "  ${GREEN}1.${NC} 两个节点都加入"
+        echo -e "  ${GREEN}2.${NC} 仅 Reality"
+        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        read -rp "选择 [1/2/3，默认1]: " NODE_SEL
+        case ${NODE_SEL:-1} in
+            2) NODE="reality" ;;
+            3) NODE="ws" ;;
+            *) NODE="both" ;;
+        esac
+    elif has_reality; then
+        NODE="reality"
+    elif has_ws; then
+        NODE="ws"
+    else
+        error "尚未配置任何节点，请先选择菜单 1 初始化"
+        return
+    fi
+
     echo "到期方式："
     echo "  1. 输入天数（如 30）"
     echo "  2. 输入具体日期（如 2026-12-31）"
@@ -403,13 +480,13 @@ add_user() {
     fi
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    echo "${USERNAME}:${UUID}:${EXPIRE}:active" >> "$USER_DB"
-    _inject_user "$UUID" "$USERNAME" "$EXPIRE"
+    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
+    _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
 
     sleep 1
     systemctl restart xray
     if systemctl is-active --quiet xray; then
-        _print_link "$USERNAME" "$UUID" "$EXPIRE"
+        _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
     else
         error "Xray 重启失败，请检查配置"
     fi
@@ -431,21 +508,58 @@ delete_user() {
     fi
 
     UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
-    sed -i "/^${USERNAME}:/d" "$USER_DB"
+    local USER_NODE
+    USER_NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    USER_NODE=${USER_NODE:-both}
 
+    # 选择删除哪个节点
+    local DEL_NODE="both"
+    if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
+        echo ""
+        echo "删除哪个节点的权限？"
+        echo -e "  ${GREEN}1.${NC} 两个节点都删除（彻底删除用户）"
+        echo -e "  ${GREEN}2.${NC} 仅删除 Reality 权限"
+        echo -e "  ${GREEN}3.${NC} 仅删除 WS+CF 权限"
+        read -rp "选择 [1/2/3，默认1]: " DEL_SEL
+        case ${DEL_SEL:-1} in
+            2) DEL_NODE="reality" ;;
+            3) DEL_NODE="ws" ;;
+            *) DEL_NODE="both" ;;
+        esac
+    fi
+
+    # 从对应节点移除
     python3 - <<PYEOF
 import json
+del_node = "$DEL_NODE"
 with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
-clients = cfg["inbounds"][0]["settings"]["clients"]
-clients = [c for c in clients if c.get("id") != "$UUID"]
-cfg["inbounds"][0]["settings"]["clients"] = clients
+for inbound in cfg["inbounds"]:
+    tag = inbound.get("tag", "")
+    if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
+        clients = inbound["settings"]["clients"]
+        inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
 with open("$XRAY_CONFIG", "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
+    if [[ "$DEL_NODE" == "both" ]]; then
+        # 彻底删除用户
+        sed -i "/^${USERNAME}:/d" "$USER_DB"
+        info "用户 ${USERNAME} 已彻底删除"
+    else
+        # 只更新节点字段，保留用户记录
+        local NEW_NODE
+        if [[ "$DEL_NODE" == "reality" ]]; then
+            NEW_NODE="ws"
+        else
+            NEW_NODE="reality"
+        fi
+        sed -i "s/^${USERNAME}:\(.*\):[^:]*$/${USERNAME}:\1:${NEW_NODE}/" "$USER_DB"
+        info "用户 ${USERNAME} 的 ${DEL_NODE} 节点权限已移除，保留 ${NEW_NODE} 节点"
+    fi
+
     systemctl restart xray
-    info "用户 ${USERNAME} 已删除"
 }
 
 # ============================================================
@@ -506,25 +620,52 @@ toggle_user() {
     fi
 
     UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    local USER_NODE
+    USER_NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    USER_NODE=${USER_NODE:-both}
+
+    # 选择操作哪个节点
+    local OP_NODE="both"
+    if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
+        echo ""
+        echo "操作哪个节点？"
+        echo -e "  ${GREEN}1.${NC} 两个节点"
+        echo -e "  ${GREEN}2.${NC} 仅 Reality"
+        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        read -rp "选择 [1/2/3，默认1]: " OP_SEL
+        case ${OP_SEL:-1} in
+            2) OP_NODE="reality" ;;
+            3) OP_NODE="ws" ;;
+            *) OP_NODE="both" ;;
+        esac
+    else
+        OP_NODE="$USER_NODE"
+    fi
 
     if [[ "$ACTION" == "disable" ]]; then
         python3 - <<PYEOF
 import json
+op_node = "$OP_NODE"
 with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
-clients = cfg["inbounds"][0]["settings"]["clients"]
-clients = [c for c in clients if c.get("id") != "$UUID"]
-cfg["inbounds"][0]["settings"]["clients"] = clients
+for inbound in cfg["inbounds"]:
+    tag = inbound.get("tag", "")
+    if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
+        clients = inbound["settings"]["clients"]
+        inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
 with open("$XRAY_CONFIG", "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
+        sed -i "s/^${USERNAME}:\(.*\):active:\(.*\)$/${USERNAME}:\1:disabled:\2/" "$USER_DB"
         sed -i "s/^${USERNAME}:\(.*\):active$/${USERNAME}:\1:disabled/" "$USER_DB"
-        info "用户 ${USERNAME} 已禁用"
+        info "用户 ${USERNAME} 已禁用（节点: ${OP_NODE}）"
     else
+        local EXPIRE
         EXPIRE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f3)
-        _inject_user "$UUID" "$USERNAME" "$EXPIRE"
+        _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$OP_NODE"
+        sed -i "s/^${USERNAME}:\(.*\):disabled:\(.*\)$/${USERNAME}:\1:active:\2/" "$USER_DB"
         sed -i "s/^${USERNAME}:\(.*\):disabled$/${USERNAME}:\1:active/" "$USER_DB"
-        info "用户 ${USERNAME} 已启用"
+        info "用户 ${USERNAME} 已启用（节点: ${OP_NODE}）"
     fi
 
     systemctl restart xray
@@ -717,32 +858,34 @@ main_menu() {
             "${MODE_STR}" "${USER_COUNT}"
         echo -e "${BLUE}╚══════════════════════════════════╝${NC}"
         echo -e " ${GREEN}1.${NC}  安装 Xray + 初始化配置"
-        echo -e " ${GREEN}2.${NC}  添加用户"
-        echo -e " ${GREEN}3.${NC}  删除用户"
-        echo -e " ${GREEN}4.${NC}  禁用用户"
-        echo -e " ${GREEN}5.${NC}  启用用户"
-        echo -e " ${GREEN}6.${NC}  重置到期时间"
-        echo -e " ${GREEN}7.${NC}  查看所有用户"
-        echo -e " ${GREEN}8.${NC}  检查到期用户"
-        echo -e " ${GREEN}9.${NC}  查看节点信息"
-        echo -e " ${GREEN}10.${NC} 设置自动到期检查（cron）"
-        echo -e " ${RED}11.${NC} 卸载 Xray"
+        echo -e " ${GREEN}2.${NC}  切换协议（重新初始化）"
+        echo -e " ${GREEN}3.${NC}  添加用户"
+        echo -e " ${GREEN}4.${NC}  删除用户"
+        echo -e " ${GREEN}5.${NC}  禁用用户"
+        echo -e " ${GREEN}6.${NC}  启用用户"
+        echo -e " ${GREEN}7.${NC}  重置到期时间"
+        echo -e " ${GREEN}8.${NC}  查看所有用户"
+        echo -e " ${GREEN}9.${NC}  检查到期用户"
+        echo -e " ${GREEN}10.${NC} 查看节点信息"
+        echo -e " ${GREEN}11.${NC} 设置自动到期检查（cron）"
+        echo -e " ${RED}12.${NC} 卸载 Xray"
         echo -e " ${RED}0.${NC}  退出"
         echo -e "${BLUE}──────────────────────────────────${NC}"
-        read -rp " 选择 [0-11]: " OPT
+        read -rp " 选择 [0-12]: " OPT
 
         case $OPT in
             1)  install_xray; init_config ;;
-            2)  add_user ;;
-            3)  delete_user ;;
-            4)  toggle_user disable ;;
-            5)  toggle_user enable ;;
-            6)  renew_user ;;
-            7)  list_users ;;
-            8)  check_expire ;;
-            9)  show_info ;;
-            10) setup_cron ;;
-            11) uninstall_xray ;;
+            2)  init_config ;;
+            3)  add_user ;;
+            4)  delete_user ;;
+            5)  toggle_user disable ;;
+            6)  toggle_user enable ;;
+            7)  renew_user ;;
+            8)  list_users ;;
+            9)  check_expire ;;
+            10) show_info ;;
+            11) setup_cron ;;
+            12) uninstall_xray ;;
             0)  exit 0 ;;
             *)  warn "无效选项" ;;
         esac
