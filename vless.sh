@@ -220,7 +220,7 @@ init_ws_cf() {
         -days 3650 \
         -subj "/CN=${WS_DOMAIN}" \
         -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null
-    chmod 600 "${CERT_DIR}/ws.key"
+    chmod 644 "${CERT_DIR}/ws.key"
     info "自签证书生成完成"
 
     cat > "$META_WS" <<EOF
