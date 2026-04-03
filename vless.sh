@@ -1070,7 +1070,7 @@ show_info() {
 # ============================================================
 setup_cron() {
     SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    EXPIRE_CMD="0 1 * * * bash <(curl -sL ${SCRIPT_URL}) --check-expire >> /var/log/xray-expire.log 2>&1"
+    EXPIRE_CMD="0 1 * * * /usr/local/bin/vless_script.sh --check-expire >> /var/log/xray-expire.log 2>&1"
     (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
     info "已设置每日 01:00 自动检查到期用户"
 
