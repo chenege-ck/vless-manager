@@ -58,9 +58,13 @@ install_xray() {
         return
     fi
     install_deps
+    # 备份已有配置
+    [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
     curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
     bash /tmp/xray-install.sh install
     [[ $? -ne 0 ]] && error "安装失败，请检查网络" && exit 1
+    # 恢复配置
+    [[ -f "${XRAY_CONFIG}.bak" ]] && mv "${XRAY_CONFIG}.bak" "$XRAY_CONFIG" && info "已恢复原配置"
     info "Xray 安装成功"
 }
 
@@ -1314,18 +1318,22 @@ update_xray() {
     local CURRENT_VER
     CURRENT_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
     info "当前版本: ${CURRENT_VER}"
-    info "正在检查最新版本..."
+    info "正在下载最新版本..."
+    # 备份配置
+    [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
     curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
     bash /tmp/xray-install.sh install
+    # 恢复配置
+    [[ -f "${XRAY_CONFIG}.bak" ]] && mv "${XRAY_CONFIG}.bak" "$XRAY_CONFIG" && info "已恢复原配置"
     local NEW_VER
     NEW_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
     if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
         info "已是最新版本: ${NEW_VER}"
     else
         info "更新完成: ${CURRENT_VER} → ${NEW_VER}"
-        systemctl restart xray
-        info "Xray 已重启"
     fi
+    systemctl restart xray
+    info "Xray 已重启"
 }
 
 # ============================================================
