@@ -83,6 +83,7 @@ uninstall_xray() {
     rm -rf /usr/local/etc/xray
     rm -f /var/log/xray/access.log /var/log/xray/error.log
     crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray" | crontab -
+    rm -f /usr/local/bin/c
     info "Xray 已完全卸载"
     exit 0
 }
