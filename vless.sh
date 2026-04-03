@@ -313,11 +313,34 @@ rebuild_config() {
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [${INBOUNDS}
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "policy": {
+    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
+    "system": { "statsInboundUplink": true, "statsInboundDownlink": true }
+  },
+  "routing": {
+    "rules": [
+      { "inboundTag": ["api"], "outboundTag": "api", "type": "field" }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 62789,
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1" },
+      "tag": "api"
+    },
+    ${INBOUNDS}
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
+    { "protocol": "blackhole", "tag": "block" },
+    { "protocol": "freedom", "tag": "api" }
   ]
 }
 EOF
@@ -752,7 +775,173 @@ list_users_brief() {
 }
 
 # ============================================================
-# 查看节点信息
+# 流量统计
+# ============================================================
+show_traffic() {
+    title "用户流量统计"
+    [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
+
+    # 检查 API 是否可用
+    if ! command -v curl &>/dev/null; then
+        error "需要 curl 支持"
+        return
+    fi
+
+    # 格式化流量显示
+    fmt_bytes() {
+        local BYTES=$1
+        if [[ $BYTES -ge 1073741824 ]]; then
+            echo "$(python3 -c "print(f'{${BYTES}/1073741824:.2f} GB')")"
+        elif [[ $BYTES -ge 1048576 ]]; then
+            echo "$(python3 -c "print(f'{${BYTES}/1048576:.2f} MB')")"
+        elif [[ $BYTES -ge 1024 ]]; then
+            echo "$(python3 -c "print(f'{${BYTES}/1024:.2f} KB')")"
+        else
+            echo "${BYTES} B"
+        fi
+    }
+
+    echo ""
+    printf "  ${YELLOW}%-15s %-12s %-12s %-12s${NC}\n" "用户名" "上传" "下载" "总计"
+    echo "  ────────────────────────────────────────────────"
+
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+        local UP=0 DOWN=0
+        # 通过 Xray API 查询流量
+        local API_RESULT
+        API_RESULT=$(curl -s --max-time 3 \
+            "http://127.0.0.1:62789/stats/user?email=${NAME}&reset=false" 2>/dev/null)
+
+        if [[ -n "$API_RESULT" ]]; then
+            UP=$(echo "$API_RESULT" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('stat',{}).get('value',0) if 'uplink' in d.get('stat',{}).get('name','') else 0)
+except: print(0)" 2>/dev/null || echo 0)
+            DOWN=$(echo "$API_RESULT" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('stat',{}).get('value',0) if 'downlink' in d.get('stat',{}).get('name','') else 0)
+except: print(0)" 2>/dev/null || echo 0)
+        fi
+
+        # 用 xray api 命令查询（更可靠）
+        if command -v "$XRAY_BIN" &>/dev/null; then
+            local UP_VAL DOWN_VAL
+            UP_VAL=$("$XRAY_BIN" api stats --server=127.0.0.1:62789 \
+                "user>>>$NAME>>>traffic>>>uplink" 2>/dev/null | grep -oP '\d+' | tail -1)
+            DOWN_VAL=$("$XRAY_BIN" api stats --server=127.0.0.1:62789 \
+                "user>>>$NAME>>>traffic>>>downlink" 2>/dev/null | grep -oP '\d+' | tail -1)
+            UP=${UP_VAL:-0}
+            DOWN=${DOWN_VAL:-0}
+        fi
+
+        local TOTAL=$((UP + DOWN))
+        local COLOR=$GREEN
+        [[ "$STATUS" != "active" ]] && COLOR=$RED
+
+        printf "  ${COLOR}%-15s${NC} %-12s %-12s %-12s\n" \
+            "$NAME" "$(fmt_bytes $UP)" "$(fmt_bytes $DOWN)" "$(fmt_bytes $TOTAL)"
+    done < "$USER_DB"
+    echo ""
+    echo -e "  ${YELLOW}提示：流量统计从 Xray 启动后开始计算，重启清零${NC}"
+}
+
+# ============================================================
+# 节点连通性检测
+# ============================================================
+check_nodes() {
+    title "节点连通性检测"
+    load_meta
+    echo ""
+
+    if has_reality; then
+        source "$META_REALITY"
+        echo -ne "  检测 Reality 节点 (${REALITY_PORT})... "
+        if ss -tlnp | grep -q ":${REALITY_PORT} "; then
+            echo -e "${GREEN}● 端口监听正常${NC}"
+        else
+            echo -e "${RED}● 端口未监听${NC}"
+        fi
+        # 测试伪装域名是否可达
+        echo -ne "  检测伪装域名 (${REALITY_SNI})... "
+        if curl -sk --max-time 5 "https://${REALITY_SNI}" -o /dev/null; then
+            echo -e "${GREEN}● 可达${NC}"
+        else
+            echo -e "${YELLOW}● 不可达（可能影响伪装）${NC}"
+        fi
+    fi
+
+    if has_ws; then
+        source "$META_WS"
+        echo -ne "  检测 WS 节点 (${WS_PORT})... "
+        if ss -tlnp | grep -q ":${WS_PORT} "; then
+            echo -e "${GREEN}● 端口监听正常${NC}"
+        else
+            echo -e "${RED}● 端口未监听${NC}"
+        fi
+        # 测试 TLS 握手
+        echo -ne "  检测 TLS 证书... "
+        local CERT_RESULT
+        CERT_RESULT=$(echo | openssl s_client -connect "127.0.0.1:${WS_PORT}" \
+            -servername "${WS_DOMAIN}" 2>/dev/null | grep "Verify return code")
+        if [[ -n "$CERT_RESULT" ]]; then
+            echo -e "${GREEN}● TLS 握手成功${NC}"
+        else
+            echo -e "${RED}● TLS 握手失败${NC}"
+        fi
+        # 测试域名解析
+        echo -ne "  检测域名解析 (${WS_DOMAIN})... "
+        local DOMAIN_IP
+        DOMAIN_IP=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${WS_DOMAIN}&type=A" \
+            -H "accept: application/dns-json" 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Answer'][0]['data'])" 2>/dev/null)
+        if [[ -n "$DOMAIN_IP" ]]; then
+            echo -e "${GREEN}● 解析到 ${DOMAIN_IP}${NC}"
+        else
+            echo -e "${RED}● 域名解析失败${NC}"
+        fi
+    fi
+
+    echo ""
+    echo -ne "  检测 Xray 进程... "
+    if systemctl is-active --quiet xray; then
+        local PID
+        PID=$(systemctl show xray --property=MainPID | cut -d= -f2)
+        echo -e "${GREEN}● 运行中 (PID: ${PID})${NC}"
+    else
+        echo -e "${RED}● 未运行${NC}"
+    fi
+    echo ""
+}
+
+# ============================================================
+# 查看用户分享链接
+# ============================================================
+show_user_link() {
+    title "查看用户分享链接"
+    list_users_brief
+
+    read -rp "输入用户名: " USERNAME
+    [[ -z "$USERNAME" ]] && return
+
+    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+        error "用户不存在"
+        return
+    fi
+
+    local UUID EXPIRE NODE
+    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    EXPIRE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f3)
+    NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    NODE=${NODE:-both}
+
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
+}
+
+# ============================================================
 # ============================================================
 show_info() {
     title "节点信息"
@@ -1190,23 +1379,26 @@ main_menu() {
         echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
         echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  节点连通性检测"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  添加用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  删除用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  启用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  重置到期时间"
-        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  查看所有用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  添加用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  禁用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  重置到期时间"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看所有用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看用户分享链接"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 用户流量统计"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  检查到期用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看节点信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 设置自动到期检查"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 Xray"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 网络优化（BBR/TCP/测速）"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 设置自动到期检查"
+        echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
+        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 网络优化（BBR/TCP/测速）"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED}14.${NC} 卸载 Xray"
+        echo -e "${BLUE}║${NC}   ${RED}17.${NC} 卸载 Xray"
         echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
         echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -1215,18 +1407,21 @@ main_menu() {
         case $OPT in
             1)  install_xray; init_config ;;
             2)  init_config ;;
-            3)  add_user ;;
-            4)  delete_user ;;
-            5)  toggle_user disable ;;
-            6)  toggle_user enable ;;
-            7)  renew_user ;;
-            8)  list_users ;;
-            9)  check_expire ;;
-            10) show_info ;;
-            11) setup_cron ;;
-            12) update_xray ;;
-            13) optimize_menu ;;
-            14) uninstall_xray ;;
+            3)  check_nodes ;;
+            4)  add_user ;;
+            5)  delete_user ;;
+            6)  toggle_user disable ;;
+            7)  toggle_user enable ;;
+            8)  renew_user ;;
+            9)  list_users ;;
+            10) show_user_link ;;
+            11) show_traffic ;;
+            12) check_expire ;;
+            13) show_info ;;
+            14) setup_cron ;;
+            15) update_xray ;;
+            16) optimize_menu ;;
+            17) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
