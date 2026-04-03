@@ -200,39 +200,37 @@ EOF
 # ============================================================
 init_ws_cf() {
     while true; do
-        read -rp "服务器监听端口 [默认 8080]: " WS_PORT
-        WS_PORT=${WS_PORT:-8080}
+        read -rp "监听端口 [默认 443]: " WS_PORT
+        WS_PORT=${WS_PORT:-443}
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
     done
 
-    read -rp "WS 路径 [默认 /ray]: " WS_PATH
-    WS_PATH=${WS_PATH:-/ray}
+    read -rp "WS 路径 [默认 /vless]: " WS_PATH
+    WS_PATH=${WS_PATH:-/vless}
 
     read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
     [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
 
-    echo ""
-    echo -e "${YELLOW}CF 回源端口说明：${NC}"
-    echo -e "  CF 会把客户端流量转发到你服务器的某个端口（回源端口）"
-    echo -e "  如果 CF 回源端口 = 服务器监听端口（${WS_PORT}），直接回车即可"
-    echo -e "  如果你在 CF 设置了不同的回源端口，在这里填那个端口"
-    read -rp "CF 回源端口 [默认与监听端口相同 ${WS_PORT}]: " WS_CF_PORT
-    WS_CF_PORT=${WS_CF_PORT:-$WS_PORT}
-
-    # 手动选择是否启用 TLS
-    read -rp "是否启用 TLS？[Y/n，默认Y]: " TLS_SEL
-    if [[ "$TLS_SEL" == "n" || "$TLS_SEL" == "N" ]]; then
-        WS_TLS="none"
-    else
-        WS_TLS="tls"
-    fi
+    # 自动生成自签证书
+    local CERT_DIR="/usr/local/etc/xray/ssl"
+    mkdir -p "$CERT_DIR"
+    info "正在生成自签证书..."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "${CERT_DIR}/ws.key" \
+        -out "${CERT_DIR}/ws.crt" \
+        -days 3650 \
+        -subj "/CN=${WS_DOMAIN}" \
+        -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null
+    chmod 600 "${CERT_DIR}/ws.key"
+    info "自签证书生成完成"
 
     cat > "$META_WS" <<EOF
 WS_PORT=${WS_PORT}
 WS_PATH=${WS_PATH}
 WS_DOMAIN=${WS_DOMAIN}
-WS_CF_PORT=${WS_CF_PORT}
-WS_TLS=${WS_TLS}
+WS_CF_PORT=${WS_PORT}
+WS_TLS=tls
+CERT_DIR=${CERT_DIR}
 EOF
     chmod 600 "$META_WS"
 
@@ -242,14 +240,14 @@ EOF
     info "WS+CF 节点配置完成"
     echo ""
     echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
-    echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启橙云代理"
-    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}"
-    echo -e "3. CF 回源端口设为 ${GREEN}${WS_CF_PORT}${NC}"
-    echo -e "4. 客户端配置："
+    echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启${GREEN}橙云代理${NC}"
+    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}（不要用严格模式）"
+    echo -e "3. 客户端配置："
     echo -e "   地址   : ${WS_DOMAIN}"
-    echo -e "   端口   : ${WS_CF_PORT}"
+    echo -e "   端口   : ${WS_PORT}"
     echo -e "   WS路径 : ${WS_PATH}"
-    echo -e "   TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
+    echo -e "   TLS    : 开启"
+    echo -e "   SNI    : ${WS_DOMAIN}"
     echo ""
 }
 
@@ -285,6 +283,7 @@ rebuild_config() {
 
     if has_ws; then
         source "$META_WS"
+        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
         INBOUNDS="${INBOUNDS}
     {
       \"port\": ${WS_PORT},
@@ -293,8 +292,16 @@ rebuild_config() {
       \"settings\": { \"clients\": [], \"decryption\": \"none\" },
       \"streamSettings\": {
         \"network\": \"ws\",
-        \"security\": \"none\",
-        \"wsSettings\": { \"path\": \"${WS_PATH}\" }
+        \"security\": \"tls\",
+        \"tlsSettings\": {
+          \"certificates\": [
+            {
+              \"certificateFile\": \"${CERT_DIR}/ws.crt\",
+              \"keyFile\": \"${CERT_DIR}/ws.key\"
+            }
+          ]
+        },
+        \"wsSettings\": { \"path\": \"${WS_PATH}\", \"host\": \"${WS_DOMAIN}\" }
       },
       \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
       \"tag\": \"inbound-ws\"
