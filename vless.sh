@@ -318,34 +318,15 @@ rebuild_config() {
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning" },
-  "stats": {},
-  "api": {
-    "tag": "api",
-    "services": ["StatsService"]
-  },
-  "policy": {
-    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
-    "system": { "statsInboundUplink": true, "statsInboundDownlink": true }
-  },
   "routing": {
-    "rules": [
-      { "inboundTag": ["api"], "outboundTag": "api", "type": "field" }
-    ]
+    "rules": []
   },
   "inbounds": [
-    {
-      "listen": "127.0.0.1",
-      "port": 62789,
-      "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1" },
-      "tag": "api"
-    },
     ${INBOUNDS}
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" },
-    { "protocol": "freedom", "tag": "api" }
   ]
 }
 EOF
@@ -787,80 +768,6 @@ list_users_brief() {
     echo ""
 }
 
-# ============================================================
-# 流量统计
-# ============================================================
-show_traffic() {
-    title "用户流量统计"
-    [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
-
-    # 检查 API 是否可用
-    if ! command -v curl &>/dev/null; then
-        error "需要 curl 支持"
-        return
-    fi
-
-    # 格式化流量显示
-    fmt_bytes() {
-        local BYTES=$1
-        if [[ $BYTES -ge 1073741824 ]]; then
-            echo "$(python3 -c "print(f'{${BYTES}/1073741824:.2f} GB')")"
-        elif [[ $BYTES -ge 1048576 ]]; then
-            echo "$(python3 -c "print(f'{${BYTES}/1048576:.2f} MB')")"
-        elif [[ $BYTES -ge 1024 ]]; then
-            echo "$(python3 -c "print(f'{${BYTES}/1024:.2f} KB')")"
-        else
-            echo "${BYTES} B"
-        fi
-    }
-
-    echo ""
-    printf "  ${YELLOW}%-15s %-12s %-12s %-12s${NC}\n" "用户名" "上传" "下载" "总计"
-    echo "  ────────────────────────────────────────────────"
-
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
-        local UP=0 DOWN=0
-        # 通过 Xray API 查询流量
-        local API_RESULT
-        API_RESULT=$(curl -s --max-time 3 \
-            "http://127.0.0.1:62789/stats/user?email=${NAME}&reset=false" 2>/dev/null)
-
-        if [[ -n "$API_RESULT" ]]; then
-            UP=$(echo "$API_RESULT" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get('stat',{}).get('value',0) if 'uplink' in d.get('stat',{}).get('name','') else 0)
-except: print(0)" 2>/dev/null || echo 0)
-            DOWN=$(echo "$API_RESULT" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get('stat',{}).get('value',0) if 'downlink' in d.get('stat',{}).get('name','') else 0)
-except: print(0)" 2>/dev/null || echo 0)
-        fi
-
-        # 用 xray api 命令查询（更可靠）
-        if command -v "$XRAY_BIN" &>/dev/null; then
-            local UP_VAL DOWN_VAL
-            UP_VAL=$("$XRAY_BIN" api stats --server=127.0.0.1:62789 \
-                "user>>>$NAME>>>traffic>>>uplink" 2>/dev/null | grep -oP '\d+' | tail -1)
-            DOWN_VAL=$("$XRAY_BIN" api stats --server=127.0.0.1:62789 \
-                "user>>>$NAME>>>traffic>>>downlink" 2>/dev/null | grep -oP '\d+' | tail -1)
-            UP=${UP_VAL:-0}
-            DOWN=${DOWN_VAL:-0}
-        fi
-
-        local TOTAL=$((UP + DOWN))
-        local COLOR=$GREEN
-        [[ "$STATUS" != "active" ]] && COLOR=$RED
-
-        printf "  ${COLOR}%-15s${NC} %-12s %-12s %-12s\n" \
-            "$NAME" "$(fmt_bytes $UP)" "$(fmt_bytes $DOWN)" "$(fmt_bytes $TOTAL)"
-    done < "$USER_DB"
-    echo ""
-    echo -e "  ${YELLOW}提示：流量统计从 Xray 启动后开始计算，重启清零${NC}"
-}
 
 # ============================================================
 # 节点连通性检测
@@ -1298,7 +1205,6 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  重置到期时间"
         echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看所有用户"
         echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看用户分享链接"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 用户流量统计"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户"
@@ -1325,7 +1231,6 @@ main_menu() {
             8)  renew_user ;;
             9)  list_users ;;
             10) show_user_link ;;
-            11) show_traffic ;;
             12) check_expire ;;
             13) show_info ;;
             14) setup_cron ;;
