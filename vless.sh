@@ -17,10 +17,10 @@ META_WS="/usr/local/etc/xray/meta-ws.conf"
 # 兼容旧版单节点 meta.conf
 META="/usr/local/etc/xray/meta.conf"
 
-info()  { echo -e "${GREEN}[✓]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
-error() { echo -e "${RED}[✗]${NC} $1"; }
-title() { echo -e "\n${CYAN}$1${NC}"; }
+info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
+warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
+error() { echo -e "${RED}  ✗${NC}  $1"; }
+title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
 
@@ -490,24 +490,9 @@ add_user() {
         return
     fi
 
-    echo "到期方式："
-    echo "  1. 输入天数（如 30）"
-    echo "  2. 输入具体日期（如 2026-12-31）"
-    read -rp "选择 [1/2，默认1]: " EXPIRE_MODE
-    EXPIRE_MODE=${EXPIRE_MODE:-1}
-
-    if [[ "$EXPIRE_MODE" == "2" ]]; then
-        read -rp "到期日期 (YYYY-MM-DD): " EXPIRE
-        if ! date -d "$EXPIRE" +%Y-%m-%d &>/dev/null; then
-            error "日期格式错误"
-            return
-        fi
-        EXPIRE=$(date -d "$EXPIRE" +%Y-%m-%d)
-    else
-        read -rp "到期天数 [默认 30 天]: " DAYS
-        DAYS=${DAYS:-30}
-        EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
-    fi
+    read -rp "到期天数 [默认 30 天]: " DAYS
+    DAYS=${DAYS:-30}
+    EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
     echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
@@ -607,24 +592,9 @@ renew_user() {
         return
     fi
 
-    echo "到期方式："
-    echo "  1. 输入天数（如 30）"
-    echo "  2. 输入具体日期（如 2026-12-31）"
-    read -rp "选择 [1/2，默认1]: " EXPIRE_MODE
-    EXPIRE_MODE=${EXPIRE_MODE:-1}
-
-    if [[ "$EXPIRE_MODE" == "2" ]]; then
-        read -rp "新到期日期 (YYYY-MM-DD): " NEW_EXPIRE
-        if ! date -d "$NEW_EXPIRE" +%Y-%m-%d &>/dev/null; then
-            error "日期格式错误"
-            return
-        fi
-        NEW_EXPIRE=$(date -d "$NEW_EXPIRE" +%Y-%m-%d)
-    else
-        read -rp "续期天数 [默认 30 天]: " DAYS
-        DAYS=${DAYS:-30}
-        NEW_EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
-    fi
+    read -rp "续期天数 [默认 30 天]: " DAYS
+    DAYS=${DAYS:-30}
+    NEW_EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
 
     UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
     sed -i "s/^${USERNAME}:${UUID}:.*$/${USERNAME}:${UUID}:${NEW_EXPIRE}:active/" "$USER_DB"
@@ -752,18 +722,24 @@ list_users() {
 
     local TOTAL ACTIVE DISABLED
     TOTAL=$(wc -l < "$USER_DB")
-    ACTIVE=$(grep -c ":active$" "$USER_DB" 2>/dev/null || echo 0)
-    DISABLED=$(grep -c ":disabled$" "$USER_DB" 2>/dev/null || echo 0)
-    echo -e "共 ${TOTAL} 个用户  ${GREEN}活跃: ${ACTIVE}${NC}  ${RED}禁用: ${DISABLED}${NC}"
-    echo ""
-    printf "%-15s %-38s %-12s %-10s\n" "用户名" "UUID" "到期日" "状态"
-    echo "----------------------------------------------------------------------"
-    while IFS=: read -r NAME UUID EXPIRE STATUS; do
-        COLOR=$NC
-        [[ "$STATUS" == "disabled" ]] && COLOR=$RED
-        [[ "$STATUS" == "active" ]] && COLOR=$GREEN
-        printf "${COLOR}%-15s %-38s %-12s %-10s${NC}\n" "$NAME" "$UUID" "$EXPIRE" "$STATUS"
+    ACTIVE=$(grep -c ":active" "$USER_DB" 2>/dev/null || echo 0)
+    DISABLED=$((TOTAL - ACTIVE))
+    echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
+    echo -e "  ${YELLOW}%-15s %-38s %-12s %-8s %-8s${NC}" "用户名" "UUID" "到期日" "状态" "节点"
+    echo -e "  ──────────────────────────────────────────────────────────────────────────────────"
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+        NODE=${NODE:-both}
+        local COLOR=$NC
+        local STATUS_ICON="○"
+        if [[ "$STATUS" == "active" ]]; then
+            COLOR=$GREEN; STATUS_ICON="●"
+        elif [[ "$STATUS" == "disabled" ]]; then
+            COLOR=$RED; STATUS_ICON="○"
+        fi
+        printf "  ${COLOR}%-15s %-38s %-12s %-8s %-8s${NC}\n" \
+            "$NAME" "$UUID" "$EXPIRE" "${STATUS_ICON} ${STATUS}" "$NODE"
     done < "$USER_DB"
+    echo ""
 }
 
 list_users_brief() {
@@ -1191,38 +1167,50 @@ main_menu() {
     while true; do
         clear
         load_meta
-        local XRAY_STATUS USER_COUNT MODE_STR
+        local XRAY_STATUS USER_COUNT
         XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
         USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+        local ACTIVE_COUNT=0
+        [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active" "$USER_DB" 2>/dev/null || echo 0)
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
         has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
 
-        echo -e "${BLUE}╔══════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║     VLESS 节点用户管理工具       ║${NC}"
-        echo -e "${BLUE}╠══════════════════════════════════╣${NC}"
-        printf "${BLUE}║${NC} Xray: %-8s 模式: %-8s 用户: %s\n" \
-            "$( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}停止${NC}" )" \
-            "${MODE_STR}" "${USER_COUNT}"
-        echo -e "${BLUE}╚══════════════════════════════════╝${NC}"
-        echo -e " ${GREEN}1.${NC}  安装 Xray + 初始化配置"
-        echo -e " ${GREEN}2.${NC}  切换协议（重新初始化）"
-        echo -e " ${GREEN}3.${NC}  添加用户"
-        echo -e " ${GREEN}4.${NC}  删除用户"
-        echo -e " ${GREEN}5.${NC}  禁用用户"
-        echo -e " ${GREEN}6.${NC}  启用用户"
-        echo -e " ${GREEN}7.${NC}  重置到期时间"
-        echo -e " ${GREEN}8.${NC}  查看所有用户"
-        echo -e " ${GREEN}9.${NC}  检查到期用户"
-        echo -e " ${GREEN}10.${NC} 查看节点信息"
-        echo -e " ${GREEN}11.${NC} 设置自动到期检查（cron）"
-        echo -e " ${GREEN}12.${NC} 更新 Xray"
-        echo -e " ${GREEN}13.${NC} 网络优化（BBR / TCP / 测速）"
-        echo -e " ${RED}14.${NC} 卸载 Xray"
-        echo -e " ${RED}0.${NC}  退出"
-        echo -e "${BLUE}──────────────────────────────────${NC}"
-        read -rp " 选择 [0-14]: " OPT
+        local STATUS_COLOR=$RED
+        local STATUS_TEXT="● 已停止"
+        [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
+
+        echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.0${NC}       ${BLUE}║${NC}"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
+        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  添加用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  重置到期时间"
+        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  查看所有用户"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  检查到期用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看节点信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 设置自动到期检查"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 Xray"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 网络优化（BBR/TCP/测速）"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}   ${RED}14.${NC} 卸载 Xray"
+        echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
+        echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
+        echo -ne " 请选择 » "
+        read -r OPT
 
         case $OPT in
             1)  install_xray; init_config ;;
@@ -1239,12 +1227,13 @@ main_menu() {
             12) update_xray ;;
             13) optimize_menu ;;
             14) uninstall_xray ;;
-            0)  exit 0 ;;
-            *)  warn "无效选项" ;;
+            0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
+            *)  warn "无效选项，请重新选择" ;;
         esac
 
         echo ""
-        read -rp "按 Enter 继续..." _
+        echo -ne "${BLUE}按 Enter 返回菜单...${NC}"
+        read -r _
     done
 }
 
