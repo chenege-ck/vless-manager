@@ -82,7 +82,7 @@ uninstall_xray() {
     bash /tmp/xray-install.sh remove
     rm -rf /usr/local/etc/xray
     rm -f /var/log/xray/access.log /var/log/xray/error.log
-    crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray" | crontab -
+    crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
     rm -f /usr/local/bin/c
     info "Xray 已完全卸载"
     exit 0
@@ -769,73 +769,6 @@ list_users_brief() {
 }
 
 
-# ============================================================
-# 节点连通性检测
-# ============================================================
-check_nodes() {
-    title "节点连通性检测"
-    load_meta
-    echo ""
-
-    if has_reality; then
-        source "$META_REALITY"
-        echo -ne "  检测 Reality 节点 (${REALITY_PORT})... "
-        if ss -tlnp | grep -q ":${REALITY_PORT} "; then
-            echo -e "${GREEN}● 端口监听正常${NC}"
-        else
-            echo -e "${RED}● 端口未监听${NC}"
-        fi
-        # 测试伪装域名是否可达
-        echo -ne "  检测伪装域名 (${REALITY_SNI})... "
-        if curl -sk --max-time 5 "https://${REALITY_SNI}" -o /dev/null; then
-            echo -e "${GREEN}● 可达${NC}"
-        else
-            echo -e "${YELLOW}● 不可达（可能影响伪装）${NC}"
-        fi
-    fi
-
-    if has_ws; then
-        source "$META_WS"
-        echo -ne "  检测 WS 节点 (${WS_PORT})... "
-        if ss -tlnp | grep -q ":${WS_PORT} "; then
-            echo -e "${GREEN}● 端口监听正常${NC}"
-        else
-            echo -e "${RED}● 端口未监听${NC}"
-        fi
-        # 测试 TLS 握手
-        echo -ne "  检测 TLS 证书... "
-        local CERT_RESULT
-        CERT_RESULT=$(echo | openssl s_client -connect "127.0.0.1:${WS_PORT}" \
-            -servername "${WS_DOMAIN}" 2>/dev/null | grep "Verify return code")
-        if [[ -n "$CERT_RESULT" ]]; then
-            echo -e "${GREEN}● TLS 握手成功${NC}"
-        else
-            echo -e "${RED}● TLS 握手失败${NC}"
-        fi
-        # 测试域名解析
-        echo -ne "  检测域名解析 (${WS_DOMAIN})... "
-        local DOMAIN_IP
-        DOMAIN_IP=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${WS_DOMAIN}&type=A" \
-            -H "accept: application/dns-json" 2>/dev/null | \
-            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Answer'][0]['data'])" 2>/dev/null)
-        if [[ -n "$DOMAIN_IP" ]]; then
-            echo -e "${GREEN}● 解析到 ${DOMAIN_IP}${NC}"
-        else
-            echo -e "${RED}● 域名解析失败${NC}"
-        fi
-    fi
-
-    echo ""
-    echo -ne "  检测 Xray 进程... "
-    if systemctl is-active --quiet xray; then
-        local PID
-        PID=$(systemctl show xray --property=MainPID | cut -d= -f2)
-        echo -e "${GREEN}● 运行中 (PID: ${PID})${NC}"
-    else
-        echo -e "${RED}● 未运行${NC}"
-    fi
-    echo ""
-}
 
 # ============================================================
 # 查看用户分享链接
@@ -912,12 +845,10 @@ show_info() {
 setup_cron() {
     SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
     EXPIRE_CMD="0 1 * * * bash <(curl -sL ${SCRIPT_URL}) --check-expire >> /var/log/xray-expire.log 2>&1"
-    LOG_CMD="0 3 * * 0 truncate -s 0 /var/log/xray/access.log /var/log/xray/error.log"
-    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "truncate.*xray"; echo "$EXPIRE_CMD"; echo "$LOG_CMD") | crontab -
+    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
     info "已设置每日 01:00 自动检查到期用户"
-    info "已设置每周日 03:00 自动清理日志"
 
-    # 配置 logrotate 自动轮转 xray-expire.log
+    # 配置 logrotate 自动轮转日志（保留4周）
     cat > /etc/logrotate.d/xray-expire <<EOF
 /var/log/xray-expire.log {
     weekly
@@ -928,7 +859,6 @@ setup_cron() {
     create 0640 root root
 }
 EOF
-    # 同时配置 xray 自身日志轮转
     cat > /etc/logrotate.d/xray <<EOF
 /var/log/xray/*.log {
     weekly
@@ -1195,7 +1125,6 @@ main_menu() {
         echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
         echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
-        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  节点连通性检测"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  添加用户"
@@ -1223,7 +1152,6 @@ main_menu() {
         case $OPT in
             1)  install_xray; init_config ;;
             2)  init_config ;;
-            3)  check_nodes ;;
             4)  add_user ;;
             5)  delete_user ;;
             6)  toggle_user disable ;;
