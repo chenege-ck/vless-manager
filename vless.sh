@@ -1088,7 +1088,7 @@ optimize_tcp() {
 
     # 先测两个节点取平均延迟和丢包
     local TOTAL_MS=0 TOTAL_FAIL=0 TOTAL_COUNT=0
-    local TARGETS=("v4-sc-ct.oojj.de:80" "v4-sc-cm.oojj.de:80")
+    local TARGETS=("61.139.2.69" "119.6.6.6" "211.137.96.205")
 
     for TARGET in "${TARGETS[@]}"; do
         local HOST="${TARGET%%:*}"
@@ -1244,8 +1244,9 @@ network_test() {
 
     # 测试节点：域名:端口
     declare -A TARGETS=(
-        ["电信-四川"]="v4-sc-ct.oojj.de:80"
-        ["移动-四川"]="v4-sc-cm.oojj.de:80"
+        ["成都电信"]="61.139.2.69"
+        ["成都联通"]="119.6.6.6"
+        ["成都移动"]="211.137.96.205"
     )
 
     printf "%-15s %-30s %-12s %-10s\n" "线路" "节点" "延迟(ms)" "状态"
