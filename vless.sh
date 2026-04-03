@@ -397,6 +397,8 @@ with open("$XRAY_CONFIG", "r") as f:
 node = "$NODE"
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
+    if "clients" not in inbound.get("settings", {}):
+        continue
     clients = inbound["settings"]["clients"]
     clients = [c for c in clients if c.get("id") != "$UUID"]
     if node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws"):
@@ -579,6 +581,8 @@ with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
+    if "clients" not in inbound.get("settings", {}):
+        continue
     if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
@@ -678,6 +682,8 @@ with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
+    if "clients" not in inbound.get("settings", {}):
+        continue
     if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
@@ -728,9 +734,11 @@ import json
 expired = "$EXPIRED_UUIDS".split()
 with open("$XRAY_CONFIG", "r") as f:
     cfg = json.load(f)
-clients = cfg["inbounds"][0]["settings"]["clients"]
-clients = [c for c in clients if c.get("id") not in expired]
-cfg["inbounds"][0]["settings"]["clients"] = clients
+for inbound in cfg["inbounds"]:
+    if "clients" not in inbound.get("settings", {}):
+        continue
+    clients = inbound["settings"]["clients"]
+    inbound["settings"]["clients"] = [c for c in clients if c.get("id") not in expired]
 with open("$XRAY_CONFIG", "w") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
