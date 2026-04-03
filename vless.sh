@@ -1083,41 +1083,14 @@ EOF
 # TCP 智能优化（根据网络测试结果动态调整）
 # ============================================================
 optimize_tcp() {
-    title "TCP 智能优化..."
-    echo -e "正在测试网络质量，请稍候...\n"
-
-    # 先测两个节点取平均延迟和丢包
-    local TOTAL_MS=0 TOTAL_FAIL=0 TOTAL_COUNT=0
-    local TARGETS=("61.139.2.69" "119.6.6.6" "211.137.96.205")
-
-    for TARGET in "${TARGETS[@]}"; do
-        local HOST="${TARGET%%:*}"
-        local PORT="${TARGET##*:}"
-        for i in {1..20}; do
-            local MS
-            MS=$(curl -o /dev/null -s -w "%{time_connect}" \
-                --connect-timeout 3 --max-time 5 \
-                "http://${HOST}:${PORT}/" 2>/dev/null)
-            if [[ $? -eq 0 && -n "$MS" && "$MS" != "0.000000" ]]; then
-                local MS_INT
-                MS_INT=$(python3 -c "print(int(float('${MS}') * 1000))" 2>/dev/null)
-                TOTAL_MS=$((TOTAL_MS + MS_INT))
-                TOTAL_COUNT=$((TOTAL_COUNT + 1))
-            else
-                TOTAL_FAIL=$((TOTAL_FAIL + 1))
-            fi
-        done
-    done
-
-    # 计算平均延迟和丢包率
-    local AVG_MS=999 LOSS_PCT=100
-    if [[ $TOTAL_COUNT -gt 0 ]]; then
-        AVG_MS=$((TOTAL_MS / TOTAL_COUNT))
-        LOSS_PCT=$(( TOTAL_FAIL * 100 / (TOTAL_COUNT + TOTAL_FAIL) ))
-    fi
-
-    echo -e "测试结果：平均延迟 ${CYAN}${AVG_MS}ms${NC}  丢包率 ${CYAN}${LOSS_PCT}%${NC}"
+    title "TCP 参数优化"
     echo ""
+    echo -e "  请选择服务器所在区域："
+    echo -e "  ${GREEN}1.${NC} 亚太低延迟（日本/香港/新加坡 → 国内，延迟 50-150ms）"
+    echo -e "  ${GREEN}2.${NC} 美国高延迟（美西/美东 → 国内，延迟 150ms+）"
+    echo -e "  ${GREEN}0.${NC} 返回"
+    echo ""
+    read -rp "选择: " SEL
 
     # 避免重复写入
     if grep -q "VLESS TCP优化" /etc/sysctl.conf 2>/dev/null; then
@@ -1125,177 +1098,64 @@ optimize_tcp() {
         sed -i '/# VLESS TCP优化/,/^$/d' /etc/sysctl.conf
     fi
 
-    # 根据延迟和丢包率选择优化策略
-    local STRATEGY=""
-    local STRATEGY_DESC=""
-
-    if [[ $AVG_MS -lt 80 && $LOSS_PCT -lt 5 ]]; then
-        # 延迟低、丢包低 → 线路优质，轻度优化即可
-        STRATEGY="good"
-        STRATEGY_DESC="线路优质，使用轻度优化"
-
-    elif [[ $AVG_MS -lt 80 && $LOSS_PCT -ge 5 ]]; then
-        # 延迟低、丢包高 → 线路不稳定，加强重传
-        STRATEGY="low_latency_high_loss"
-        STRATEGY_DESC="延迟低但丢包高，启用激进重传优化"
-
-    elif [[ $AVG_MS -ge 80 && $AVG_MS -lt 150 && $LOSS_PCT -lt 5 ]]; then
-        # 延迟中、丢包低 → 距离较远，加大缓冲区
-        STRATEGY="high_latency_low_loss"
-        STRATEGY_DESC="延迟较高但线路稳定，加大缓冲区"
-
-    else
-        # 延迟高、丢包高 → 线路很差，激进全套优化
-        STRATEGY="bad"
-        STRATEGY_DESC="线路较差，启用全套激进优化"
-    fi
-
-    info "优化策略：${STRATEGY_DESC}"
-    echo ""
-
-    case $STRATEGY in
-        good)
+    case $SEL in
+        1)
             cat >> /etc/sysctl.conf <<EOF
 
-# VLESS TCP优化 - 策略:轻度(低延迟低丢包)
+# VLESS TCP优化 - 亚太低延迟策略
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
-EOF
-            ;;
-
-        low_latency_high_loss)
-            cat >> /etc/sysctl.conf <<EOF
-
-# VLESS TCP优化 - 策略:重传优化(低延迟高丢包)
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
 EOF
+            modprobe tcp_bbr 2>/dev/null
+            sysctl -p &>/dev/null
+            info "亚太低延迟 TCP 优化完成"
             ;;
-
-        high_latency_low_loss)
+        2)
             cat >> /etc/sysctl.conf <<EOF
 
-# VLESS TCP优化 - 策略:大缓冲区(高延迟低丢包)
+# VLESS TCP优化 - 美国高延迟策略
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.netdev_max_backlog = 250000
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-EOF
-            ;;
-
-        bad)
-            cat >> /etc/sysctl.conf <<EOF
-
-# VLESS TCP优化 - 策略:全套激进(高延迟高丢包)
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
 net.core.rmem_max = 134217728
 net.core.wmem_max = 134217728
 net.core.netdev_max_backlog = 250000
 net.core.somaxconn = 8192
 net.ipv4.tcp_rmem = 4096 87380 134217728
 net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
 EOF
+            modprobe tcp_bbr 2>/dev/null
+            sysctl -p &>/dev/null
+            info "美国高延迟 TCP 优化完成"
             ;;
+        0) return ;;
+        *) warn "无效选项" ;;
     esac
-
-    # 加载 BBR 模块
-    modprobe tcp_bbr 2>/dev/null
-    sysctl -p &>/dev/null
-    info "TCP 智能优化完成！策略：${STRATEGY_DESC}"
 }
 
-# ============================================================
-# 网络质量测试（测延迟 + 丢包率）
-# ============================================================
-network_test() {
-    title "网络质量测试..."
-    echo -e "测试服务器到国内各运营商的延迟和丢包率...\n"
-
-    # 测试节点：域名:端口
-    declare -A TARGETS=(
-        ["成都电信"]="61.139.2.69"
-        ["成都联通"]="119.6.6.6"
-        ["成都移动"]="211.137.96.205"
-    )
-
-    printf "%-15s %-30s %-12s %-10s\n" "线路" "节点" "延迟(ms)" "状态"
-    echo "──────────────────────────────────────────────────────"
-
-    for NAME in "${!TARGETS[@]}"; do
-        local TARGET="${TARGETS[$NAME]}"
-        local HOST="${TARGET%%:*}"
-        local PORT="${TARGET##*:}"
-
-        # 用 curl 测 HTTP 连接延迟，测5次取平均
-        local TOTAL=0 COUNT=0 FAIL=0
-        for i in {1..20}; do
-            local MS
-            MS=$(curl -o /dev/null -s -w "%{time_connect}" \
-                --connect-timeout 3 --max-time 5 \
-                "http://${HOST}:${PORT}/" 2>/dev/null)
-            if [[ $? -eq 0 && -n "$MS" && "$MS" != "0.000000" ]]; then
-                # 转换为毫秒整数
-                local MS_INT
-                MS_INT=$(python3 -c "print(int(float('${MS}') * 1000))" 2>/dev/null)
-                TOTAL=$((TOTAL + MS_INT))
-                COUNT=$((COUNT + 1))
-            else
-                FAIL=$((FAIL + 1))
-            fi
-        done
-
-        if [[ $COUNT -eq 0 ]]; then
-            printf "${RED}%-15s${NC} %-30s ${RED}%-12s${NC} ${RED}%s${NC}\n" \
-                "$NAME" "$TARGET" "超时" "全部失败"
-        else
-            local AVG=$((TOTAL / COUNT))
-            local LOSS_PCT=$(( FAIL * 100 / 20 ))
-            if [[ $AVG -lt 80 ]]; then
-                printf "${GREEN}%-15s${NC} %-30s ${GREEN}%-12s${NC} ${GREEN}丢包:${LOSS_PCT}%%${NC}\n" \
-                    "$NAME" "$TARGET" "${AVG}ms"
-            elif [[ $AVG -lt 150 ]]; then
-                printf "${YELLOW}%-15s${NC} %-30s ${YELLOW}%-12s${NC} ${YELLOW}丢包:${LOSS_PCT}%%${NC}\n" \
-                    "$NAME" "$TARGET" "${AVG}ms"
-            else
-                printf "${RED}%-15s${NC} %-30s ${RED}%-12s${NC} ${RED}丢包:${LOSS_PCT}%%${NC}\n" \
-                    "$NAME" "$TARGET" "${AVG}ms"
-            fi
-        fi
-    done
-    echo ""
-    echo -e "${GREEN}<80ms${NC} 优秀  ${YELLOW}80-150ms${NC} 一般  ${RED}>150ms${NC} 较差"
-}
 
 # ============================================================
 # 一键优化菜单
@@ -1304,9 +1164,8 @@ optimize_menu() {
     title "网络优化"
     echo ""
     echo -e "  ${GREEN}1.${NC} 开启 BBR（推荐，提升吞吐量）"
-    echo -e "  ${GREEN}2.${NC} TCP 参数优化（缓冲区/队列调优）"
+    echo -e "  ${GREEN}2.${NC} TCP 参数优化（选择区域策略）"
     echo -e "  ${GREEN}3.${NC} 一键全部优化（BBR + TCP）"
-    echo -e "  ${GREEN}4.${NC} 网络质量测试（延迟 + 丢包）"
     echo -e "  ${GREEN}0.${NC} 返回"
     echo ""
     read -rp "选择: " OPT
@@ -1314,7 +1173,6 @@ optimize_menu() {
         1) enable_bbr ;;
         2) optimize_tcp ;;
         3) enable_bbr; optimize_tcp ;;
-        4) network_test ;;
         0) return ;;
         *) warn "无效选项" ;;
     esac
