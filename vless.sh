@@ -1205,16 +1205,49 @@ update_xray() {
 }
 
 # ============================================================
+# 更新脚本到最新版本
+# ============================================================
+update_script() {
+    title "更新管理脚本..."
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+    info "正在从 GitHub 拉取最新版本..."
+    local TMP_SCRIPT="/tmp/vless_new.sh"
+    curl -sL "$SCRIPT_URL" -o "$TMP_SCRIPT"
+    if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
+        error "下载失败，请检查网络"
+        return
+    fi
+    # 验证脚本完整性
+    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
+        error "脚本语法错误，取消更新"
+        rm -f "$TMP_SCRIPT"
+        return
+    fi
+    # 替换快捷命令
+    cp "$TMP_SCRIPT" /usr/local/bin/vless_script.sh
+    chmod +x /usr/local/bin/vless_script.sh
+    rm -f "$TMP_SCRIPT"
+    info "脚本已更新，用户数据完整保留"
+    info "正在重新启动新版本..."
+    sleep 1
+    exec bash /usr/local/bin/vless_script.sh
+}
+
+# ============================================================
 # 安装快捷命令 c
 # ============================================================
 install_shortcut() {
-    SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+    # 首次或脚本不存在时下载到本地
+    if [[ ! -f /usr/local/bin/vless_script.sh ]]; then
+        curl -sL "$SCRIPT_URL" -o /usr/local/bin/vless_script.sh 2>/dev/null
+        chmod +x /usr/local/bin/vless_script.sh
+    fi
     cat > /usr/local/bin/c <<EOF
 #!/bin/bash
-bash <(curl -sL ${SCRIPT_URL})
+bash /usr/local/bin/vless_script.sh
 EOF
     chmod +x /usr/local/bin/c
-    info "快捷命令已安装，输入 c 即可进入面板"
 }
 
 # ============================================================
@@ -1272,9 +1305,10 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
         echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 设置自动到期检查"
         echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
-        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 网络优化（BBR/TCP/测速）"
+        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优化（BBR/TCP）"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED}17.${NC} 卸载 Xray"
+        echo -e "${BLUE}║${NC}   ${RED}18.${NC} 卸载 Xray"
         echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
         echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -1296,8 +1330,9 @@ main_menu() {
             13) show_info ;;
             14) setup_cron ;;
             15) update_xray ;;
-            16) optimize_menu ;;
-            17) uninstall_xray ;;
+            16) update_script ;;
+            17) optimize_menu ;;
+            18) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
