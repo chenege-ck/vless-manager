@@ -1032,6 +1032,7 @@ show_user_link() {
 
 # ============================================================
 # ============================================================
+# ============================================================
 # 主机信息
 # ============================================================
 show_host_status() {
@@ -1042,18 +1043,18 @@ show_host_status() {
     LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
 
-    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%dMB/%dMB", $3, $2}' 2>/dev/null)
+    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
     [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
 
-    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%dMB/%dMB", $3, $2}' 2>/dev/null)
+    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
     [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
 
-    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //' | awk -F, '{print $1","$2}')
+    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //' | awk -F, '{print $1}')
     [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
 
-    printf "${BLUE}║${NC}  IP   ${CYAN}%-26s${NC}║\n" "$PUBLIC_IP"
-    printf "${BLUE}║${NC}  LOAD ${GREEN}%-8s${NC} MEM  ${YELLOW}%-13s${NC}║\n" "$LOAD_INFO" "$MEM_INFO"
-    printf "${BLUE}║${NC}  SWAP ${YELLOW}%-13s${NC} UP   ${CYAN}%-16s${NC}║\n" "$SWAP_INFO" "$UPTIME_INFO"
+    echo -e "${BLUE}║${NC}  IP   ${CYAN}${PUBLIC_IP}${NC}"
+    echo -e "${BLUE}║${NC}  负载 ${GREEN}${LOAD_INFO}${NC}  内存 ${YELLOW}${MEM_INFO}${NC}"
+    echo -e "${BLUE}║${NC}  交换 ${YELLOW}${SWAP_INFO}${NC}  在线 ${CYAN}${UPTIME_INFO}${NC}"
 }
 # ============================================================
 # 节点信息
