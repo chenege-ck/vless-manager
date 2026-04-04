@@ -1032,15 +1032,16 @@ show_user_link() {
 
 # ============================================================
 # ============================================================
+# ============================================================
 # 主机信息
 # ============================================================
 show_host_status() {
-    local PUBLIC_IP CPU_LOAD MEM_INFO SWAP_INFO UPTIME_INFO
+    local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
 
     PUBLIC_IP=$(get_public_ip)
 
-    CPU_LOAD=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    [[ -z "$CPU_LOAD" ]] && CPU_LOAD="N/A"
+    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
 
     MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%dMB/%dMB", $3, $2}' 2>/dev/null)
     [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
@@ -1052,7 +1053,7 @@ show_host_status() {
     [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
 
     printf "${BLUE}║${NC}  IP   ${CYAN}%-26s${NC}║\n" "$PUBLIC_IP"
-    printf "${BLUE}║${NC}  LOAD ${GREEN}%-8s${NC} MEM  ${YELLOW}%-13s${NC}║\n" "$CPU_LOAD" "$MEM_INFO"
+    printf "${BLUE}║${NC}  LOAD ${GREEN}%-8s${NC} MEM  ${YELLOW}%-13s${NC}║\n" "$LOAD_INFO" "$MEM_INFO"
     printf "${BLUE}║${NC}  SWAP ${YELLOW}%-13s${NC} UP   ${CYAN}%-12s${NC}║\n" "$SWAP_INFO" "$UPTIME_INFO"
 }
 # ============================================================
