@@ -1049,27 +1049,48 @@ show_host_status() {
 EOF
 }
 # ============================================================
+# ============================================================
 # 节点信息
 # ============================================================
 show_info() {
     title "节点信息"
     load_meta
     normalize_user_db
+
     local XRAY_STATUS USER_COUNT ACTIVE_COUNT
+    local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
+
     XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
     USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
     ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
+    PUBLIC_IP=$(get_public_ip)
+    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
+
+    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
+    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
+
+    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
+    [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
+
+    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
+    [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
+
     echo -e "状态   : $( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
     echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
+    echo -e "公网IP : ${PUBLIC_IP}"
+    echo -e "负载   : ${LOAD_INFO}"
+    echo -e "内存   : ${MEM_INFO}"
+    echo -e "交换   : ${SWAP_INFO}"
+    echo -e "在线   : ${UPTIME_INFO}"
     echo ""
 
     if has_reality; then
-        local SERVER_IP SHORTID
-        SERVER_IP=$(get_public_ip)
+        local SHORTID
         SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
         echo -e "${CYAN}── Reality 节点 ──${NC}"
-        echo -e "IP     : ${SERVER_IP}"
+        echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${REALITY_PORT}"
         echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
         echo -e "SNI    : ${REALITY_SNI}"
@@ -1092,7 +1113,6 @@ show_info() {
         warn "尚未配置任何节点，请选择菜单 1 或 2 初始化"
     fi
 }
-
 # ============================================================
 # 设置 cron
 # ============================================================
@@ -1351,17 +1371,19 @@ if [[ "$1" == "--check-expire" ]]; then
 fi
 
 # ============================================================
+# ============================================================
 # 主菜单
 # ============================================================
 main_menu() {
     while true; do
+        clear
         normalize_user_db
         load_meta
 
-        local XRAY_STATUS USER_COUNT ACTIVE_COUNT
+        local XRAY_STATUS USER_COUNT
         XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
         USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-        ACTIVE_COUNT=0
+        local ACTIVE_COUNT=0
         [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
         local MODE_STR=""
@@ -1373,43 +1395,35 @@ main_menu() {
         local STATUS_TEXT="● 已停止"
         [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
-        local HOST_INFO
-        HOST_INFO="$(show_host_status)"
-
-        printf '\033[2J\033[H'
-        cat <<EOF
-${BLUE}╔════════════════════════════════════╗${NC}
-${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.1${NC}       ${BLUE}║${NC}
-${BLUE}╠════════════════════════════════════╣${NC}
-${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}
-${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计
-${BLUE}╠════════════════════════════════════╣${NC}
-${HOST_INFO}
-${BLUE}╠════════════════════════════════════╣${NC}
-${BLUE}║${NC}  ${CYAN}节点管理${NC}
-${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点
-${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点
-${BLUE}╠════════════════════════════════════╣${NC}
-${BLUE}║${NC}  ${CYAN}用户管理${NC}
-${BLUE}║${NC}   ${GREEN}4.${NC}  添加用户
-${BLUE}║${NC}   ${GREEN}5.${NC}  删除用户
-${BLUE}║${NC}   ${GREEN}6.${NC}  禁用用户
-${BLUE}║${NC}   ${GREEN}7.${NC}  启用用户
-${BLUE}║${NC}   ${GREEN}8.${NC}  重置到期时间
-${BLUE}║${NC}   ${GREEN}9.${NC}  查看所有用户
-${BLUE}║${NC}   ${GREEN}10.${NC} 查看用户分享链接
-${BLUE}╠════════════════════════════════════╣${NC}
-${BLUE}║${NC}  ${CYAN}系统工具${NC}
-${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户
-${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息
-${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray
-${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本
-${BLUE}║${NC}   ${GREEN}17.${NC} 网络优化（BBR/TCP）
-${BLUE}╠════════════════════════════════════╣${NC}
-${BLUE}║${NC}   ${RED}18.${NC} 卸载 Xray
-${BLUE}║${NC}   ${RED}0.${NC}  退出
-${BLUE}╚════════════════════════════════════╝${NC}
-EOF
+        echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.1${NC}       ${BLUE}║${NC}"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
+        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  添加用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  禁用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  重置到期时间"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看所有用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看用户分享链接"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
+        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优化（BBR/TCP）"
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}   ${RED}18.${NC} 卸载 Xray"
+        echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
+        echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
         read -r OPT
 
