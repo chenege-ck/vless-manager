@@ -665,6 +665,7 @@ _print_link() {
 }
 
 # ============================================================
+# ============================================================
 # 添加用户
 # ============================================================
 add_user() {
@@ -708,7 +709,14 @@ add_user() {
 
     read -rp "到期天数 [默认 30 天]: " DAYS
     DAYS=${DAYS:-30}
-    EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
+
+    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+        error "到期天数必须是纯数字"
+        return
+    fi
+
+    EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d 2>/dev/null)
+    [[ -z "$EXPIRE" ]] && error "到期时间计算失败" && return
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
     echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
@@ -718,15 +726,19 @@ add_user() {
         sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
         rebuild_config
         _inject_all_users
+        error "配置校验失败，已回滚本次添加"
         return 1
     }
 
-    systemctl restart xray
-    if systemctl is-active --quiet xray; then
-        _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
-    else
-        error "Xray 重启失败，请检查配置"
-    fi
+    _start_xray || {
+        sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
+        rebuild_config
+        _inject_all_users
+        error "Xray 重启失败，已回滚本次添加"
+        return 1
+    }
+
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
 
 # ============================================================
