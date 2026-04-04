@@ -23,7 +23,27 @@ error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
+# ============================================================
+# 仅支持 Debian
+# ============================================================
+check_system() {
+    local OS_ID CODENAME
+    OS_ID=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+    CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
 
+    if [[ "$OS_ID" != "debian" ]]; then
+        error "本脚本仅支持 Debian 11/12/13，不支持当前系统"
+        exit 1
+    fi
+
+    case "$CODENAME" in
+        bullseye|bookworm|trixie) ;;
+        *)
+            error "仅支持 Debian 11/12/13，当前版本代号: ${CODENAME:-unknown}"
+            exit 1
+            ;;
+    esac
+}
 # ============================================================
 # 安全读取 key=value 配置，避免 source 执行任意内容
 # ============================================================
@@ -157,21 +177,61 @@ validate_xray_config() {
 }
 
 # ============================================================
-# 修复 apt 源
+# 修复 apt 源（仅 Debian 11/12/13）
 # ============================================================
 fix_apt() {
-    if grep -q "bullseye" /etc/os-release 2>/dev/null; then
-        if ! grep -q "deb.debian.org" /etc/apt/sources.list 2>/dev/null; then
-            [[ -f /etc/apt/sources.list ]] && cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%s)
+    local CODENAME
+    CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+
+    [[ -z "$CODENAME" ]] && error "无法识别 Debian 版本代号" && return 1
+
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%s) 2>/dev/null
+
+    case "$CODENAME" in
+        bullseye)
             cat > /etc/apt/sources.list <<EOF
 deb http://deb.debian.org/debian bullseye main contrib non-free
+deb-src http://deb.debian.org/debian bullseye main contrib non-free
 deb http://deb.debian.org/debian bullseye-updates main contrib non-free
+deb-src http://deb.debian.org/debian bullseye-updates main contrib non-free
 deb http://security.debian.org/debian-security bullseye-security main contrib non-free
+deb-src http://security.debian.org/debian-security bullseye-security main contrib non-free
 EOF
-            warn "已修复 Debian bullseye 的 apt 源，并备份原 sources.list"
-        fi
-    fi
+            ;;
+        bookworm)
+            cat > /etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+deb-src http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        trixie)
+            cat > /etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        *)
+            error "不支持的 Debian 版本代号: $CODENAME"
+            return 1
+            ;;
+    esac
+
     apt-get update -qq
+    if [[ $? -ne 0 ]]; then
+        error "apt 源修复后仍然更新失败，请手动检查 /etc/apt/sources.list"
+        return 1
+    fi
+
+    info "apt 源已修复: ${CODENAME}"
+    return 0
 }
 
 # ============================================================
@@ -179,11 +239,13 @@ EOF
 # ============================================================
 install_deps() {
     title "安装依赖..."
-    fix_apt
+    fix_apt || return 1
     apt-get install -y -qq curl unzip openssl python3
+    [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
     info "依赖安装完成"
 }
 
+# ============================================================
 # ============================================================
 # 安装 xray
 # ============================================================
@@ -193,7 +255,7 @@ install_xray() {
         warn "Xray 已安装，跳过"
         return
     fi
-    install_deps
+    install_deps || return 1
 
     [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
     curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
