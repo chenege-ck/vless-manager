@@ -1032,14 +1032,12 @@ show_user_link() {
 
 # ============================================================
 # ============================================================
-# ============================================================
 # 主机信息
 # ============================================================
 show_host_status() {
     local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
 
     PUBLIC_IP=$(get_public_ip)
-
     LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
 
