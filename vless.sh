@@ -1031,6 +1031,32 @@ show_user_link() {
 }
 
 # ============================================================
+# ============================================================
+# 主机信息
+# ============================================================
+show_host_status() {
+    local PUBLIC_IP CPU_USAGE MEM_INFO SWAP_INFO UPTIME_INFO
+
+    PUBLIC_IP=$(get_public_ip)
+
+    CPU_USAGE=$(top -bn1 | awk '/Cpu\(s\)/ {print 100 - $8"%"}' 2>/dev/null)
+    [[ -z "$CPU_USAGE" ]] && CPU_USAGE="N/A"
+
+    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%dMB / %dMB", $3, $2}' 2>/dev/null)
+    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
+
+    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%dMB / %dMB", $3, $2}' 2>/dev/null)
+    [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
+
+    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
+    [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
+
+    echo -e "${BLUE}║${NC}  IP   ${CYAN}${PUBLIC_IP}${NC}"
+    echo -e "${BLUE}║${NC}  CPU  ${GREEN}${CPU_USAGE}${NC}  MEM  ${YELLOW}${MEM_INFO}${NC}"
+    echo -e "${BLUE}║${NC}  SWAP ${YELLOW}${SWAP_INFO}${NC}  UP   ${CYAN}${UPTIME_INFO}${NC}"
+}
+
+# ============================================================
 # 节点信息
 # ============================================================
 show_info() {
@@ -1362,6 +1388,8 @@ main_menu() {
         echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
+        show_host_status
+        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
         echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
@@ -1378,7 +1406,6 @@ main_menu() {
         echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户"
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 设置自动到期检查"
         echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
         echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本"
         echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优化（BBR/TCP）"
@@ -1401,21 +1428,8 @@ main_menu() {
             10) show_user_link ;;
             12) check_expire ;;
             13) show_info ;;
-            14) setup_cron ;;
             15) update_xray ;;
             16) update_script ;;
             17) optimize_menu ;;
             18) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
-            *)  warn "无效选项，请重新选择" ;;
-        esac
-
-        echo ""
-        echo -ne "${BLUE}按 Enter 返回菜单...${NC}"
-        read -r _
-    done
-}
-
-normalize_user_db
-install_shortcut
-main_menu
