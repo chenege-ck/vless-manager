@@ -554,8 +554,10 @@ _print_link() {
     if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
         local SERVER_IP
         SERVER_IP=$(get_public_ip)
+
         local SHORTID
         SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
         echo -e "地址   : ${SERVER_IP}"
@@ -563,7 +565,9 @@ _print_link() {
         echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
         echo -e "SNI    : ${REALITY_SNI}"
         echo -e "ShortID: ${SHORTID}"
-        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}&type=tcp&flow=xtls-rprx-vision#${USERNAME}-reality"
+
+        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
+
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -571,10 +575,13 @@ _print_link() {
     if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
         WS_CF_PORT=${WS_CF_PORT:-443}
         WS_TLS=${WS_TLS:-tls}
+
         local ENCODED_PATH
         ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+
         local ENCODED_NAME
         ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
+
         echo ""
         echo -e "${CYAN}── WS+CF 节点 ──${NC}"
         echo -e "域名   : ${WS_DOMAIN}"
@@ -582,10 +589,13 @@ _print_link() {
         echo -e "WS路径 : ${WS_PATH}"
         echo -e "TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
         echo -e "SNI    : ${WS_DOMAIN}"
-        local LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT}/?type=ws&encryption=none&flow=&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=${WS_TLS}&sni=${WS_DOMAIN}#${ENCODED_NAME}"
+
+        local LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=${WS_TLS}&sni=${WS_DOMAIN}#${ENCODED_NAME}"
+
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
+
     echo ""
 }
 
@@ -1380,7 +1390,7 @@ main_menu() {
         read -r OPT
 
         case $OPT in
-            1)  install_xray; init_config ;;
+            1)  install_xray; init_config; setup_cron ;;
             2)  init_config ;;
             4)  add_user ;;
             5)  delete_user ;;
