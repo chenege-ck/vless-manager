@@ -1032,7 +1032,6 @@ show_user_link() {
 
 # ============================================================
 # ============================================================
-# ============================================================
 # 主机信息
 # ============================================================
 show_host_status() {
@@ -1049,12 +1048,12 @@ show_host_status() {
     SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%dMB/%dMB", $3, $2}' 2>/dev/null)
     [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
 
-    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
+    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //' | awk -F, '{print $1","$2}')
     [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
 
     printf "${BLUE}║${NC}  IP   ${CYAN}%-26s${NC}║\n" "$PUBLIC_IP"
     printf "${BLUE}║${NC}  LOAD ${GREEN}%-8s${NC} MEM  ${YELLOW}%-13s${NC}║\n" "$LOAD_INFO" "$MEM_INFO"
-    printf "${BLUE}║${NC}  SWAP ${YELLOW}%-13s${NC} UP   ${CYAN}%-12s${NC}║\n" "$SWAP_INFO" "$UPTIME_INFO"
+    printf "${BLUE}║${NC}  SWAP ${YELLOW}%-13s${NC} UP   ${CYAN}%-16s${NC}║\n" "$SWAP_INFO" "$UPTIME_INFO"
 }
 # ============================================================
 # 节点信息
