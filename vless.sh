@@ -73,7 +73,7 @@ normalize_user_db() {
     python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 changed = False
 for line in lines:
@@ -161,7 +161,7 @@ has_ws()      { [[ -f "$META_WS" ]]; }
 validate_xray_config() {
     [[ ! -f "$XRAY_CONFIG" ]] && error "配置文件不存在: $XRAY_CONFIG" && return 1
 
-    python3 -m json.tool "$XRAY_CONFIG" >/dev/null 2>&1
+    python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$XRAY_CONFIG" >/dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         error "config.json 不是合法 JSON"
         return 1
@@ -566,7 +566,7 @@ _inject_user() {
 
     python3 - <<PYEOF
 import json
-with open("$XRAY_CONFIG", "r") as f:
+with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 node = "$NODE"
@@ -581,7 +581,7 @@ for inbound in cfg["inbounds"]:
         clients.append({"id": "$UUID", "flow": flow, "email": "$NAME", "comment": "$EXPIRE"})
     inbound["settings"]["clients"] = clients
 
-with open("$XRAY_CONFIG", "w") as f:
+with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 }
@@ -780,7 +780,7 @@ delete_user() {
     python3 - <<PYEOF
 import json
 del_node = "$DEL_NODE"
-with open("$XRAY_CONFIG", "r") as f:
+with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
@@ -789,7 +789,7 @@ for inbound in cfg["inbounds"]:
     if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
-with open("$XRAY_CONFIG", "w") as f:
+with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
@@ -806,7 +806,7 @@ PYEOF
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:"):
@@ -859,7 +859,7 @@ renew_user() {
     python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:$UUID:"):
@@ -920,7 +920,7 @@ toggle_user() {
         python3 - <<PYEOF
 import json
 op_node = "$OP_NODE"
-with open("$XRAY_CONFIG", "r") as f:
+with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
@@ -929,14 +929,14 @@ for inbound in cfg["inbounds"]:
     if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
-with open("$XRAY_CONFIG", "w") as f:
+with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:"):
@@ -958,7 +958,7 @@ PYEOF
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:"):
@@ -1002,7 +1002,7 @@ check_expire() {
             python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8").splitlines()
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$NAME:$UUID:$EXPIRE:"):
@@ -1024,14 +1024,14 @@ PYEOF
         python3 - <<PYEOF
 import json
 expired = "$EXPIRED_UUIDS".split()
-with open("$XRAY_CONFIG", "r") as f:
+with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     if "clients" not in inbound.get("settings", {}):
         continue
     clients = inbound["settings"]["clients"]
     inbound["settings"]["clients"] = [c for c in clients if c.get("id") not in expired]
-with open("$XRAY_CONFIG", "w") as f:
+with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
         validate_xray_config && systemctl restart xray
