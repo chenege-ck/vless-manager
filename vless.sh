@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 一键管理脚本 v5.1
+# VLESS 一键管理脚本 v5.2
 # 修复版：保留节点创建逻辑，不改创建方式
 # 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式，可同时运行
 
@@ -23,7 +23,6 @@ error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
-# ============================================================
 # ============================================================
 # 仅支持 Debian
 # ============================================================
@@ -704,6 +703,7 @@ _print_link() {
 }
 
 # ============================================================
+# ============================================================
 # 添加用户
 # ============================================================
 add_user() {
@@ -778,7 +778,6 @@ add_user() {
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
-
 
 # ============================================================
 # 删除用户
@@ -886,7 +885,14 @@ renew_user() {
 
     read -rp "续期天数 [默认 30 天]: " DAYS
     DAYS=${DAYS:-30}
-    NEW_EXPIRE=$(date -d "+${DAYS} days" +%Y-%m-%d)
+
+    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+        error "续期天数必须是纯数字"
+        return
+    fi
+
+    NEW_EXPIRE=$(expire_noon_str "$DAYS")
+    [[ -z "$NEW_EXPIRE" ]] && error "到期时间计算失败" && return
 
     UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
     local STATUS NODE
@@ -1023,20 +1029,31 @@ PYEOF
 }
 
 # ============================================================
-# 到期检查
+# 到期检查（按上海时间，到期日当天 12:00 断开）
 # ============================================================
 check_expire() {
     title "检查到期用户..."
     normalize_user_db
-    TODAY=$(date +%Y-%m-%d)
-    CHANGED=0
-    EXPIRED_UUIDS=""
+    local NOW_TS
+    NOW_TS=$(now_shanghai_ts)
+    local CHANGED=0
+    local EXPIRED_UUIDS=""
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
     while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
         [[ "$STATUS" != "active" ]] && continue
-        if [[ "$EXPIRE" < "$TODAY" ]]; then
+
+        # 兼容旧格式：如果还是 YYYY-MM-DD，则默认当天 12:00:00 到期
+        if [[ "$EXPIRE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            EXPIRE="${EXPIRE}T12:00:00"
+        fi
+
+        local EXPIRE_TS
+        EXPIRE_TS=$(expire_to_ts "$EXPIRE")
+        [[ -z "$EXPIRE_TS" ]] && continue
+
+        if (( NOW_TS >= EXPIRE_TS )); then
             warn "用户 ${NAME} 已到期（${EXPIRE}），自动禁用"
             python3 - <<PYEOF
 from pathlib import Path
@@ -1044,15 +1061,19 @@ p = Path("$USER_DB")
 lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
-    if not line.startswith("$NAME:$UUID:$EXPIRE:"):
+    if not line.startswith("$NAME:$UUID:"):
         out.append(line)
         continue
     parts = line.split(":")
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
+    if len(parts[2]) == 10:
+        parts[2] = parts[2] + "T12:00:00"
     parts[3] = "disabled"
     out.append(":".join(parts[:5]))
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+p.write_text("
+".join(out) + ("
+" if out else ""), encoding="utf-8")
 PYEOF
             EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
             CHANGED=1
@@ -1234,9 +1255,9 @@ show_info() {
 # ============================================================
 setup_cron() {
     SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    EXPIRE_CMD="0 1 * * * /usr/local/bin/vless_script.sh --check-expire >> /var/log/xray-expire.log 2>&1"
+    EXPIRE_CMD="*/5 * * * * /usr/local/bin/vless_script.sh --check-expire >> /var/log/xray-expire.log 2>&1"
     (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
-    info "已设置每日 01:00 自动检查到期用户"
+    info "已设置每 5 分钟自动检查到期用户（上海时间）"
 
     mkdir -p /var/log/xray
 
@@ -1267,139 +1288,121 @@ EOF
 }
 
 # ============================================================
-# 开启 BBR
+# IP 优先级设置（类似 x-ui）
+# 通过 /etc/gai.conf 控制 IPv4 / IPv6 解析优先级
 # ============================================================
-enable_bbr() {
-    title "开启 BBR 拥塞控制..."
-
-    if ! modinfo tcp_bbr &>/dev/null; then
-        error "当前内核不支持 BBR，请升级内核（建议 4.9+）"
-        return
+cleanup_old_network_tuning() {
+    if grep -q "^# BBR$" /etc/sysctl.conf 2>/dev/null; then
+        sed -i '/^# BBR$/,/^$/d' /etc/sysctl.conf
     fi
-
-    local CURRENT_CC
-    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ "$CURRENT_CC" == "bbr" ]]; then
-        info "BBR 已经是开启状态，无需重复设置"
-        return
-    fi
-
-    modprobe tcp_bbr 2>/dev/null
-
-    if ! grep -q "^# BBR$" /etc/sysctl.conf 2>/dev/null; then
-        cat >> /etc/sysctl.conf <<EOF
-
-# BBR
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-    fi
-
-    sysctl -p &>/dev/null
-    local NEW_CC
-    NEW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ "$NEW_CC" == "bbr" ]]; then
-        info "BBR 开启成功！"
-    else
-        error "BBR 开启失败，请手动检查内核版本"
+    if grep -q "VLESS TCP优化" /etc/sysctl.conf 2>/dev/null; then
+        sed -i '/# VLESS TCP优化/,/^$/d' /etc/sysctl.conf
     fi
 }
 
-# ============================================================
-# TCP 智能优化
-# ============================================================
-optimize_tcp() {
-    title "TCP 参数优化"
-    echo ""
-    echo -e "  请选择服务器所在区域："
-    echo -e "  ${GREEN}1.${NC} 亚太低延迟（日本/香港/新加坡 → 国内，延迟 50-150ms）"
-    echo -e "  ${GREEN}2.${NC} 美国高延迟（美西/美东 → 国内，延迟 150ms+）"
-    echo -e "  ${GREEN}0.${NC} 返回"
-    echo ""
-    read -rp "选择: " SEL
+get_ip_priority_mode() {
+    [[ ! -f /etc/gai.conf ]] && echo "系统默认" && return
 
-    if grep -q "VLESS TCP优化" /etc/sysctl.conf 2>/dev/null; then
-        warn "检测到已有 TCP 优化配置，先清除旧配置..."
-        sed -i '/# VLESS TCP优化/,/^$/d' /etc/sysctl.conf
+    if grep -q '^precedence ::/0 100$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::ffff:0:0/96 10$' /etc/gai.conf 2>/dev/null; then
+        echo "IPv6 优先"
+    elif grep -q '^precedence ::ffff:0:0/96 100$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::/0 40$' /etc/gai.conf 2>/dev/null; then
+        echo "IPv4 优先"
+    elif grep -q '^precedence ::/0 60$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::ffff:0:0/96 50$' /etc/gai.conf 2>/dev/null; then
+        echo "优先匹配 IPv6"
+    elif grep -q '^precedence ::ffff:0:0/96 60$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::/0 50$' /etc/gai.conf 2>/dev/null; then
+        echo "优先匹配 IPv4"
+    else
+        echo "系统默认"
     fi
+}
 
-    case $SEL in
-        1)
-            cat >> /etc/sysctl.conf <<EOF
+write_gai_priority_block() {
+    local mode="$1"
+    touch /etc/gai.conf
+    cp /etc/gai.conf /etc/gai.conf.bak.$(date +%s) 2>/dev/null
+    sed -i '/# VLESS IP PRIORITY START/,/# VLESS IP PRIORITY END/d' /etc/gai.conf
 
-# VLESS TCP优化 - 亚太低延迟策略
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
+    case "$mode" in
+        ipv6_first)
+            cat >> /etc/gai.conf <<'EOF'
+
+# VLESS IP PRIORITY START
+precedence ::/0 100
+precedence ::ffff:0:0/96 10
+# VLESS IP PRIORITY END
 EOF
-            modprobe tcp_bbr 2>/dev/null
-            sysctl -p &>/dev/null
-            info "亚太低延迟 TCP 优化完成"
+            info "已设置为 IPv6 优先"
             ;;
-        2)
-            cat >> /etc/sysctl.conf <<EOF
+        ipv4_first)
+            cat >> /etc/gai.conf <<'EOF'
 
-# VLESS TCP优化 - 美国高延迟策略
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 8192
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.ip_local_port_range = 1024 65535
+# VLESS IP PRIORITY START
+precedence ::ffff:0:0/96 100
+precedence ::/0 40
+# VLESS IP PRIORITY END
 EOF
-            modprobe tcp_bbr 2>/dev/null
-            sysctl -p &>/dev/null
-            info "美国高延迟 TCP 优化完成"
+            info "已设置为 IPv4 优先"
             ;;
-        0) return ;;
-        *) warn "无效选项" ;;
+        prefer_ipv6)
+            cat >> /etc/gai.conf <<'EOF'
+
+# VLESS IP PRIORITY START
+precedence ::/0 60
+precedence ::ffff:0:0/96 50
+# VLESS IP PRIORITY END
+EOF
+            info "已设置为 优先匹配 IPv6"
+            ;;
+        prefer_ipv4)
+            cat >> /etc/gai.conf <<'EOF'
+
+# VLESS IP PRIORITY START
+precedence ::ffff:0:0/96 60
+precedence ::/0 50
+# VLESS IP PRIORITY END
+EOF
+            info "已设置为 优先匹配 IPv4"
+            ;;
+        default)
+            info "已恢复系统默认 IP 优先级"
+            ;;
+        *)
+            error "未知模式: $mode"
+            return 1
+            ;;
     esac
 }
 
-# ============================================================
-# 一键优化菜单
-# ============================================================
-optimize_menu() {
-    title "网络优化"
+ip_priority_menu() {
+    title "网络优先级"
+    cleanup_old_network_tuning
+
+    local CURRENT_MODE
+    CURRENT_MODE=$(get_ip_priority_mode)
+
     echo ""
-    echo -e "  ${GREEN}1.${NC} 开启 BBR（推荐，提升吞吐量）"
-    echo -e "  ${GREEN}2.${NC} TCP 参数优化（选择区域策略）"
-    echo -e "  ${GREEN}3.${NC} 一键全部优化（BBR + TCP）"
+    echo -e "当前模式：${CYAN}${CURRENT_MODE}${NC}"
+    echo -e "  ${GREEN}1.${NC} IPv6 优先"
+    echo -e "  ${GREEN}2.${NC} IPv4 优先"
+    echo -e "  ${GREEN}3.${NC} 优先匹配 IPv6"
+    echo -e "  ${GREEN}4.${NC} 优先匹配 IPv4"
+    echo -e "  ${GREEN}5.${NC} 恢复系统默认"
     echo -e "  ${GREEN}0.${NC} 返回"
     echo ""
     read -rp "选择: " OPT
-    case $OPT in
-        1) enable_bbr ;;
-        2) optimize_tcp ;;
-        3) enable_bbr; optimize_tcp ;;
+
+    case "$OPT" in
+        1) write_gai_priority_block ipv6_first ;;
+        2) write_gai_priority_block ipv4_first ;;
+        3) write_gai_priority_block prefer_ipv6 ;;
+        4) write_gai_priority_block prefer_ipv4 ;;
+        5) write_gai_priority_block default ;;
         0) return ;;
         *) warn "无效选项" ;;
     esac
+
+    echo ""
+    info "当前生效模式：$(get_ip_priority_mode)"
 }
 
 # ============================================================
@@ -1512,7 +1515,7 @@ main_menu() {
         [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.1${NC}       ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.2${NC}       ${BLUE}║${NC}"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
@@ -1557,7 +1560,7 @@ main_menu() {
             13) show_info ;;
             15) update_xray ;;
             16) update_script ;;
-            17) optimize_menu ;;
+            17) ip_priority_menu ;;
             18) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
