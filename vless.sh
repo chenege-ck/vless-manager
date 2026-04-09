@@ -559,6 +559,11 @@ EOF
 # ============================================================
 rebuild_config() {
     load_meta
+    local IP_PRIO=""
+    [[ -f "$META_REALITY" ]] && IP_PRIO=$(read_kv "$META_REALITY" "IP_PRIORITY")
+    [[ -z "$IP_PRIO" && -f "$META_WS" ]] && IP_PRIO=$(read_kv "$META_WS" "IP_PRIORITY")
+    [[ -z "$IP_PRIO" && -f "$META" ]] && IP_PRIO=$(read_kv "$META" "IP_PRIORITY")
+    IP_PRIO=${IP_PRIO:-AsIs}
     local INBOUNDS=""
 
     if has_reality; then
@@ -622,7 +627,7 @@ rebuild_config() {
     ${INBOUNDS}
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "${IP_PRIO}" } },
     { "protocol": "blackhole", "tag": "block" }
   ]
 }
@@ -1340,118 +1345,84 @@ EOF
 # IP 优先级设置（类似 x-ui）
 # 通过 /etc/gai.conf 控制 IPv4 / IPv6 解析优先级
 # ============================================================
-cleanup_old_network_tuning() {
-    if grep -q "^# BBR$" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/^# BBR$/,/^$/d' /etc/sysctl.conf
-    fi
-    if grep -q "VLESS TCP优化" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/# VLESS TCP优化/,/^$/d' /etc/sysctl.conf
-    fi
-}
-
+# ============================================================
+# IP 优先级设置 — 通过 Xray freedom domainStrategy 控制
+# gai.conf 对 Xray 无效，必须在 config.json 中设置
+# ============================================================
 get_ip_priority_mode() {
-    [[ ! -f /etc/gai.conf ]] && echo "系统默认" && return
-
-    if grep -q '^precedence ::/0 100$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::ffff:0:0/96 10$' /etc/gai.conf 2>/dev/null; then
-        echo "IPv6 优先"
-    elif grep -q '^precedence ::ffff:0:0/96 100$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::/0 40$' /etc/gai.conf 2>/dev/null; then
-        echo "IPv4 优先"
-    elif grep -q '^precedence ::/0 60$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::ffff:0:0/96 50$' /etc/gai.conf 2>/dev/null; then
-        echo "优先匹配 IPv6"
-    elif grep -q '^precedence ::ffff:0:0/96 60$' /etc/gai.conf 2>/dev/null && grep -q '^precedence ::/0 50$' /etc/gai.conf 2>/dev/null; then
-        echo "优先匹配 IPv4"
-    else
-        echo "系统默认"
-    fi
-}
-
-write_gai_priority_block() {
-    local mode="$1"
-    touch /etc/gai.conf
-    cp /etc/gai.conf /etc/gai.conf.bak.$(date +%s) 2>/dev/null
-    sed -i '/# VLESS IP PRIORITY START/,/# VLESS IP PRIORITY END/d' /etc/gai.conf
-
-    case "$mode" in
-        ipv6_first)
-            cat >> /etc/gai.conf <<'EOF'
-
-# VLESS IP PRIORITY START
-precedence ::/0 100
-precedence ::ffff:0:0/96 10
-# VLESS IP PRIORITY END
-EOF
-            info "已设置为 IPv6 优先"
-            ;;
-        ipv4_first)
-            cat >> /etc/gai.conf <<'EOF'
-
-# VLESS IP PRIORITY START
-precedence ::ffff:0:0/96 100
-precedence ::/0 40
-# VLESS IP PRIORITY END
-EOF
-            info "已设置为 IPv4 优先"
-            ;;
-        prefer_ipv6)
-            cat >> /etc/gai.conf <<'EOF'
-
-# VLESS IP PRIORITY START
-precedence ::/0 60
-precedence ::ffff:0:0/96 50
-# VLESS IP PRIORITY END
-EOF
-            info "已设置为 优先匹配 IPv6"
-            ;;
-        prefer_ipv4)
-            cat >> /etc/gai.conf <<'EOF'
-
-# VLESS IP PRIORITY START
-precedence ::ffff:0:0/96 60
-precedence ::/0 50
-# VLESS IP PRIORITY END
-EOF
-            info "已设置为 优先匹配 IPv4"
-            ;;
-        default)
-            info "已恢复系统默认 IP 优先级"
-            ;;
-        *)
-            error "未知模式: $mode"
-            return 1
-            ;;
+    local ds=""
+    [[ -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
+    [[ -z "$ds" && -f "$META_WS" ]] && ds=$(read_kv "$META_WS" "IP_PRIORITY")
+    [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
+    case "$ds" in
+        UseIPv4v6) echo "IPv4 优先（v4失败自动切v6）" ;;
+        UseIPv6v4) echo "IPv6 优先（v6失败自动切v4）" ;;
+        UseIPv4)   echo "仅 IPv4" ;;
+        UseIPv6)   echo "仅 IPv6" ;;
+        *)         echo "系统默认（AsIs）" ;;
     esac
 }
 
+_save_ip_priority() {
+    local ds="$1"
+    local saved=0
+    for f in "$META_REALITY" "$META_WS" "$META"; do
+        [[ -f "$f" ]] || continue
+        if grep -q "^IP_PRIORITY=" "$f" 2>/dev/null; then
+            sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$f"
+        else
+            echo "IP_PRIORITY=${ds}" >> "$f"
+        fi
+        saved=1
+    done
+    # 如果一个 meta 文件都没有（未初始化），暂存到 META
+    if [[ $saved -eq 0 ]]; then
+        mkdir -p "$(dirname "$META")"
+        echo "IP_PRIORITY=${ds}" >> "$META"
+    fi
+}
+
 ip_priority_menu() {
-    title "网络优先级"
-    cleanup_old_network_tuning
+    title "网络优先级（IPv4/IPv6）"
+    load_meta
 
     local CURRENT_MODE
     CURRENT_MODE=$(get_ip_priority_mode)
 
     echo ""
     echo -e "当前模式：${CYAN}${CURRENT_MODE}${NC}"
-    echo -e "  ${GREEN}1.${NC} IPv6 优先"
-    echo -e "  ${GREEN}2.${NC} IPv4 优先"
-    echo -e "  ${GREEN}3.${NC} 优先匹配 IPv6"
-    echo -e "  ${GREEN}4.${NC} 优先匹配 IPv4"
-    echo -e "  ${GREEN}5.${NC} 恢复系统默认"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
+    echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
+    echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4，v6 完全不用"
+    echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6，v4 完全不用"
+    echo -e "  ${GREEN}5.${NC} 系统默认   — 由 Xray 自动决定（AsIs）"
     echo -e "  ${GREEN}0.${NC} 返回"
     echo ""
     read -rp "选择: " OPT
 
+    local DS=""
+    local DESC=""
     case "$OPT" in
-        1) write_gai_priority_block ipv6_first ;;
-        2) write_gai_priority_block ipv4_first ;;
-        3) write_gai_priority_block prefer_ipv6 ;;
-        4) write_gai_priority_block prefer_ipv4 ;;
-        5) write_gai_priority_block default ;;
+        1) DS="UseIPv4v6"; DESC="IPv4 优先" ;;
+        2) DS="UseIPv6v4"; DESC="IPv6 优先" ;;
+        3) DS="UseIPv4";   DESC="仅 IPv4" ;;
+        4) DS="UseIPv6";   DESC="仅 IPv6" ;;
+        5) DS="AsIs";      DESC="系统默认" ;;
         0) return ;;
-        *) warn "无效选项" ;;
+        *) warn "无效选项"; return ;;
     esac
 
+    _save_ip_priority "$DS"
+
+    if has_reality || has_ws; then
+        rebuild_config
+        _inject_all_users
+        _start_xray
+    fi
+
     echo ""
-    info "当前生效模式：$(get_ip_priority_mode)"
+    info "已生效：${DESC}"
 }
 
 # ============================================================
