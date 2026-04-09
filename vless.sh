@@ -74,14 +74,43 @@ now_shanghai_ts() {
 
 expire_noon_str() {
     local days="$1"
-    TZ=Asia/Shanghai date -d "+${days} days 12:00:00" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null
+    TZ=Asia/Shanghai date -d "+${days} days 12:00:00" "+%Y-%m-%d_%H-%M-%S" 2>/dev/null
 }
 
 expire_to_ts() {
     local expire="$1"
+
+    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
+        local d="${expire%%_*}"
+        local t="${expire#*_}"
+        TZ=Asia/Shanghai date -d "${d} ${t//-/:}" +%s 2>/dev/null
+        return
+    fi
+
+    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        TZ=Asia/Shanghai date -d "${expire} 12:00:00" +%s 2>/dev/null
+        return
+    fi
+
     local normalized="${expire/T/ }"
     TZ=Asia/Shanghai date -d "$normalized" +%s 2>/dev/null
 }
+
+expire_display() {
+    local expire="$1"
+    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
+        local d="${expire%%_*}"
+        local t="${expire#*_}"
+        echo "${d} ${t//-/:}"
+    elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+        echo "${expire/T/ }"
+    elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "${expire} 12:00:00"
+    else
+        echo "$expire"
+    fi
+}
+
 # ============================================================
 # 安全读取 key=value 配置，避免 source 执行任意内容
 # ============================================================
@@ -110,28 +139,52 @@ normalize_user_db() {
     [[ ! -f "$USER_DB" ]] && return 0
     python3 - <<PYEOF
 from pathlib import Path
+import re
+
 p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
 out = []
 changed = False
+
+def normalize_expire(exp: str) -> str:
+    exp = exp.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
+        return exp + "_12-00-00"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", exp):
+        d, t = exp.split("T", 1)
+        return d + "_" + t.replace(":", "-")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", exp):
+        d, t = exp.split(" ", 1)
+        return d + "_" + t.replace(":", "-")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", exp):
+        return exp
+    return exp
+
 for line in lines:
     if not line.strip():
         continue
     parts = line.rstrip("\n").split(":")
     if len(parts) == 4:
-        parts.append("both")
+        name, uuid, expire, status = parts
+        node = "both"
         changed = True
-    elif len(parts) > 5:
+    elif len(parts) >= 5:
         name = parts[0]
         uuid = parts[1]
-        expire = parts[2]
-        status = parts[3]
-        node = ":".join(parts[4:]) or "both"
-        parts = [name, uuid, expire, status, node]
-        changed = True
-    elif len(parts) < 4:
+        status = parts[-2]
+        node = parts[-1] or "both"
+        expire = ":".join(parts[2:-2])
+        if len(parts) != 5:
+            changed = True
+    else:
         continue
-    out.append(":".join(parts))
+
+    expire2 = normalize_expire(expire)
+    if expire2 != expire:
+        changed = True
+
+    out.append(":".join([name, uuid, expire2, status, node]))
+
 if changed:
     p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
@@ -647,11 +700,14 @@ _print_link() {
     local NODE=${4:-both}
     load_meta
 
+    local EXPIRE_SHOW
+    EXPIRE_SHOW=$(expire_display "$EXPIRE")
+
     echo ""
     echo -e "${GREEN}===== 节点信息 =====${NC}"
     echo -e "用户名 : ${USERNAME}"
     echo -e "UUID   : ${UUID}"
-    echo -e "到期   : ${EXPIRE}"
+    echo -e "到期   : ${EXPIRE_SHOW}"
     echo -e "节点   : ${NODE}"
 
     if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
@@ -659,7 +715,7 @@ _print_link() {
         SERVER_IP=$(get_public_ip)
 
         local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
 
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
@@ -1044,17 +1100,12 @@ check_expire() {
     while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
         [[ "$STATUS" != "active" ]] && continue
 
-        # 兼容旧格式：如果还是 YYYY-MM-DD，则默认当天 12:00:00 到期
-        if [[ "$EXPIRE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            EXPIRE="${EXPIRE}T12:00:00"
-        fi
-
         local EXPIRE_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
         [[ -z "$EXPIRE_TS" ]] && continue
 
         if (( NOW_TS >= EXPIRE_TS )); then
-            warn "用户 ${NAME} 已到期（${EXPIRE}），自动禁用"
+            warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），自动禁用"
             python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1067,13 +1118,9 @@ for line in lines:
     parts = line.split(":")
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
-    if len(parts[2]) == 10:
-        parts[2] = parts[2] + "T12:00:00"
     parts[3] = "disabled"
     out.append(":".join(parts[:5]))
-p.write_text("
-".join(out) + ("
-" if out else ""), encoding="utf-8")
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
             EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
             CHANGED=1
@@ -1114,19 +1161,21 @@ list_users() {
     ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
     DISABLED=$((TOTAL - ACTIVE))
     echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
-    echo -e "  ${YELLOW}%-15s %-38s %-12s %-8s %-8s${NC}" "用户名" "UUID" "到期日" "状态" "节点"
-    echo -e "  ──────────────────────────────────────────────────────────────────────────────────"
+    echo -e "  ${YELLOW}%-15s %-38s %-20s %-8s %-8s${NC}" "用户名" "UUID" "到期时间" "状态" "节点"
+    echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
     while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
         NODE=${NODE:-both}
         local COLOR=$NC
         local STATUS_ICON="○"
+        local EXPIRE_SHOW
+        EXPIRE_SHOW=$(expire_display "$EXPIRE")
         if [[ "$STATUS" == "active" ]]; then
             COLOR=$GREEN; STATUS_ICON="●"
         elif [[ "$STATUS" == "disabled" ]]; then
             COLOR=$RED; STATUS_ICON="○"
         fi
-        printf "  ${COLOR}%-15s %-38s %-12s %-8s %-8s${NC}\n" \
-            "$NAME" "$UUID" "$EXPIRE" "${STATUS_ICON} ${STATUS}" "$NODE"
+        printf "  ${COLOR}%-15s %-38s %-20s %-8s %-8s${NC}\n" \
+            "$NAME" "$UUID" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE"
     done < "$USER_DB"
     echo ""
 }
@@ -1137,7 +1186,7 @@ list_users_brief() {
     [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
     while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
         NODE=${NODE:-both}
-        printf "  %-15s %s  [%s | %s]\n" "$NAME" "$EXPIRE" "$STATUS" "$NODE"
+        printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
     done < "$USER_DB"
     echo ""
 }
@@ -1225,7 +1274,7 @@ show_info() {
 
     if has_reality; then
         local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
         echo -e "${CYAN}── Reality 节点 ──${NC}"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${REALITY_PORT}"
@@ -1538,7 +1587,7 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
         echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
         echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优化（BBR/TCP）"
+        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优先级（IPv4/IPv6）"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}   ${RED}18.${NC} 卸载 Xray"
         echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
@@ -1572,6 +1621,7 @@ main_menu() {
     done
 }
 
+check_system
 normalize_user_db
 install_shortcut
 main_menu
