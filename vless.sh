@@ -1,6 +1,5 @@
 #!/bin/bash
-# VLESS 一键管理脚本 v5.2
-# 修复版：保留节点创建逻辑，不改创建方式
+# VLESS 一键管理脚本 v5.3
 # 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式，可同时运行
 
 RED='\033[0;31m'
@@ -126,9 +125,15 @@ read_kv() {
 # ============================================================
 get_public_ip() {
     local ip=""
+    # 先尝试 IPv4
     ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)
+    # IPv4 全失败则尝试 IPv6（纯 IPv6 机器）
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
+        [[ -z "$ip" ]] && ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)
+    fi
     echo "${ip:-<请手动填写服务器IP>}"
 }
 
@@ -660,24 +665,30 @@ _inject_user() {
     local EXPIRE=$3
     local NODE=$4
 
-    python3 - <<PYEOF
-import json
-with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
+    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_EXPIRE="$EXPIRE" INJECT_NODE="$NODE" \
+    INJECT_CONFIG="$XRAY_CONFIG" python3 - <<'PYEOF'
+import json, os
+uuid   = os.environ["INJECT_UUID"]
+name   = os.environ["INJECT_NAME"]
+expire = os.environ["INJECT_EXPIRE"]
+node   = os.environ["INJECT_NODE"]
+cfg_path = os.environ["INJECT_CONFIG"]
+
+with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
-node = "$NODE"
 for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
     if "clients" not in inbound.get("settings", {}):
         continue
     clients = inbound["settings"]["clients"]
-    clients = [c for c in clients if c.get("id") != "$UUID"]
+    clients = [c for c in clients if c.get("id") != uuid]
     if node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws"):
         flow = "xtls-rprx-vision" if tag == "inbound-reality" else ""
-        clients.append({"id": "$UUID", "flow": flow, "email": "$NAME", "comment": "$EXPIRE"})
+        clients.append({"id": uuid, "flow": flow, "email": name, "comment": expire})
     inbound["settings"]["clients"] = clients
 
-with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
+with open(cfg_path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 }
@@ -822,7 +833,14 @@ add_user() {
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
 
     validate_xray_config || {
-        sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
+        # UUID 唯一，用 UUID 定位回滚，安全精确
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
         rebuild_config
         _inject_all_users
         error "配置校验失败，已回滚本次添加"
@@ -830,7 +848,13 @@ add_user() {
     }
 
     _start_xray || {
-        sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
         rebuild_config
         _inject_all_users
         error "Xray 重启失败，已回滚本次添加"
@@ -851,14 +875,15 @@ delete_user() {
     read -rp "输入要删除的用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
 
-    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    # 精确匹配：用户名后紧跟冒号，避免前缀误删
+    if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
         error "用户不存在"
         return
     fi
 
-    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
     local USER_NODE
-    USER_NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    USER_NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
     USER_NODE=${USER_NODE:-both}
 
     local DEL_NODE="both"
@@ -893,7 +918,14 @@ with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
 PYEOF
 
     if [[ "$DEL_NODE" == "both" ]]; then
-        sed -i "/^${USERNAME}:/d" "$USER_DB"
+        # 用 python 精确删除，避免 sed 前缀误匹配
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (l.startswith("$USERNAME:") and l.split(":")[0] == "$USERNAME")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
         info "用户 ${USERNAME} 已彻底删除"
     else
         local NEW_NODE
@@ -955,12 +987,15 @@ renew_user() {
     NEW_EXPIRE=$(expire_noon_str "$DAYS")
     [[ -z "$NEW_EXPIRE" ]] && error "到期时间计算失败" && return
 
-    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
     local STATUS NODE
-    STATUS=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f4)
-    NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    STATUS=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f4)
+    NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
     NODE=${NODE:-both}
     STATUS=${STATUS:-active}
+
+    # 续期后统一恢复为 active（无论原来是什么状态）
+    local NEW_STATUS="active"
 
     python3 - <<PYEOF
 from pathlib import Path
@@ -968,19 +1003,23 @@ p = Path("$USER_DB")
 lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
-    if not line.startswith("$USERNAME:$UUID:"):
+    parts = line.split(":")
+    if len(parts) >= 2 and parts[0] == "$USERNAME" and parts[1] == "$UUID":
+        out.append("$USERNAME:$UUID:$NEW_EXPIRE:$NEW_STATUS:$NODE")
+    else:
         out.append(line)
-        continue
-    out.append("$USERNAME:$UUID:$NEW_EXPIRE:$STATUS:$NODE")
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
-    if [[ "$STATUS" == "active" ]]; then
-        _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
-        validate_xray_config && systemctl restart xray
-    fi
+    # 无论原来 active 还是 disabled，续期后都重新注入并启动
+    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
+    validate_xray_config && systemctl restart xray
 
-    info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}"
+    if [[ "$STATUS" == "disabled" ]]; then
+        info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}，已自动恢复启用"
+    else
+        info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}"
+    fi
 }
 
 # ============================================================
@@ -1058,7 +1097,18 @@ PYEOF
         info "用户 ${USERNAME} 已禁用（节点: ${OP_NODE}）"
     else
         local EXPIRE
-        EXPIRE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f3)
+        EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
+
+        # 检查是否已过期，过期不允许直接启用
+        local EXPIRE_TS NOW_TS
+        EXPIRE_TS=$(expire_to_ts "$EXPIRE")
+        NOW_TS=$(now_shanghai_ts)
+        if [[ -n "$EXPIRE_TS" ]] && (( NOW_TS >= EXPIRE_TS )); then
+            warn "用户 ${USERNAME} 已过期（$(expire_display "$EXPIRE")），无法启用"
+            warn "请先使用菜单 8 重置到期时间再启用"
+            return
+        fi
+
         _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$OP_NODE"
 
         python3 - <<PYEOF
@@ -1098,6 +1148,7 @@ check_expire() {
     local NOW_TS
     NOW_TS=$(now_shanghai_ts)
     local CHANGED=0
+    local EXPIRED_NAMES=""
     local EXPIRED_UUIDS=""
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
@@ -1111,41 +1162,50 @@ check_expire() {
 
         if (( NOW_TS >= EXPIRE_TS )); then
             warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），自动禁用"
-            python3 - <<PYEOF
-from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = []
-for line in lines:
-    if not line.startswith("$NAME:$UUID:"):
-        out.append(line)
-        continue
-    parts = line.split(":")
-    if len(parts) < 5:
-        parts += ["both"] * (5 - len(parts))
-    parts[3] = "disabled"
-    out.append(":".join(parts[:5]))
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
             EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
+            EXPIRED_NAMES="${EXPIRED_NAMES} ${NAME}"
             CHANGED=1
         fi
     done < "$USER_DB"
 
     if [[ $CHANGED -eq 1 ]]; then
-        python3 - <<PYEOF
-import json
-expired = "$EXPIRED_UUIDS".split()
-with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
+        # 批量更新 db：一次 python 调用完成所有到期用户状态变更
+        BATCH_UUIDS="$EXPIRED_UUIDS" DB_PATH="$USER_DB" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+uuids = set(os.environ["BATCH_UUIDS"].split())
+p = Path(os.environ["DB_PATH"])
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = []
+for line in lines:
+    parts = line.split(":")
+    if len(parts) >= 2 and parts[1] in uuids:
+        if len(parts) < 5:
+            parts += ["both"] * (5 - len(parts))
+        parts[3] = "disabled"
+        out.append(":".join(parts[:5]))
+    else:
+        out.append(line)
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+
+        # 批量从 config.json 移除到期用户
+        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$XRAY_CONFIG" python3 - <<'PYEOF'
+import json, os
+expired = set(os.environ["BATCH_UUIDS"].split())
+cfg_path = os.environ["CFG_PATH"]
+with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg["inbounds"]:
     if "clients" not in inbound.get("settings", {}):
         continue
-    clients = inbound["settings"]["clients"]
-    inbound["settings"]["clients"] = [c for c in clients if c.get("id") not in expired]
-with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
+    inbound["settings"]["clients"] = [
+        c for c in inbound["settings"]["clients"] if c.get("id") not in expired
+    ]
+with open(cfg_path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
+
         validate_xray_config && systemctl restart xray
         info "已重启 Xray"
     else
@@ -1207,16 +1267,21 @@ show_user_link() {
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
 
-    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
         error "用户不存在"
         return
     fi
 
-    local UUID EXPIRE NODE
-    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
-    EXPIRE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f3)
-    NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    local UUID EXPIRE NODE STATUS
+    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
+    EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
+    STATUS=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f4)
+    NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
     NODE=${NODE:-both}
+
+    if [[ "$STATUS" == "disabled" ]]; then
+        warn "用户 ${USERNAME} 当前已禁用，链接仍可查看但节点不会响应"
+    fi
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
@@ -1341,10 +1406,6 @@ EOF
     info "已配置日志自动轮转（每周轮转，保留4周）"
 }
 
-# ============================================================
-# IP 优先级设置（类似 x-ui）
-# 通过 /etc/gai.conf 控制 IPv4 / IPv6 解析优先级
-# ============================================================
 # ============================================================
 # IP 优先级设置 — 通过 Xray freedom domainStrategy 控制
 # gai.conf 对 Xray 无效，必须在 config.json 中设置
@@ -1535,7 +1596,7 @@ main_menu() {
         [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.2${NC}       ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.3${NC}       ${BLUE}║${NC}"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
@@ -1545,22 +1606,22 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  添加用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  删除用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  禁用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  启用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  重置到期时间"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看所有用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 查看用户分享链接"
+        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  添加用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  重置到期时间"
+        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  查看所有用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看用户分享链接"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 检查到期用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 查看节点信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} 更新 Xray"
-        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 网络优先级（IPv4/IPv6）"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 检查到期用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 查看节点信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 Xray"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 网络优先级（IPv4/IPv6）"
         echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED}18.${NC} 卸载 Xray"
+        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 Xray"
         echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
         echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -1569,19 +1630,19 @@ main_menu() {
         case $OPT in
             1)  check_system; set_shanghai_timezone; install_xray; init_config; setup_cron ;;
             2)  init_config ;;
-            4)  add_user ;;
-            5)  delete_user ;;
-            6)  toggle_user disable ;;
-            7)  toggle_user enable ;;
-            8)  renew_user ;;
-            9)  list_users ;;
-            10) show_user_link ;;
-            12) check_expire ;;
-            13) show_info ;;
-            15) update_xray ;;
-            16) update_script ;;
-            17) ip_priority_menu ;;
-            18) uninstall_xray ;;
+            3)  add_user ;;
+            4)  delete_user ;;
+            5)  toggle_user disable ;;
+            6)  toggle_user enable ;;
+            7)  renew_user ;;
+            8)  list_users ;;
+            9)  show_user_link ;;
+            10) check_expire ;;
+            11) show_info ;;
+            12) update_xray ;;
+            13) update_script ;;
+            14) ip_priority_menu ;;
+            15) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
