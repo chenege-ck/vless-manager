@@ -478,8 +478,8 @@ init_reality() {
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用，请换一个"
     done
 
-    read -rp "伪装域名 [默认 www.microsoft.com]: " REALITY_SNI
-    REALITY_SNI=${REALITY_SNI:-www.microsoft.com}
+    read -rp "伪装域名 [默认 www.apple.com]: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-www.apple.com}
     local REALITY_SHORTID
     REALITY_SHORTID=$(openssl rand -hex 4)
 
