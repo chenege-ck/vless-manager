@@ -1,6 +1,8 @@
+
 #!/bin/bash
-# VLESS 一键管理脚本 v5.3
+# VLESS 一键管理脚本 v5.4
 # 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式，可同时运行
+# 新增功能：查看用户 YAML 节点（菜单 16）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -22,6 +24,7 @@ error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
+
 # ============================================================
 # 仅支持 Debian
 # ============================================================
@@ -111,7 +114,7 @@ expire_display() {
 }
 
 # ============================================================
-# 安全读取 key=value 配置，避免 source 执行任意内容
+# 安全读取 key=value 配置
 # ============================================================
 read_kv() {
     local file="$1"
@@ -121,15 +124,13 @@ read_kv() {
 }
 
 # ============================================================
-# 获取公网 IP（失败兜底）
+# 获取公网 IP
 # ============================================================
 get_public_ip() {
     local ip=""
-    # 先尝试 IPv4
     ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)
-    # IPv4 全失败则尝试 IPv6（纯 IPv6 机器）
     if [[ -z "$ip" ]]; then
         ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
         [[ -z "$ip" ]] && ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)
@@ -196,7 +197,7 @@ PYEOF
 }
 
 # ============================================================
-# 加载元数据（不再 source）
+# 加载元数据
 # ============================================================
 load_meta() {
     REALITY_PRIVATE_KEY=""
@@ -247,7 +248,9 @@ load_meta() {
     fi
 }
 
-# 检查哪些节点已启用
+# ============================================================
+# 检查节点是否启用
+# ============================================================
 has_reality() { [[ -f "$META_REALITY" ]]; }
 has_ws()      { [[ -f "$META_WS" ]]; }
 
@@ -273,7 +276,7 @@ validate_xray_config() {
 }
 
 # ============================================================
-# 修复 apt 源（仅 Debian 11/12/13）
+# 修复 apt 源
 # ============================================================
 fix_apt() {
     local CODENAME
@@ -342,8 +345,7 @@ install_deps() {
 }
 
 # ============================================================
-# ============================================================
-# 安装 xray
+# 安装 Xray
 # ============================================================
 install_xray() {
     title "安装 Xray..."
@@ -363,7 +365,7 @@ install_xray() {
 }
 
 # ============================================================
-# 卸载 xray
+# 卸载 Xray
 # ============================================================
 uninstall_xray() {
     title "卸载 Xray..."
@@ -387,7 +389,8 @@ uninstall_xray() {
 # ============================================================
 gen_keypair() {
     local OUTPUT
-    OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
+    OUTPUT=$($XRAY_BIN x25519
+
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Public" | awk '{print $NF}')
 }
@@ -463,7 +466,7 @@ init_config() {
 }
 
 # ============================================================
-# 初始化 Reality（保留原创建逻辑）
+# 初始化 Reality
 # ============================================================
 init_reality() {
     gen_keypair
@@ -500,8 +503,7 @@ EOF
 }
 
 # ============================================================
-# ============================================================
-# 初始化 WS+CF（保留原创建逻辑）
+# 初始化 WS+CF
 # ============================================================
 init_ws_cf() {
     while true; do
@@ -548,7 +550,7 @@ EOF
     echo ""
     echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
     echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启${GREEN}橙云代理${NC}"
-    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}（不要用严格模式）"
+    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}"
     echo -e "3. 客户端配置："
     echo -e "   地址   : ${WS_DOMAIN}"
     echo -e "   端口   : ${WS_PORT}"
@@ -559,8 +561,7 @@ EOF
 }
 
 # ============================================================
-# 根据已有 meta 重建 config.json（支持双节点）
-# 保留节点结构，只修复 JSON 合法性
+# 重建 config.json（支持双节点）
 # ============================================================
 rebuild_config() {
     load_meta
@@ -640,7 +641,7 @@ EOF
 }
 
 # ============================================================
-# 启动 xray（先校验后重启）
+# 启动 Xray
 # ============================================================
 _start_xray() {
     validate_xray_config || return 1
@@ -657,7 +658,7 @@ _start_xray() {
 }
 
 # ============================================================
-# 注入用户到 config.json（指定节点类型）
+# 注入用户到 config.json
 # ============================================================
 _inject_user() {
     local UUID=$1
@@ -694,7 +695,7 @@ PYEOF
 }
 
 # ============================================================
-# 重建后将所有 active 用户按节点类型重新注入
+# 重建后注入所有 active 用户
 # ============================================================
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
@@ -731,7 +732,10 @@ _print_link() {
         SERVER_IP=$(get_public_ip)
 
         local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8'));
+for i in d['inbounds']:
+    if i.get('tag')=='inbound-reality':
+        print(i['streamSettings']['realitySettings']['shortIds'][0])")
 
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
@@ -762,7 +766,7 @@ _print_link() {
         echo -e "域名   : ${WS_DOMAIN}"
         echo -e "端口   : ${WS_CF_PORT}"
         echo -e "WS路径 : ${WS_PATH}"
-        echo -e "TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
+        echo -e "TLS    : 开启"
         echo -e "SNI    : ${WS_DOMAIN}"
 
         local LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=${WS_TLS}&sni=${WS_DOMAIN}#${ENCODED_NAME}"
@@ -775,6 +779,93 @@ _print_link() {
 }
 
 # ============================================================
+# 新增功能：输出用户 YAML 节点
+# ============================================================
+_print_yaml() {
+    local USERNAME=$1
+    local UUID=$2
+    local EXPIRE=$3
+    local NODE=$4
+
+    load_meta
+
+    echo ""
+    echo "proxies:"
+
+    # Reality 节点
+    if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
+        local SERVER_IP SHORTID
+        SERVER_IP=$(get_public_ip)
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8'));
+for i in d['inbounds']:
+    if i.get('tag')=='inbound-reality':
+        print(i['streamSettings']['realitySettings']['shortIds'][0])")
+
+        cat <<EOF
+  - name: ${USERNAME}-reality
+    type: vless
+    server: ${SERVER_IP}
+    port: ${REALITY_PORT}
+    uuid: ${UUID}
+    flow: xtls-rprx-vision
+    tls: true
+    reality:
+      public-key: ${REALITY_PUBLIC_KEY}
+      short-id: ${SHORTID}
+    sni: ${REALITY_SNI}
+    fingerprint: chrome
+EOF
+    fi
+
+    # WS 节点
+    if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
+        cat <<EOF
+  - name: ${USERNAME}-ws
+    type: vless
+    server: ${WS_DOMAIN}
+    port: ${WS_CF_PORT}
+    uuid: ${UUID}
+    tls: true
+    network: ws
+    ws-opts:
+      path: ${WS_PATH}
+      headers:
+        Host: ${WS_DOMAIN}
+    sni: ${WS_DOMAIN}
+EOF
+    fi
+
+    echo ""
+}
+
+# ============================================================
+# 查看用户 YAML 节点（菜单 16）
+# ============================================================
+view_user_yaml() {
+    title "查看用户 YAML 节点"
+    normalize_user_db
+    list_users_brief
+
+    read -rp "输入用户名: " USERNAME
+    [[ -z "$USERNAME" ]] && error "用户名不能为空" && return
+
+    local LINE
+    LINE=$(grep "^${USERNAME}:" "$USER_DB" 2>/dev/null)
+
+    if [[ -z "$LINE" ]]; then
+        error "用户不存在: ${USERNAME}"
+        return
+    fi
+
+    IFS=: read -r NAME UUID EXPIRE STATUS NODE <<< "$LINE"
+
+    if [[ "$STATUS" != "active" ]]; then
+        warn "用户状态不是 active，仍然生成 YAML"
+    fi
+
+    _print_yaml "$NAME" "$UUID" "$EXPIRE" "$NODE"
+}
+
 # ============================================================
 # 添加用户
 # ============================================================
@@ -799,9 +890,9 @@ add_user() {
     if has_reality && has_ws; then
         echo ""
         echo "请选择加入的节点："
-        echo -e "  ${GREEN}1.${NC} 两个节点都加入"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        echo -e "  1. 两个节点都加入"
+        echo -e "  2. 仅 Reality"
+        echo -e "  3. 仅 WS+CF"
         read -rp "选择 [1/2/3，默认1]: " NODE_SEL
         case ${NODE_SEL:-1} in
             2) NODE="reality" ;;
@@ -833,7 +924,6 @@ add_user() {
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
 
     validate_xray_config || {
-        # UUID 唯一，用 UUID 定位回滚，安全精确
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -875,7 +965,6 @@ delete_user() {
     read -rp "输入要删除的用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
 
-    # 精确匹配：用户名后紧跟冒号，避免前缀误删
     if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
         error "用户不存在"
         return
@@ -890,9 +979,9 @@ delete_user() {
     if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
         echo ""
         echo "删除哪个节点的权限？"
-        echo -e "  ${GREEN}1.${NC} 两个节点都删除（彻底删除用户）"
-        echo -e "  ${GREEN}2.${NC} 仅删除 Reality 权限"
-        echo -e "  ${GREEN}3.${NC} 仅删除 WS+CF 权限"
+        echo -e "  1. 两个节点都删除（彻底删除用户）"
+        echo -e "  2. 仅删除 Reality 权限"
+        echo -e "  3. 仅删除 WS+CF 权限"
         read -rp "选择 [1/2/3，默认1]: " DEL_SEL
         case ${DEL_SEL:-1} in
             2) DEL_NODE="reality" ;;
@@ -918,7 +1007,6 @@ with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
 PYEOF
 
     if [[ "$DEL_NODE" == "both" ]]; then
-        # 用 python 精确删除，避免 sed 前缀误匹配
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -994,7 +1082,6 @@ renew_user() {
     NODE=${NODE:-both}
     STATUS=${STATUS:-active}
 
-    # 续期后统一恢复为 active（无论原来是什么状态）
     local NEW_STATUS="active"
 
     python3 - <<PYEOF
@@ -1011,7 +1098,6 @@ for line in lines:
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
-    # 无论原来 active 还是 disabled，续期后都重新注入并启动
     _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
     validate_xray_config && systemctl restart xray
 
@@ -1048,9 +1134,9 @@ toggle_user() {
     if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
         echo ""
         echo "操作哪个节点？"
-        echo -e "  ${GREEN}1.${NC} 两个节点"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        echo -e "  1. 两个节点"
+        echo -e "  2. 仅 Reality"
+        echo -e "  3. 仅 WS+CF"
         read -rp "选择 [1/2/3，默认1]: " OP_SEL
         case ${OP_SEL:-1} in
             2) OP_NODE="reality" ;;
@@ -1099,13 +1185,12 @@ PYEOF
         local EXPIRE
         EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
 
-        # 检查是否已过期，过期不允许直接启用
         local EXPIRE_TS NOW_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
         NOW_TS=$(now_shanghai_ts)
         if [[ -n "$EXPIRE_TS" ]] && (( NOW_TS >= EXPIRE_TS )); then
             warn "用户 ${USERNAME} 已过期（$(expire_display "$EXPIRE")），无法启用"
-            warn "请先使用菜单 8 重置到期时间再启用"
+            warn "请先使用菜单 7 重置到期时间再启用"
             return
         fi
 
@@ -1140,7 +1225,7 @@ PYEOF
 }
 
 # ============================================================
-# 到期检查（按上海时间，到期日当天 12:00 断开）
+# 到期检查
 # ============================================================
 check_expire() {
     title "检查到期用户..."
@@ -1168,492 +1253,4 @@ check_expire() {
         fi
     done < "$USER_DB"
 
-    if [[ $CHANGED -eq 1 ]]; then
-        # 批量更新 db：一次 python 调用完成所有到期用户状态变更
-        BATCH_UUIDS="$EXPIRED_UUIDS" DB_PATH="$USER_DB" python3 - <<'PYEOF'
-import os
-from pathlib import Path
-uuids = set(os.environ["BATCH_UUIDS"].split())
-p = Path(os.environ["DB_PATH"])
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = []
-for line in lines:
-    parts = line.split(":")
-    if len(parts) >= 2 and parts[1] in uuids:
-        if len(parts) < 5:
-            parts += ["both"] * (5 - len(parts))
-        parts[3] = "disabled"
-        out.append(":".join(parts[:5]))
-    else:
-        out.append(line)
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-
-        # 批量从 config.json 移除到期用户
-        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$XRAY_CONFIG" python3 - <<'PYEOF'
-import json, os
-expired = set(os.environ["BATCH_UUIDS"].split())
-cfg_path = os.environ["CFG_PATH"]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-for inbound in cfg["inbounds"]:
-    if "clients" not in inbound.get("settings", {}):
-        continue
-    inbound["settings"]["clients"] = [
-        c for c in inbound["settings"]["clients"] if c.get("id") not in expired
-    ]
-with open(cfg_path, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
-PYEOF
-
-        validate_xray_config && systemctl restart xray
-        info "已重启 Xray"
-    else
-        info "没有到期用户"
-    fi
-}
-
-# ============================================================
-# 列出用户
-# ============================================================
-list_users() {
-    title "用户列表"
-    normalize_user_db
-    [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
-
-    local TOTAL ACTIVE DISABLED
-    TOTAL=$(wc -l < "$USER_DB")
-    ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
-    DISABLED=$((TOTAL - ACTIVE))
-    echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
-    echo -e "  ${YELLOW}%-15s %-38s %-20s %-8s %-8s${NC}" "用户名" "UUID" "到期时间" "状态" "节点"
-    echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
-        NODE=${NODE:-both}
-        local COLOR=$NC
-        local STATUS_ICON="○"
-        local EXPIRE_SHOW
-        EXPIRE_SHOW=$(expire_display "$EXPIRE")
-        if [[ "$STATUS" == "active" ]]; then
-            COLOR=$GREEN; STATUS_ICON="●"
-        elif [[ "$STATUS" == "disabled" ]]; then
-            COLOR=$RED; STATUS_ICON="○"
-        fi
-        printf "  ${COLOR}%-15s %-38s %-20s %-8s %-8s${NC}\n" \
-            "$NAME" "$UUID" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE"
-    done < "$USER_DB"
-    echo ""
-}
-
-list_users_brief() {
-    normalize_user_db
-    echo ""
-    [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
-        NODE=${NODE:-both}
-        printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
-    done < "$USER_DB"
-    echo ""
-}
-
-# ============================================================
-# 查看用户分享链接
-# ============================================================
-show_user_link() {
-    title "查看用户分享链接"
-    normalize_user_db
-    list_users_brief
-
-    read -rp "输入用户名: " USERNAME
-    [[ -z "$USERNAME" ]] && return
-
-    if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
-        error "用户不存在"
-        return
-    fi
-
-    local UUID EXPIRE NODE STATUS
-    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
-    EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
-    STATUS=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f4)
-    NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
-    NODE=${NODE:-both}
-
-    if [[ "$STATUS" == "disabled" ]]; then
-        warn "用户 ${USERNAME} 当前已禁用，链接仍可查看但节点不会响应"
-    fi
-
-    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
-}
-
-# ============================================================
-# 主机信息
-# ============================================================
-show_host_status() {
-    local PUBLIC_IP LOAD_INFO MEM_INFO
-
-    PUBLIC_IP=$(get_public_ip)
-    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
-
-    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
-
-    cat <<EOF
-║  IP   ${PUBLIC_IP}
-║  负载 ${LOAD_INFO}  内存 ${MEM_INFO}
-EOF
-}
-# ============================================================
-# ============================================================
-# 节点信息
-# ============================================================
-show_info() {
-    title "节点信息"
-    load_meta
-    normalize_user_db
-
-    local XRAY_STATUS USER_COUNT ACTIVE_COUNT
-    local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
-
-    XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
-    USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-    ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
-
-    PUBLIC_IP=$(get_public_ip)
-    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
-
-    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
-
-    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
-
-    UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
-    [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
-
-    echo -e "状态   : $( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
-    echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
-    echo -e "公网IP : ${PUBLIC_IP}"
-    echo -e "负载   : ${LOAD_INFO}"
-    echo -e "内存   : ${MEM_INFO}"
-    echo -e "交换   : ${SWAP_INFO}"
-    echo -e "在线   : ${UPTIME_INFO}"
-    echo ""
-
-    if has_reality; then
-        local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
-        echo -e "${CYAN}── Reality 节点 ──${NC}"
-        echo -e "地址   : ${PUBLIC_IP}"
-        echo -e "端口   : ${REALITY_PORT}"
-        echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
-        echo -e "SNI    : ${REALITY_SNI}"
-        echo -e "ShortID: ${SHORTID}"
-        echo -e "协议   : VLESS+Reality+TCP"
-        echo ""
-    fi
-
-    if has_ws; then
-        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
-        echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : ${WS_PORT}"
-        echo -e "WS路径 : ${WS_PATH}"
-        echo -e "TLS    : 开启（自签证书）"
-        echo -e "协议   : VLESS+WS+TLS"
-        echo ""
-    fi
-
-    if ! has_reality && ! has_ws; then
-        warn "尚未配置任何节点，请选择菜单 1 或 2 初始化"
-    fi
-}
-# ============================================================
-# 设置 cron
-# ============================================================
-setup_cron() {
-    SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    EXPIRE_CMD="*/5 * * * * /usr/local/bin/vless_script.sh --check-expire >> /var/log/xray-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
-    info "已设置每 5 分钟自动检查到期用户（上海时间）"
-
-    mkdir -p /var/log/xray
-
-    cat > /etc/logrotate.d/xray-expire <<EOF
-/var/log/xray-expire.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 root root
-}
-EOF
-    cat > /etc/logrotate.d/xray <<EOF
-/var/log/xray/*.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 nobody root
-    postrotate
-        systemctl kill -s USR1 xray 2>/dev/null || true
-    endscript
-}
-EOF
-    info "已配置日志自动轮转（每周轮转，保留4周）"
-}
-
-# ============================================================
-# IP 优先级设置 — 通过 Xray freedom domainStrategy 控制
-# gai.conf 对 Xray 无效，必须在 config.json 中设置
-# ============================================================
-get_ip_priority_mode() {
-    local ds=""
-    [[ -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META_WS" ]] && ds=$(read_kv "$META_WS" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
-    case "$ds" in
-        UseIPv4v6) echo "IPv4 优先（v4失败自动切v6）" ;;
-        UseIPv6v4) echo "IPv6 优先（v6失败自动切v4）" ;;
-        UseIPv4)   echo "仅 IPv4" ;;
-        UseIPv6)   echo "仅 IPv6" ;;
-        *)         echo "系统默认（AsIs）" ;;
-    esac
-}
-
-_save_ip_priority() {
-    local ds="$1"
-    local saved=0
-    for f in "$META_REALITY" "$META_WS" "$META"; do
-        [[ -f "$f" ]] || continue
-        if grep -q "^IP_PRIORITY=" "$f" 2>/dev/null; then
-            sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$f"
-        else
-            echo "IP_PRIORITY=${ds}" >> "$f"
-        fi
-        saved=1
-    done
-    # 如果一个 meta 文件都没有（未初始化），暂存到 META
-    if [[ $saved -eq 0 ]]; then
-        mkdir -p "$(dirname "$META")"
-        echo "IP_PRIORITY=${ds}" >> "$META"
-    fi
-}
-
-ip_priority_menu() {
-    title "网络优先级（IPv4/IPv6）"
-    load_meta
-
-    local CURRENT_MODE
-    CURRENT_MODE=$(get_ip_priority_mode)
-
-    echo ""
-    echo -e "当前模式：${CYAN}${CURRENT_MODE}${NC}"
-    echo ""
-    echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
-    echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
-    echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4，v6 完全不用"
-    echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6，v4 完全不用"
-    echo -e "  ${GREEN}5.${NC} 系统默认   — 由 Xray 自动决定（AsIs）"
-    echo -e "  ${GREEN}0.${NC} 返回"
-    echo ""
-    read -rp "选择: " OPT
-
-    local DS=""
-    local DESC=""
-    case "$OPT" in
-        1) DS="UseIPv4v6"; DESC="IPv4 优先" ;;
-        2) DS="UseIPv6v4"; DESC="IPv6 优先" ;;
-        3) DS="UseIPv4";   DESC="仅 IPv4" ;;
-        4) DS="UseIPv6";   DESC="仅 IPv6" ;;
-        5) DS="AsIs";      DESC="系统默认" ;;
-        0) return ;;
-        *) warn "无效选项"; return ;;
-    esac
-
-    _save_ip_priority "$DS"
-
-    if has_reality || has_ws; then
-        rebuild_config
-        _inject_all_users
-        _start_xray
-    fi
-
-    echo ""
-    info "已生效：${DESC}"
-}
-
-# ============================================================
-# 一键更新 Xray
-# ============================================================
-update_xray() {
-    title "更新 Xray..."
-    local CURRENT_VER
-    CURRENT_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
-    info "当前版本: ${CURRENT_VER}"
-    info "正在下载最新版本..."
-
-    [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
-    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
-    bash /tmp/xray-install.sh install
-
-    [[ -f "${XRAY_CONFIG}.bak" ]] && mv "${XRAY_CONFIG}.bak" "$XRAY_CONFIG" && info "已恢复原配置"
-
-    validate_xray_config || {
-        error "恢复后的配置校验失败，已取消重启"
-        return 1
-    }
-
-    local NEW_VER
-    NEW_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
-    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
-        info "已是最新版本: ${NEW_VER}"
-    else
-        info "更新完成: ${CURRENT_VER} → ${NEW_VER}"
-    fi
-    systemctl restart xray
-    info "Xray 已重启"
-}
-
-# ============================================================
-# 更新脚本到最新版本
-# ============================================================
-update_script() {
-    title "更新管理脚本..."
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    info "正在从 GitHub 拉取最新版本..."
-    local TMP_SCRIPT="/tmp/vless_new.sh"
-    curl -sL "$SCRIPT_URL" -o "$TMP_SCRIPT"
-    if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
-        error "下载失败，请检查网络"
-        return
-    fi
-    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
-        error "脚本语法错误，取消更新"
-        rm -f "$TMP_SCRIPT"
-        return
-    fi
-    cp "$TMP_SCRIPT" /usr/local/bin/vless_script.sh
-    chmod +x /usr/local/bin/vless_script.sh
-    rm -f "$TMP_SCRIPT"
-    info "脚本已更新，用户数据完整保留"
-    info "正在重新启动新版本..."
-    sleep 1
-    exec bash /usr/local/bin/vless_script.sh
-}
-
-# ============================================================
-# 安装快捷命令 c
-# ============================================================
-install_shortcut() {
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    if [[ ! -f /usr/local/bin/vless_script.sh ]]; then
-        curl -sL "$SCRIPT_URL" -o /usr/local/bin/vless_script.sh 2>/dev/null
-        chmod +x /usr/local/bin/vless_script.sh
-    fi
-    cat > /usr/local/bin/c <<EOF
-#!/bin/bash
-bash /usr/local/bin/vless_script.sh
-EOF
-    chmod +x /usr/local/bin/c
-}
-
-# ============================================================
-# CLI 模式（供 cron 调用）
-# ============================================================
-if [[ "$1" == "--check-expire" ]]; then
-    normalize_user_db
-    check_expire
-    exit 0
-fi
-
-# ============================================================
-# ============================================================
-# 主菜单
-# ============================================================
-main_menu() {
-    while true; do
-        clear
-        normalize_user_db
-        load_meta
-
-        local XRAY_STATUS USER_COUNT
-        XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
-        USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-        local ACTIVE_COUNT=0
-        [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
-
-        local MODE_STR=""
-        has_reality && MODE_STR="Reality"
-        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
-        [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
-
-        local STATUS_COLOR=$RED
-        local STATUS_TEXT="● 已停止"
-        [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
-
-        echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.3${NC}       ${BLUE}║${NC}"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
-        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
-        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  添加用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  删除用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  启用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  重置到期时间"
-        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  查看所有用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看用户分享链接"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 检查到期用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 查看节点信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 Xray"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 网络优先级（IPv4/IPv6）"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 Xray"
-        echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
-        echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
-        echo -ne " 请选择 » "
-        read -r OPT
-
-        case $OPT in
-            1)  check_system; set_shanghai_timezone; install_xray; init_config; setup_cron ;;
-            2)  init_config ;;
-            3)  add_user ;;
-            4)  delete_user ;;
-            5)  toggle_user disable ;;
-            6)  toggle_user enable ;;
-            7)  renew_user ;;
-            8)  list_users ;;
-            9)  show_user_link ;;
-            10) check_expire ;;
-            11) show_info ;;
-            12) update_xray ;;
-            13) update_script ;;
-            14) ip_priority_menu ;;
-            15) uninstall_xray ;;
-            0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
-            *)  warn "无效选项，请重新选择" ;;
-        esac
-
-        echo ""
-        echo -ne "${BLUE}按 Enter 返回菜单...${NC}"
-        read -r _
-    done
-}
-
-check_system
-normalize_user_db
-install_shortcut
-main_menu
+    if [[ $CHANGED -eq 1 ]];
