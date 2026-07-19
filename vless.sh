@@ -335,7 +335,24 @@ EOF
 # ============================================================
 install_deps() {
     title "安装依赖..."
-    fix_apt || return 1
+
+    info "正在使用当前 apt 软件源更新索引..."
+    if ! apt-get update -qq; then
+        warn "当前 apt 软件源更新失败"
+        warn "自动修复会备份并覆盖 /etc/apt/sources.list"
+
+        local REPAIR_APT
+        read -rp "apt 更新失败，是否自动修复软件源？[y/N]: " REPAIR_APT
+        if [[ "$REPAIR_APT" == "y" || "$REPAIR_APT" == "Y" ]]; then
+            fix_apt || return 1
+        else
+            error "已取消修复 apt 源，未修改 /etc/apt/sources.list"
+            return 1
+        fi
+    else
+        info "当前 apt 软件源可用，保持原配置不变"
+    fi
+
     apt-get install -y -qq curl unzip openssl python3
     [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
     info "依赖安装完成"
