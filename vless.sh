@@ -1597,6 +1597,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+ReadWritePaths=/usr/local/etc/xray
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -1930,6 +1931,7 @@ main_menu
 #TG|from __future__ import annotations
 #TG|
 #TG|import argparse
+#TG|import concurrent.futures
 #TG|import html
 #TG|import json
 #TG|import os
@@ -2230,6 +2232,19 @@ main_menu
 #TG|    return "未知命令，请发送 /help"
 #TG|
 #TG|
+#TG|def handle_message(token: str, cfg: dict, message: dict, users_path: Path, db_path: Path) -> None:
+#TG|    started = time.monotonic()
+#TG|    chat_id = (message.get("chat") or {}).get("id")
+#TG|    text = message.get("text", "")
+#TG|    if chat_id is None or not text:
+#TG|        return
+#TG|    if not is_authorized_message(cfg, message):
+#TG|        send_message(token, int(chat_id), "⛔ 未授权。你的 Telegram 用户 ID：\n<code>%s</code>" % ((message.get("from") or {}).get("id", "未知")))
+#TG|        return
+#TG|    send_message(token, int(chat_id), command_reply(text, users_path, db_path))
+#TG|    print(f"command={text.split(maxsplit=1)[0]} elapsed={time.monotonic() - started:.3f}s", flush=True)
+#TG|
+#TG|
 #TG|def run_collector(config_path: Path, once: bool = False) -> None:
 #TG|    cfg = parse_config(config_path)
 #TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
@@ -2254,23 +2269,20 @@ main_menu
 #TG|    users_path = Path(cfg.get("USER_DB", str(DEFAULT_USERS)))
 #TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
 #TG|    offset = 0
-#TG|    while True:
-#TG|        try:
-#TG|            result = tg_request(token, "getUpdates", {"timeout": "50", "offset": str(offset)})
-#TG|            for update in result.get("result", []):
-#TG|                offset = max(offset, int(update["update_id"]) + 1)
-#TG|                message = update.get("message") or {}
-#TG|                chat_id = (message.get("chat") or {}).get("id")
-#TG|                text = message.get("text", "")
-#TG|                if chat_id is None or not text:
-#TG|                    continue
-#TG|                if not is_authorized_message(cfg, message):
-#TG|                    send_message(token, int(chat_id), "⛔ 未授权。请把这个 Chat ID 交给服务器管理员：\n<code>%s</code>" % chat_id)
-#TG|                    continue
-#TG|                send_message(token, int(chat_id), command_reply(text, users_path, db_path))
-#TG|        except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
-#TG|            print(f"bot: {exc}", flush=True)
-#TG|            time.sleep(5)
+#TG|    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+#TG|        while True:
+#TG|            try:
+#TG|                result = tg_request(token, "getUpdates", {"timeout": "50", "offset": str(offset), "limit": "20"})
+#TG|                updates = result.get("result", [])
+#TG|                if updates:
+#TG|                    offset = max(int(item["update_id"]) for item in updates) + 1
+#TG|                    # Acknowledge the batch immediately; process replies concurrently.
+#TG|                    tg_request(token, "getUpdates", {"timeout": "0", "offset": str(offset), "limit": "1"})
+#TG|                    for update in updates:
+#TG|                        pool.submit(handle_message, token, cfg, update.get("message") or {}, users_path, db_path)
+#TG|            except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+#TG|                print(f"bot: {exc}", flush=True)
+#TG|                time.sleep(2)
 #TG|
 #TG|
 #TG|def main() -> None:
