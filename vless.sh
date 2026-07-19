@@ -1,6 +1,6 @@
 #!/bin/bash
-# VLESS 一键管理脚本 v5.3
-# 支持：VLESS+Reality 和 VLESS+WS+CF 两种模式，可同时运行
+# VLESS 智能节点控制台 v6.0
+# Reality + WS + 用户管理 + Telegram 到期/流量统计
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -15,11 +15,38 @@ XRAY_BIN="/usr/local/bin/xray"
 META_REALITY="/usr/local/etc/xray/meta-reality.conf"
 META_WS="/usr/local/etc/xray/meta-ws.conf"
 META="/usr/local/etc/xray/meta.conf"
+TG_DIR="/usr/local/lib/vless-manager"
+TG_SCRIPT="${TG_DIR}/vless_tg_bot.py"
+TG_CONFIG="/etc/vless-manager/bot.conf"
+TRAFFIC_DB="/usr/local/etc/xray/traffic.db"
 
 info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
 warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
+
+validate_username() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || {
+        error "用户名只能包含英文字母、数字、下划线和短横线"
+        return 1
+    }
+}
+
+validate_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+        error "用户数据库中的 UUID 格式异常，操作已停止"
+        return 1
+    }
+}
+
+user_exists() {
+    awk -F: -v n="$1" '$1==n {found=1; exit} END {exit !found}' "$USER_DB" 2>/dev/null
+}
+
+get_user_field() {
+    awk -F: -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$USER_DB" 2>/dev/null
+}
 
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
 # ============================================================
@@ -423,6 +450,7 @@ init_config() {
     title "节点配置..."
     mkdir -p /usr/local/etc/xray
     touch "$USER_DB"
+    chmod 600 "$USER_DB"
     normalize_user_db
     load_meta
 
@@ -543,7 +571,8 @@ init_ws_cf() {
         -subj "/CN=${WS_DOMAIN}" \
         -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null
 
-    chmod 644 "${CERT_DIR}/ws.key"
+    chmod 640 "${CERT_DIR}/ws.key"
+    chown root:nogroup "${CERT_DIR}/ws.key" 2>/dev/null || true
     chmod 644 "${CERT_DIR}/ws.crt"
 
     info "自签证书生成完成"
@@ -642,6 +671,20 @@ rebuild_config() {
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning" },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    }
+  },
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:10085",
+    "services": ["StatsService"]
+  },
   "routing": {
     "rules": []
   },
@@ -802,12 +845,9 @@ add_user() {
 
     read -rp "用户名（备注用）: " USERNAME
     [[ -z "$USERNAME" ]] && error "用户名不能为空" && return
-    if [[ "$USERNAME" =~ [:/\ ] ]]; then
-        error "用户名不能包含 : / 空格 等特殊字符"
-        return
-    fi
+    validate_username "$USERNAME" || return
 
-    if grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if user_exists "$USERNAME"; then
         error "用户 ${USERNAME} 已存在"
         return
     fi
@@ -889,18 +929,20 @@ delete_user() {
     normalize_user_db
     list_users_brief
 
-    read -rp "输入要删除的用户名: " USERNAME
+    read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
 
     # 精确匹配：用户名后紧跟冒号，避免前缀误删
-    if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if ! user_exists "$USERNAME"; then
         error "用户不存在"
         return
     fi
 
-    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
     local USER_NODE
-    USER_NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
+    USER_NODE=$(get_user_field "$USERNAME" 5)
     USER_NODE=${USER_NODE:-both}
 
     local DEL_NODE="both"
@@ -987,8 +1029,9 @@ renew_user() {
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
 
-    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if ! user_exists "$USERNAME"; then
         error "用户不存在"
         return
     fi
@@ -1004,10 +1047,11 @@ renew_user() {
     NEW_EXPIRE=$(expire_noon_str "$DAYS")
     [[ -z "$NEW_EXPIRE" ]] && error "到期时间计算失败" && return
 
-    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
     local STATUS NODE
-    STATUS=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f4)
-    NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
+    STATUS=$(get_user_field "$USERNAME" 4)
+    NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
     STATUS=${STATUS:-active}
 
@@ -1050,15 +1094,17 @@ toggle_user() {
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
 
-    if ! grep -q "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if ! user_exists "$USERNAME"; then
         error "用户不存在"
         return
     fi
 
-    UUID=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f2)
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
     local USER_NODE
-    USER_NODE=$(grep "^${USERNAME}:" "$USER_DB" | cut -d: -f5)
+    USER_NODE=$(get_user_field "$USERNAME" 5)
     USER_NODE=${USER_NODE:-both}
 
     local OP_NODE="both"
@@ -1114,7 +1160,7 @@ PYEOF
         info "用户 ${USERNAME} 已禁用（节点: ${OP_NODE}）"
     else
         local EXPIRE
-        EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
+        EXPIRE=$(get_user_field "$USERNAME" 3)
 
         # 检查是否已过期，过期不允许直接启用
         local EXPIRE_TS NOW_TS
@@ -1283,17 +1329,19 @@ show_user_link() {
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
 
-    if ! grep -qP "^${USERNAME}:" "$USER_DB" 2>/dev/null; then
+    if ! user_exists "$USERNAME"; then
         error "用户不存在"
         return
     fi
 
     local UUID EXPIRE NODE STATUS
-    UUID=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f2)
-    EXPIRE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f3)
-    STATUS=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f4)
-    NODE=$(grep -P "^${USERNAME}:" "$USER_DB" | head -1 | cut -d: -f5)
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
+    EXPIRE=$(get_user_field "$USERNAME" 3)
+    STATUS=$(get_user_field "$USERNAME" 4)
+    NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
 
     if [[ "$STATUS" == "disabled" ]]; then
@@ -1421,6 +1469,205 @@ EOF
 }
 EOF
     info "已配置日志自动轮转（每周轮转，保留4周）"
+}
+
+# ============================================================
+# Telegram 机器人与流量统计
+# ============================================================
+extract_telegram_runtime() {
+    mkdir -p "$TG_DIR" /etc/vless-manager /usr/local/etc/xray
+    awk '
+        /^###__VLESS_TG_BOT_PY__###$/ {inside=1; next}
+        /^###__END_VLESS_TG_BOT_PY__###$/ {inside=0; exit}
+        inside {sub(/^#TG\|/, ""); print}
+    ' "$0" > "$TG_SCRIPT"
+    [[ -s "$TG_SCRIPT" ]] || { error "机器人程序提取失败"; return 1; }
+    chmod 700 "$TG_SCRIPT"
+}
+
+enable_xray_stats() {
+    [[ -f "$XRAY_CONFIG" ]] || { error "Xray 配置不存在"; return 1; }
+    local TMP_CONFIG BACKUP_CONFIG
+    TMP_CONFIG=$(mktemp /tmp/xray-stats.XXXXXX.json) || return 1
+    BACKUP_CONFIG="${XRAY_CONFIG}.pre-telegram.$(date +%s).bak"
+    cp "$XRAY_CONFIG" "$BACKUP_CONFIG" || { rm -f "$TMP_CONFIG"; return 1; }
+
+    XRAY_STATS_SOURCE="$XRAY_CONFIG" XRAY_STATS_TARGET="$TMP_CONFIG" python3 - <<'PYEOF'
+import json, os
+src = os.environ["XRAY_STATS_SOURCE"]
+dst = os.environ["XRAY_STATS_TARGET"]
+with open(src, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+cfg["stats"] = {}
+levels = cfg.setdefault("policy", {}).setdefault("levels", {})
+level0 = levels.setdefault("0", {})
+level0["statsUserUplink"] = True
+level0["statsUserDownlink"] = True
+api = cfg.setdefault("api", {})
+api.setdefault("tag", "api")
+api.setdefault("listen", "127.0.0.1:10085")
+services = set(api.get("services", []))
+services.add("StatsService")
+api["services"] = sorted(services)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+PYEOF
+    if [[ $? -ne 0 ]] || ! "$XRAY_BIN" run -test -config "$TMP_CONFIG" >/dev/null 2>&1; then
+        rm -f "$TMP_CONFIG"
+        error "开启流量统计失败，原配置未修改"
+        return 1
+    fi
+    cp "$TMP_CONFIG" "$XRAY_CONFIG"
+    rm -f "$TMP_CONFIG"
+    systemctl restart xray
+    systemctl is-active --quiet xray || {
+        cp "$BACKUP_CONFIG" "$XRAY_CONFIG"
+        systemctl restart xray
+        error "Xray 启动失败，已恢复原配置"
+        return 1
+    }
+    info "已在现有配置上开启 Xray 用户流量统计"
+}
+
+install_telegram_bot() {
+    title "安装 Telegram 智能管家"
+    command -v python3 >/dev/null 2>&1 || { error "缺少 python3，请先安装依赖"; return 1; }
+    [[ -x "$XRAY_BIN" ]] || { error "请先安装 Xray"; return 1; }
+
+    local BOT_TOKEN ADMIN_CHAT_IDS
+    read -rsp "输入 Bot Token（输入内容不会显示）: " BOT_TOKEN
+    echo ""
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { error "Bot Token 格式不正确"; return 1; }
+    read -rp "输入你的 Telegram 用户 ID（只允许正整数，可用逗号分隔）: " ADMIN_CHAT_IDS
+    [[ "$ADMIN_CHAT_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]] || { error "用户 ID 格式不正确"; return 1; }
+
+    extract_telegram_runtime || return 1
+    cat > "$TG_CONFIG" <<EOF
+BOT_TOKEN=${BOT_TOKEN}
+ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+USER_DB=${USER_DB}
+TRAFFIC_DB=${TRAFFIC_DB}
+XRAY_BIN=${XRAY_BIN}
+COLLECT_INTERVAL=60
+EOF
+    chmod 600 "$TG_CONFIG"
+
+    cat > /etc/systemd/system/vless-traffic.service <<EOF
+[Unit]
+Description=VLESS per-user traffic collector
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${TG_SCRIPT} --config ${TG_CONFIG} --collector
+Restart=always
+RestartSec=5
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/usr/local/etc/xray
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/vless-tgbot.service <<EOF
+[Unit]
+Description=VLESS Telegram management bot
+After=network-online.target vless-traffic.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${TG_SCRIPT} --config ${TG_CONFIG}
+Restart=always
+RestartSec=5
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    enable_xray_stats || return 1
+    chmod 600 "$USER_DB" 2>/dev/null || true
+    touch "$TRAFFIC_DB"
+    chmod 600 "$TRAFFIC_DB"
+    systemctl daemon-reload
+    systemctl enable vless-traffic.service vless-tgbot.service >/dev/null 2>&1
+    systemctl restart vless-traffic.service vless-tgbot.service
+    sleep 2
+    if systemctl is-active --quiet vless-traffic.service && systemctl is-active --quiet vless-tgbot.service; then
+        info "Telegram 机器人和流量采集器已启动"
+        info "现在打开 Telegram，向机器人发送 /start"
+        warn "首次启用统计后，从现在开始记录流量；无法补算以前的流量"
+    else
+        error "服务启动失败，请选择“查看机器人日志”排查"
+        return 1
+    fi
+}
+
+telegram_bot_status() {
+    title "Telegram 服务状态"
+    systemctl --no-pager --full status vless-tgbot.service vless-traffic.service 2>/dev/null || true
+}
+
+telegram_bot_logs() {
+    title "Telegram 最近日志"
+    journalctl -u vless-tgbot.service -u vless-traffic.service -n 60 --no-pager
+}
+
+uninstall_telegram_bot() {
+    read -rp "确认卸载机器人？流量历史默认保留 [y/N]: " C
+    [[ "$C" != "y" && "$C" != "Y" ]] && return
+    systemctl disable --now vless-tgbot.service vless-traffic.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/vless-tgbot.service /etc/systemd/system/vless-traffic.service
+    rm -rf "$TG_DIR" /etc/vless-manager
+    systemctl daemon-reload
+    info "机器人已卸载，流量数据库仍保留在 ${TRAFFIC_DB}"
+}
+
+telegram_bot_menu() {
+    while true; do
+        clear
+        title "Telegram 机器人与流量统计"
+        echo -e "  ${GREEN}1.${NC} 安装 / 重新配置机器人"
+        echo -e "  ${GREEN}2.${NC} 查看运行状态"
+        echo -e "  ${GREEN}3.${NC} 重启机器人与采集器"
+        echo -e "  ${GREEN}4.${NC} 查看最近日志"
+        echo -e "  ${RED}5.${NC} 卸载机器人"
+        echo -e "  ${GREEN}0.${NC} 返回主菜单"
+        echo ""
+        read -rp "请选择: " TG_OPT
+        case "$TG_OPT" in
+            1) install_telegram_bot ;;
+            2) telegram_bot_status ;;
+            3) systemctl restart vless-traffic.service vless-tgbot.service && info "服务已重启" ;;
+            4) telegram_bot_logs ;;
+            5) uninstall_telegram_bot ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+        echo ""; read -rp "按 Enter 继续..." _
+    done
 }
 
 # ============================================================
@@ -1566,9 +1813,10 @@ update_script() {
 # 安装快捷命令 c
 # ============================================================
 install_shortcut() {
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    if [[ ! -f /usr/local/bin/vless_script.sh ]]; then
-        curl -sL "$SCRIPT_URL" -o /usr/local/bin/vless_script.sh 2>/dev/null
+    local SELF_PATH
+    SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    if [[ "$SELF_PATH" != "/usr/local/bin/vless_script.sh" ]]; then
+        cp "$SELF_PATH" /usr/local/bin/vless_script.sh
         chmod +x /usr/local/bin/vless_script.sh
     fi
     cat > /usr/local/bin/c <<EOF
@@ -1612,35 +1860,34 @@ main_menu() {
         local STATUS_TEXT="● 已停止"
         [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
-        echo -e "${BLUE}╔════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}    ${CYAN}VLESS 节点管理工具  v5.3${NC}       ${BLUE}║${NC}"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  状态 ${STATUS_COLOR}${STATUS_TEXT}${NC}  模式 ${YELLOW}${MODE_STR}${NC}"
-        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}节点管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray + 配置节点"
-        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加/移除节点"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}用户管理${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  添加用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}4.${NC}  删除用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}6.${NC}  启用用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  重置到期时间"
-        echo -e "${BLUE}║${NC}   ${GREEN}8.${NC}  查看所有用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看用户分享链接"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}系统工具${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 检查到期用户"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 查看节点信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 Xray"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} 网络优先级（IPv4/IPv6）"
-        echo -e "${BLUE}╠════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 Xray"
-        echo -e "${BLUE}║${NC}   ${RED}0.${NC}  退出"
-        echo -e "${BLUE}╚════════════════════════════════════╝${NC}"
+        local TG_STATUS="未安装"
+        systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
+
+        echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.0${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
+        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 节点中心${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray 并配置节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加 / 移除协议节点"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 用户中心${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  新建用户          ${GREEN}4.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户          ${GREEN}6.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  用户续期          ${GREEN}8.${NC}  用户列表"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 监控与机器人${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 检查到期用户     ${GREEN}11.${NC} 节点运行信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} Telegram 机器人与流量统计"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Xray        ${GREEN}14.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} IPv4 / IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${RED}16.${NC} 卸载 Xray         ${RED}0.${NC}  退出"
+        echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
         read -r OPT
 
@@ -1656,10 +1903,11 @@ main_menu() {
             9)  show_user_link ;;
             10) check_expire ;;
             11) show_info ;;
-            12) update_xray ;;
-            13) update_script ;;
-            14) ip_priority_menu ;;
-            15) uninstall_xray ;;
+            12) telegram_bot_menu ;;
+            13) update_xray ;;
+            14) update_script ;;
+            15) ip_priority_menu ;;
+            16) uninstall_xray ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
@@ -1674,3 +1922,369 @@ check_system
 normalize_user_db
 install_shortcut
 main_menu
+
+
+###__VLESS_TG_BOT_PY__###
+#TG|#!/usr/bin/env python3
+#TG|"""VLESS Manager Telegram bot and Xray traffic collector (stdlib only)."""
+#TG|from __future__ import annotations
+#TG|
+#TG|import argparse
+#TG|import html
+#TG|import json
+#TG|import os
+#TG|import re
+#TG|import sqlite3
+#TG|import subprocess
+#TG|import time
+#TG|import urllib.error
+#TG|import urllib.parse
+#TG|import urllib.request
+#TG|from datetime import datetime
+#TG|from pathlib import Path
+#TG|from typing import Dict, Iterable, Optional, Tuple
+#TG|
+#TG|DEFAULT_CONFIG = Path("/etc/vless-manager/bot.conf")
+#TG|DEFAULT_USERS = Path("/usr/local/etc/xray/users.db")
+#TG|DEFAULT_DB = Path("/usr/local/etc/xray/traffic.db")
+#TG|DEFAULT_XRAY = Path("/usr/local/bin/xray")
+#TG|
+#TG|
+#TG|def parse_config(path: Path) -> dict:
+#TG|    result = {}
+#TG|    if not path.exists():
+#TG|        return result
+#TG|    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+#TG|        line = raw.strip()
+#TG|        if not line or line.startswith("#") or "=" not in line:
+#TG|            continue
+#TG|        key, value = line.split("=", 1)
+#TG|        result[key.strip()] = value.strip()
+#TG|    ids = set()
+#TG|    for item in result.get("ADMIN_CHAT_IDS", "").split(","):
+#TG|        item = item.strip()
+#TG|        if item.isdigit() and int(item) > 0:
+#TG|            ids.add(int(item))
+#TG|    result["ADMIN_CHAT_IDS"] = ids
+#TG|    return result
+#TG|
+#TG|
+#TG|def is_authorized(config: dict, chat_id: int) -> bool:
+#TG|    return int(chat_id) in config.get("ADMIN_CHAT_IDS", set())
+#TG|
+#TG|
+#TG|def is_authorized_message(config: dict, message: dict) -> bool:
+#TG|    sender_id = (message.get("from") or {}).get("id")
+#TG|    return sender_id is not None and is_authorized(config, int(sender_id))
+#TG|
+#TG|
+#TG|def read_users(path: Path = DEFAULT_USERS) -> list[dict]:
+#TG|    users = []
+#TG|    if not path.exists():
+#TG|        return users
+#TG|    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+#TG|        parts = raw.strip().split(":")
+#TG|        if len(parts) < 5:
+#TG|            continue
+#TG|        users.append({
+#TG|            "name": parts[0], "uuid": parts[1], "expire": parts[2],
+#TG|            "status": parts[3], "node": parts[4] or "both",
+#TG|        })
+#TG|    return users
+#TG|
+#TG|
+#TG|def parse_expire(value: str) -> Optional[datetime]:
+#TG|    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+#TG|        try:
+#TG|            dt = datetime.strptime(value, fmt)
+#TG|            if fmt == "%Y-%m-%d":
+#TG|                dt = dt.replace(hour=12)
+#TG|            return dt
+#TG|        except ValueError:
+#TG|            pass
+#TG|    return None
+#TG|
+#TG|
+#TG|def remaining_days(expire: str, now: Optional[datetime] = None) -> Optional[int]:
+#TG|    dt = parse_expire(expire)
+#TG|    if not dt:
+#TG|        return None
+#TG|    now = now or datetime.now()
+#TG|    seconds = (dt - now).total_seconds()
+#TG|    if seconds <= 0:
+#TG|        return 0
+#TG|    return int((seconds + 86399) // 86400)
+#TG|
+#TG|
+#TG|def init_db(path: Path = DEFAULT_DB) -> None:
+#TG|    path.parent.mkdir(parents=True, exist_ok=True)
+#TG|    with sqlite3.connect(path, timeout=30) as db:
+#TG|        db.execute("PRAGMA busy_timeout=30000")
+#TG|        db.executescript("""
+#TG|        CREATE TABLE IF NOT EXISTS counters (
+#TG|            username TEXT PRIMARY KEY,
+#TG|            uplink INTEGER NOT NULL,
+#TG|            downlink INTEGER NOT NULL,
+#TG|            updated_at TEXT NOT NULL
+#TG|        );
+#TG|        CREATE TABLE IF NOT EXISTS traffic_daily (
+#TG|            day TEXT NOT NULL,
+#TG|            username TEXT NOT NULL,
+#TG|            uplink INTEGER NOT NULL DEFAULT 0,
+#TG|            downlink INTEGER NOT NULL DEFAULT 0,
+#TG|            PRIMARY KEY(day, username)
+#TG|        );
+#TG|        CREATE TABLE IF NOT EXISTS bot_state (
+#TG|            key TEXT PRIMARY KEY,
+#TG|            value TEXT NOT NULL
+#TG|        );
+#TG|        """)
+#TG|    try:
+#TG|        path.chmod(0o600)
+#TG|    except OSError:
+#TG|        pass
+#TG|
+#TG|
+#TG|def record_snapshot(path: Path, counters: Dict[str, Tuple[int, int]], now: Optional[datetime] = None) -> None:
+#TG|    """Persist positive deltas. A lower counter means Xray restarted; count from zero."""
+#TG|    init_db(path)
+#TG|    now = now or datetime.now()
+#TG|    stamp = now.isoformat(timespec="seconds")
+#TG|    day = now.strftime("%Y-%m-%d")
+#TG|    with sqlite3.connect(path, timeout=30) as db:
+#TG|        db.execute("PRAGMA busy_timeout=30000")
+#TG|        for username, values in counters.items():
+#TG|            current_up, current_down = max(0, int(values[0])), max(0, int(values[1]))
+#TG|            row = db.execute(
+#TG|                "SELECT uplink, downlink, updated_at FROM counters WHERE username=?", (username,)
+#TG|            ).fetchone()
+#TG|            if row is None:
+#TG|                delta_up = delta_down = 0
+#TG|            else:
+#TG|                try:
+#TG|                    gap = (now - datetime.fromisoformat(row[2])).total_seconds()
+#TG|                except (TypeError, ValueError):
+#TG|                    gap = 999999
+#TG|                if gap > 300:
+#TG|                    # A long collector outage cannot be split accurately by day.
+#TG|                    delta_up = delta_down = 0
+#TG|                else:
+#TG|                    delta_up = current_up - row[0] if current_up >= row[0] else current_up
+#TG|                    delta_down = current_down - row[1] if current_down >= row[1] else current_down
+#TG|            db.execute(
+#TG|                "INSERT INTO counters(username,uplink,downlink,updated_at) VALUES(?,?,?,?) "
+#TG|                "ON CONFLICT(username) DO UPDATE SET uplink=excluded.uplink, "
+#TG|                "downlink=excluded.downlink, updated_at=excluded.updated_at",
+#TG|                (username, current_up, current_down, stamp),
+#TG|            )
+#TG|            if delta_up or delta_down:
+#TG|                db.execute(
+#TG|                    "INSERT INTO traffic_daily(day,username,uplink,downlink) VALUES(?,?,?,?) "
+#TG|                    "ON CONFLICT(day,username) DO UPDATE SET "
+#TG|                    "uplink=uplink+excluded.uplink, downlink=downlink+excluded.downlink",
+#TG|                    (day, username, delta_up, delta_down),
+#TG|                )
+#TG|
+#TG|
+#TG|def _usage(path: Path, username: Optional[str], where: str, value: str) -> Tuple[int, int]:
+#TG|    init_db(path)
+#TG|    sql = f"SELECT COALESCE(SUM(uplink),0), COALESCE(SUM(downlink),0) FROM traffic_daily WHERE {where}"
+#TG|    args: list[object] = [value]
+#TG|    if username:
+#TG|        sql += " AND username=?"
+#TG|        args.append(username)
+#TG|    with sqlite3.connect(path, timeout=30) as db:
+#TG|        row = db.execute(sql, args).fetchone()
+#TG|    return int(row[0]), int(row[1])
+#TG|
+#TG|
+#TG|def usage_for_day(path: Path, username: Optional[str], day: str) -> Tuple[int, int]:
+#TG|    return _usage(path, username, "day=?", day)
+#TG|
+#TG|
+#TG|def usage_for_month(path: Path, username: Optional[str], month: str) -> Tuple[int, int]:
+#TG|    return _usage(path, username, "substr(day,1,7)=?", month)
+#TG|
+#TG|
+#TG|def format_bytes(value: int) -> str:
+#TG|    amount = float(max(0, value))
+#TG|    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+#TG|    for unit in units:
+#TG|        if amount < 1024 or unit == units[-1]:
+#TG|            return f"{int(amount)} B" if unit == "B" else f"{amount:.2f} {unit}"
+#TG|        amount /= 1024
+#TG|    return "0 B"
+#TG|
+#TG|
+#TG|def parse_xray_stats(output: str) -> Dict[str, Tuple[int, int]]:
+#TG|    payload = json.loads(output)
+#TG|    found: dict[str, dict[str, int]] = {}
+#TG|    for stat in payload.get("stat", []):
+#TG|        match = re.fullmatch(r"user>>>(.+?)>>>traffic>>>(uplink|downlink)", str(stat.get("name", "")))
+#TG|        if not match:
+#TG|            continue
+#TG|        username, direction = match.groups()
+#TG|        found.setdefault(username, {})[direction] = max(0, int(stat.get("value", 0)))
+#TG|    return {
+#TG|        username: (values["uplink"], values["downlink"])
+#TG|        for username, values in found.items()
+#TG|        if "uplink" in values and "downlink" in values
+#TG|    }
+#TG|
+#TG|
+#TG|def query_xray_counters(xray_bin: Path = DEFAULT_XRAY, server: str = "127.0.0.1:10085") -> Dict[str, Tuple[int, int]]:
+#TG|    proc = subprocess.run(
+#TG|        [str(xray_bin), "api", "statsquery", f"--server={server}", "-pattern", "user>>>", "-reset=false"],
+#TG|        text=True, capture_output=True, timeout=20, check=False,
+#TG|    )
+#TG|    if proc.returncode != 0:
+#TG|        raise RuntimeError((proc.stderr or proc.stdout or "Xray Stats API 查询失败").strip())
+#TG|    return parse_xray_stats(proc.stdout)
+#TG|
+#TG|
+#TG|def tg_request(token: str, method: str, data: Optional[dict] = None) -> dict:
+#TG|    url = f"https://api.telegram.org/bot{token}/{method}"
+#TG|    encoded = urllib.parse.urlencode(data or {}).encode()
+#TG|    req = urllib.request.Request(url, data=encoded)
+#TG|    with urllib.request.urlopen(req, timeout=65) as response:
+#TG|        result = json.loads(response.read().decode("utf-8"))
+#TG|    if not result.get("ok"):
+#TG|        raise RuntimeError(result.get("description", "Telegram API 错误"))
+#TG|    return result
+#TG|
+#TG|
+#TG|def send_message(token: str, chat_id: int, text: str) -> None:
+#TG|    tg_request(token, "sendMessage", {
+#TG|        "chat_id": str(chat_id), "text": text, "parse_mode": "HTML",
+#TG|        "disable_web_page_preview": "true",
+#TG|    })
+#TG|
+#TG|
+#TG|def usage_text(db_path: Path, username: Optional[str] = None) -> str:
+#TG|    now = datetime.now()
+#TG|    today = usage_for_day(db_path, username, now.strftime("%Y-%m-%d"))
+#TG|    month = usage_for_month(db_path, username, now.strftime("%Y-%m"))
+#TG|    who = f"用户 <b>{html.escape(username)}</b>" if username else "全部用户"
+#TG|    return (
+#TG|        f"📊 <b>{who}流量统计</b>\n\n"
+#TG|        f"📅 今日\n  ↑ {format_bytes(today[0])}  ↓ {format_bytes(today[1])}\n"
+#TG|        f"  合计：<b>{format_bytes(sum(today))}</b>\n\n"
+#TG|        f"🗓 本月\n  ↑ {format_bytes(month[0])}  ↓ {format_bytes(month[1])}\n"
+#TG|        f"  合计：<b>{format_bytes(sum(month))}</b>"
+#TG|    )
+#TG|
+#TG|
+#TG|def user_text(user: dict, db_path: Path) -> str:
+#TG|    days = remaining_days(user["expire"])
+#TG|    day_text = "未知" if days is None else ("已到期" if days == 0 else f"{days} 天")
+#TG|    expire = parse_expire(user["expire"])
+#TG|    expire_text = expire.strftime("%Y-%m-%d %H:%M") if expire else user["expire"]
+#TG|    state = "🟢 正常" if user["status"] == "active" else "🔴 已禁用"
+#TG|    return (
+#TG|        f"👤 <b>{html.escape(user['name'])}</b>\n"
+#TG|        f"状态：{state}\n节点：{html.escape(user['node'])}\n"
+#TG|        f"到期：{html.escape(expire_text)}\n剩余：<b>{day_text}</b>\n\n"
+#TG|        + usage_text(db_path, user["name"])
+#TG|    )
+#TG|
+#TG|
+#TG|def users_text(users: Iterable[dict]) -> str:
+#TG|    rows = ["👥 <b>用户列表</b>", ""]
+#TG|    for user in users:
+#TG|        days = remaining_days(user["expire"])
+#TG|        left = "未知" if days is None else ("已到期" if days == 0 else f"{days}天")
+#TG|        icon = "🟢" if user["status"] == "active" else "🔴"
+#TG|        rows.append(f"{icon} <code>{html.escape(user['name'])}</code> · {left} · {html.escape(user['node'])}")
+#TG|    return "\n".join(rows) if len(rows) > 2 else "暂无用户"
+#TG|
+#TG|
+#TG|def command_reply(text: str, users_path: Path, db_path: Path) -> str:
+#TG|    parts = text.strip().split(maxsplit=1)
+#TG|    command = parts[0].split("@", 1)[0].lower() if parts else "/start"
+#TG|    users = read_users(users_path)
+#TG|    if command in ("/start", "/help"):
+#TG|        return (
+#TG|            "🤖 <b>VLESS 智能管家</b>\n\n"
+#TG|            "/users — 用户与到期概览\n"
+#TG|            "/user 用户名 — 用户详情与流量\n"
+#TG|            "/today — 今日全部流量\n"
+#TG|            "/month — 本月全部流量\n"
+#TG|            "/expiring — 7天内到期用户\n"
+#TG|            "/status — 机器人状态"
+#TG|        )
+#TG|    if command == "/users":
+#TG|        return users_text(users)
+#TG|    if command in ("/today", "/month"):
+#TG|        return usage_text(db_path)
+#TG|    if command == "/user":
+#TG|        if len(parts) < 2:
+#TG|            return "用法：<code>/user 用户名</code>"
+#TG|        name = parts[1].strip()
+#TG|        user = next((u for u in users if u["name"] == name), None)
+#TG|        return user_text(user, db_path) if user else "未找到该用户"
+#TG|    if command == "/expiring":
+#TG|        selected = [u for u in users if (days := remaining_days(u["expire"])) is not None and days <= 7]
+#TG|        return "⏰ <b>7天内到期</b>\n\n" + (users_text(selected) if selected else "暂无")
+#TG|    if command == "/status":
+#TG|        return "✅ 机器人在线\n✅ 流量数据库可读取\n🕐 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#TG|    return "未知命令，请发送 /help"
+#TG|
+#TG|
+#TG|def run_collector(config_path: Path, once: bool = False) -> None:
+#TG|    cfg = parse_config(config_path)
+#TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
+#TG|    xray_bin = Path(cfg.get("XRAY_BIN", str(DEFAULT_XRAY)))
+#TG|    interval = max(30, int(cfg.get("COLLECT_INTERVAL", "60")))
+#TG|    while True:
+#TG|        try:
+#TG|            record_snapshot(db_path, query_xray_counters(xray_bin))
+#TG|        except Exception as exc:
+#TG|            print(f"collector: {exc}", flush=True)
+#TG|        if once:
+#TG|            return
+#TG|        time.sleep(interval)
+#TG|
+#TG|
+#TG|def run_bot(config_path: Path) -> None:
+#TG|    cfg = parse_config(config_path)
+#TG|    token = cfg.get("BOT_TOKEN", "")
+#TG|    admins = cfg.get("ADMIN_CHAT_IDS", set())
+#TG|    if not token or not admins:
+#TG|        raise SystemExit("请先配置 BOT_TOKEN 和 ADMIN_CHAT_IDS")
+#TG|    users_path = Path(cfg.get("USER_DB", str(DEFAULT_USERS)))
+#TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
+#TG|    offset = 0
+#TG|    while True:
+#TG|        try:
+#TG|            result = tg_request(token, "getUpdates", {"timeout": "50", "offset": str(offset)})
+#TG|            for update in result.get("result", []):
+#TG|                offset = max(offset, int(update["update_id"]) + 1)
+#TG|                message = update.get("message") or {}
+#TG|                chat_id = (message.get("chat") or {}).get("id")
+#TG|                text = message.get("text", "")
+#TG|                if chat_id is None or not text:
+#TG|                    continue
+#TG|                if not is_authorized_message(cfg, message):
+#TG|                    send_message(token, int(chat_id), "⛔ 未授权。请把这个 Chat ID 交给服务器管理员：\n<code>%s</code>" % chat_id)
+#TG|                    continue
+#TG|                send_message(token, int(chat_id), command_reply(text, users_path, db_path))
+#TG|        except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+#TG|            print(f"bot: {exc}", flush=True)
+#TG|            time.sleep(5)
+#TG|
+#TG|
+#TG|def main() -> None:
+#TG|    parser = argparse.ArgumentParser()
+#TG|    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+#TG|    parser.add_argument("--collector", action="store_true")
+#TG|    parser.add_argument("--collect-once", action="store_true")
+#TG|    args = parser.parse_args()
+#TG|    if args.collector or args.collect_once:
+#TG|        run_collector(args.config, once=args.collect_once)
+#TG|    else:
+#TG|        run_bot(args.config)
+#TG|
+#TG|
+#TG|if __name__ == "__main__":
+#TG|    main()
+###__END_VLESS_TG_BOT_PY__###
