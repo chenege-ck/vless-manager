@@ -473,8 +473,8 @@ init_reality() {
     fi
 
     while true; do
-        read -rp "监听端口 [默认 443]: " REALITY_PORT
-        REALITY_PORT=${REALITY_PORT:-443}
+        read -rp "监听端口 [默认 8443]: " REALITY_PORT
+        REALITY_PORT=${REALITY_PORT:-8443}
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用，请换一个"
     done
 
@@ -505,8 +505,8 @@ EOF
 # ============================================================
 init_ws_cf() {
     while true; do
-        read -rp "监听端口 [默认 443]: " WS_PORT
-        WS_PORT=${WS_PORT:-443}
+        read -rp "监听端口 [默认 8445]: " WS_PORT
+        WS_PORT=${WS_PORT:-8445}
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
     done
 
@@ -817,8 +817,8 @@ add_user() {
         return
     fi
 
-    read -rp "到期天数 [默认 30 天]: " DAYS
-    DAYS=${DAYS:-30}
+    read -rp "到期天数 [默认 999 天]: " DAYS
+    DAYS=${DAYS:-999}
 
     if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
         error "到期天数必须是纯数字"
@@ -976,8 +976,8 @@ renew_user() {
         return
     fi
 
-    read -rp "续期天数 [默认 30 天]: " DAYS
-    DAYS=${DAYS:-30}
+    read -rp "续期天数 [默认 999 天]: " DAYS
+    DAYS=${DAYS:-999}
 
     if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
         error "续期天数必须是纯数字"
