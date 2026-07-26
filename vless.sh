@@ -1817,7 +1817,12 @@ install_shortcut() {
     local SELF_PATH
     SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
     if [[ "$SELF_PATH" != "/usr/local/bin/vless_script.sh" ]]; then
-        cp "$SELF_PATH" /usr/local/bin/vless_script.sh
+        local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+        curl -sL "$SCRIPT_URL" -o /usr/local/bin/vless_script.sh
+        if [[ $? -ne 0 || ! -s /usr/local/bin/vless_script.sh ]]; then
+            error "脚本下载失败，请检查网络后重试"
+            exit 1
+        fi
         chmod +x /usr/local/bin/vless_script.sh
     fi
     cat > /usr/local/bin/c <<EOF
