@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 v6.0
+# VLESS 智能节点控制台 v6.1
 # Reality + WS + 用户管理 + Telegram 到期/流量统计
 
 RED='\033[0;31m'
@@ -1534,17 +1534,33 @@ install_telegram_bot() {
     command -v python3 >/dev/null 2>&1 || { error "缺少 python3，请先安装依赖"; return 1; }
     [[ -x "$XRAY_BIN" ]] || { error "请先安装 Xray"; return 1; }
 
-    local BOT_TOKEN ADMIN_CHAT_IDS
+    local BOT_TOKEN BOT_INFO BOT_USERNAME BIND_TOKEN BIND_URL
     read -rsp "输入 Bot Token（输入内容不会显示）: " BOT_TOKEN
     echo ""
     [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { error "Bot Token 格式不正确"; return 1; }
-    read -rp "输入你的 Telegram 用户 ID（只允许正整数，可用逗号分隔）: " ADMIN_CHAT_IDS
-    [[ "$ADMIN_CHAT_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]] || { error "用户 ID 格式不正确"; return 1; }
+
+    BOT_INFO=$(curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null) || {
+        error "无法验证 Bot Token，请检查 Token 和服务器网络"
+        return 1
+    }
+    BOT_USERNAME=$(BOT_INFO="$BOT_INFO" python3 - <<'PYEOF'
+import json, os
+try:
+    data = json.loads(os.environ["BOT_INFO"])
+    print(data["result"]["username"] if data.get("ok") else "")
+except (KeyError, TypeError, json.JSONDecodeError):
+    print("")
+PYEOF
+)
+    [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,}$ ]] || { error "Token 验证失败，未取得机器人用户名"; return 1; }
+    BIND_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+    BIND_URL="https://t.me/${BOT_USERNAME}?start=${BIND_TOKEN}"
 
     extract_telegram_runtime || return 1
     cat > "$TG_CONFIG" <<EOF
 BOT_TOKEN=${BOT_TOKEN}
-ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+ADMIN_CHAT_IDS=
+BIND_TOKEN=${BIND_TOKEN}
 USER_DB=${USER_DB}
 TRAFFIC_DB=${TRAFFIC_DB}
 XRAY_BIN=${XRAY_BIN}
@@ -1597,7 +1613,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/usr/local/etc/xray
+ReadWritePaths=/usr/local/etc/xray /etc/vless-manager
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -1618,7 +1634,21 @@ EOF
     sleep 2
     if systemctl is-active --quiet vless-traffic.service && systemctl is-active --quiet vless-tgbot.service; then
         info "Telegram 机器人和流量采集器已启动"
-        info "现在打开 Telegram，向机器人发送 /start"
+        echo ""
+        title "扫码绑定 Telegram"
+        if ! command -v qrencode >/dev/null 2>&1; then
+            info "正在安装二维码工具..."
+            apt-get update -qq && apt-get install -y -qq qrencode >/dev/null 2>&1 || true
+        fi
+        if command -v qrencode >/dev/null 2>&1; then
+            qrencode -t ANSIUTF8 "$BIND_URL"
+        else
+            warn "二维码工具安装失败，请直接打开下方链接"
+        fi
+        echo -e "  ${CYAN}${BIND_URL}${NC}"
+        echo ""
+        info "用 Telegram 扫码或打开链接，再点击“开始”即可完成绑定"
+        warn "绑定链接仅可使用一次；重新配置机器人会生成新链接"
         warn "首次启用统计后，从现在开始记录流量；无法补算以前的流量"
     else
         error "服务启动失败，请选择“查看机器人日志”排查"
@@ -1870,7 +1900,7 @@ main_menu() {
         systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.0${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.1${NC}          ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
@@ -1941,8 +1971,10 @@ main_menu
 #TG|import json
 #TG|import os
 #TG|import re
+#TG|import secrets
 #TG|import sqlite3
 #TG|import subprocess
+#TG|import threading
 #TG|import time
 #TG|import urllib.error
 #TG|import urllib.parse
@@ -1955,6 +1987,7 @@ main_menu
 #TG|DEFAULT_USERS = Path("/usr/local/etc/xray/users.db")
 #TG|DEFAULT_DB = Path("/usr/local/etc/xray/traffic.db")
 #TG|DEFAULT_XRAY = Path("/usr/local/bin/xray")
+#TG|BIND_LOCK = threading.Lock()
 #TG|
 #TG|
 #TG|def parse_config(path: Path) -> dict:
@@ -1983,6 +2016,55 @@ main_menu
 #TG|def is_authorized_message(config: dict, message: dict) -> bool:
 #TG|    sender_id = (message.get("from") or {}).get("id")
 #TG|    return sender_id is not None and is_authorized(config, int(sender_id))
+#TG|
+#TG|
+#TG|def validate_bot_config(config: dict) -> None:
+#TG|    if not config.get("BOT_TOKEN"):
+#TG|        raise ValueError("请先配置 BOT_TOKEN")
+#TG|    if not config.get("ADMIN_CHAT_IDS") and not config.get("BIND_TOKEN"):
+#TG|        raise ValueError("机器人尚未绑定，请重新配置并扫描绑定二维码")
+#TG|
+#TG|
+#TG|def update_config_values(path: Path, values: dict[str, str]) -> None:
+#TG|    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
+#TG|    pending = dict(values)
+#TG|    output = []
+#TG|    for line in lines:
+#TG|        key = line.split("=", 1)[0].strip() if "=" in line else ""
+#TG|        if key in pending:
+#TG|            output.append(f"{key}={pending.pop(key)}")
+#TG|        else:
+#TG|            output.append(line)
+#TG|    output.extend(f"{key}={value}" for key, value in pending.items())
+#TG|    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+#TG|    try:
+#TG|        tmp.write_text("\n".join(output) + "\n", encoding="utf-8")
+#TG|        tmp.chmod(0o600)
+#TG|        os.replace(tmp, path)
+#TG|    finally:
+#TG|        try:
+#TG|            tmp.unlink()
+#TG|        except FileNotFoundError:
+#TG|            pass
+#TG|
+#TG|
+#TG|def claim_binding(config_path: Path, config: dict, message: dict) -> bool:
+#TG|    chat = message.get("chat") or {}
+#TG|    sender_id = (message.get("from") or {}).get("id")
+#TG|    parts = message.get("text", "").strip().split(maxsplit=1)
+#TG|    if chat.get("type") != "private" or sender_id is None or len(parts) != 2:
+#TG|        return False
+#TG|    command = parts[0].split("@", 1)[0].lower()
+#TG|    supplied = parts[1].strip()
+#TG|    with BIND_LOCK:
+#TG|        expected = str(config.get("BIND_TOKEN", ""))
+#TG|        if command != "/start" or not expected or not secrets.compare_digest(supplied, expected):
+#TG|            return False
+#TG|        admin_id = int(sender_id)
+#TG|        update_config_values(config_path, {"ADMIN_CHAT_IDS": str(admin_id), "BIND_TOKEN": ""})
+#TG|        config["ADMIN_CHAT_IDS"] = {admin_id}
+#TG|        config["BIND_TOKEN"] = ""
+#TG|        return True
 #TG|
 #TG|
 #TG|def read_users(path: Path = DEFAULT_USERS) -> list[dict]:
@@ -2237,14 +2319,18 @@ main_menu
 #TG|    return "未知命令，请发送 /help"
 #TG|
 #TG|
-#TG|def handle_message(token: str, cfg: dict, message: dict, users_path: Path, db_path: Path) -> None:
+#TG|def handle_message(token: str, config_path: Path, cfg: dict, message: dict, users_path: Path, db_path: Path) -> None:
 #TG|    started = time.monotonic()
 #TG|    chat_id = (message.get("chat") or {}).get("id")
 #TG|    text = message.get("text", "")
 #TG|    if chat_id is None or not text:
 #TG|        return
+#TG|    if claim_binding(config_path, cfg, message):
+#TG|        send_message(token, int(chat_id), "✅ <b>绑定成功</b>\n\n你已成为此服务器的 Telegram 管理员。\n发送 /start 查看可用命令。")
+#TG|        print(f"binding=success admin={chat_id}", flush=True)
+#TG|        return
 #TG|    if not is_authorized_message(cfg, message):
-#TG|        send_message(token, int(chat_id), "⛔ 未授权。你的 Telegram 用户 ID：\n<code>%s</code>" % ((message.get("from") or {}).get("id", "未知")))
+#TG|        send_message(token, int(chat_id), "⛔ 未授权或绑定链接已失效。\n请在服务器上重新配置机器人并扫描新的二维码。")
 #TG|        return
 #TG|    send_message(token, int(chat_id), command_reply(text, users_path, db_path))
 #TG|    print(f"command={text.split(maxsplit=1)[0]} elapsed={time.monotonic() - started:.3f}s", flush=True)
@@ -2268,9 +2354,10 @@ main_menu
 #TG|def run_bot(config_path: Path) -> None:
 #TG|    cfg = parse_config(config_path)
 #TG|    token = cfg.get("BOT_TOKEN", "")
-#TG|    admins = cfg.get("ADMIN_CHAT_IDS", set())
-#TG|    if not token or not admins:
-#TG|        raise SystemExit("请先配置 BOT_TOKEN 和 ADMIN_CHAT_IDS")
+#TG|    try:
+#TG|        validate_bot_config(cfg)
+#TG|    except ValueError as exc:
+#TG|        raise SystemExit(str(exc)) from exc
 #TG|    users_path = Path(cfg.get("USER_DB", str(DEFAULT_USERS)))
 #TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
 #TG|    offset = 0
@@ -2284,7 +2371,7 @@ main_menu
 #TG|                    # Acknowledge the batch immediately; process replies concurrently.
 #TG|                    tg_request(token, "getUpdates", {"timeout": "0", "offset": str(offset), "limit": "1"})
 #TG|                    for update in updates:
-#TG|                        pool.submit(handle_message, token, cfg, update.get("message") or {}, users_path, db_path)
+#TG|                        pool.submit(handle_message, token, config_path, cfg, update.get("message") or {}, users_path, db_path)
 #TG|            except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
 #TG|                print(f"bot: {exc}", flush=True)
 #TG|                time.sleep(2)
