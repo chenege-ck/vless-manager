@@ -1,6 +1,6 @@
 #!/bin/bash
-# VLESS 智能节点控制台 v6.1
-# Reality + WS + 用户管理 + Telegram 到期/流量统计
+# VLESS 智能节点控制台 v6.2
+# Reality + WS + 用户管理 + Telegram + BBR/iperf3
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,6 +19,10 @@ TG_DIR="/usr/local/lib/vless-manager"
 TG_SCRIPT="${TG_DIR}/vless_tg_bot.py"
 TG_CONFIG="/etc/vless-manager/bot.conf"
 TRAFFIC_DB="/usr/local/etc/xray/traffic.db"
+BBR_CONFIG="/etc/sysctl.d/99-vless-bbr.conf"
+BBR_MODULE_CONFIG="/etc/modules-load.d/vless-bbr.conf"
+IPERF_SERVICE="/etc/systemd/system/vless-iperf3.service"
+IPERF_PORT=5201
 
 info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
 warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
@@ -1782,6 +1786,223 @@ ip_priority_menu() {
 }
 
 # ============================================================
+# BBR 与 iperf3 网络测试
+# ============================================================
+show_bbr_status() {
+    title "BBR 状态检测"
+
+    local KERNEL AVAILABLE CURRENT QDISC MODULE_STATE STATUS_TEXT
+    KERNEL=$(uname -r 2>/dev/null || echo "未知")
+    AVAILABLE=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [[ -d /sys/module/tcp_bbr ]]; then
+        MODULE_STATE="已加载"
+    elif modinfo tcp_bbr >/dev/null 2>&1; then
+        MODULE_STATE="内核支持，尚未加载"
+    else
+        MODULE_STATE="当前内核不支持"
+    fi
+
+    if [[ "$CURRENT" == "bbr" && "$QDISC" == "fq" ]]; then
+        STATUS_TEXT="${GREEN}BBR + fq 已生效${NC}"
+    elif [[ "$AVAILABLE" == *bbr* ]]; then
+        STATUS_TEXT="${YELLOW}支持 BBR，但尚未完整启用${NC}"
+    else
+        STATUS_TEXT="${RED}当前内核未提供 BBR${NC}"
+    fi
+
+    echo -e "内核版本 : ${KERNEL}"
+    echo -e "BBR 模块 : ${MODULE_STATE}"
+    echo -e "可用算法 : ${AVAILABLE:-读取失败}"
+    echo -e "当前算法 : ${CURRENT:-读取失败}"
+    echo -e "队列算法 : ${QDISC:-读取失败}"
+    echo -e "综合状态 : ${STATUS_TEXT}"
+    [[ -f "$BBR_CONFIG" ]] && echo -e "脚本配置 : ${BBR_CONFIG}" || echo -e "脚本配置 : 未创建"
+}
+
+enable_bbr() {
+    title "开启 BBR"
+
+    local TMP_CONFIG BACKUP_CONFIG="" AVAILABLE CURRENT QDISC
+    modprobe tcp_bbr >/dev/null 2>&1 || {
+        error "当前内核无法加载 tcp_bbr，本脚本不会自动更换内核"
+        return 1
+    }
+
+    AVAILABLE=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    [[ "$AVAILABLE" == *bbr* ]] || {
+        error "tcp_available_congestion_control 中没有 bbr，无法开启"
+        return 1
+    }
+
+    TMP_CONFIG=$(mktemp /tmp/vless-bbr.XXXXXX) || return 1
+    cat > "$TMP_CONFIG" <<'EOF'
+# Managed by VLESS Manager. Only BBR and fq are configured here.
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    if [[ -f "$BBR_CONFIG" ]]; then
+        BACKUP_CONFIG="${BBR_CONFIG}.bak.$(date +%s)"
+        cp "$BBR_CONFIG" "$BACKUP_CONFIG" || { rm -f "$TMP_CONFIG"; return 1; }
+    fi
+    cp "$TMP_CONFIG" "$BBR_CONFIG" || { rm -f "$TMP_CONFIG"; return 1; }
+    rm -f "$TMP_CONFIG"
+    printf '%s\n' tcp_bbr > "$BBR_MODULE_CONFIG"
+
+    if ! sysctl -p "$BBR_CONFIG" >/dev/null 2>&1; then
+        [[ -n "$BACKUP_CONFIG" ]] && cp "$BACKUP_CONFIG" "$BBR_CONFIG" || rm -f "$BBR_CONFIG"
+        sysctl --system >/dev/null 2>&1 || true
+        error "BBR 参数应用失败，已恢复原配置"
+        return 1
+    fi
+
+    CURRENT=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [[ "$CURRENT" != "bbr" || "$QDISC" != "fq" ]]; then
+        [[ -n "$BACKUP_CONFIG" ]] && cp "$BACKUP_CONFIG" "$BBR_CONFIG" || rm -f "$BBR_CONFIG"
+        sysctl --system >/dev/null 2>&1 || true
+        error "运行时验证失败，已恢复原配置"
+        return 1
+    fi
+
+    info "BBR + fq 已开启并持久化，无需重启即可作用于新连接"
+    show_bbr_status
+}
+
+install_iperf3() {
+    title "安装 iperf3"
+    if command -v iperf3 >/dev/null 2>&1; then
+        info "iperf3 已安装：$(iperf3 --version 2>/dev/null | awk 'NR==1{print $2}')"
+        return 0
+    fi
+    apt-get update -qq || { error "apt 软件索引更新失败"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 || {
+        error "iperf3 安装失败"
+        return 1
+    }
+    command -v iperf3 >/dev/null 2>&1 || { error "安装完成但未找到 iperf3"; return 1; }
+    info "iperf3 安装完成"
+}
+
+show_iperf3_commands() {
+    local PUBLIC_IP
+    PUBLIC_IP=$(get_public_ip)
+    echo ""
+    echo -e "服务器地址：${CYAN}${PUBLIC_IP}${NC}  端口：${CYAN}${IPERF_PORT}/TCP${NC}"
+    echo ""
+    echo "本地上传测试："
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -t 30 -O 5${NC}"
+    echo "本地下载测试（重点测试 BBR）："
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -R -t 30 -O 5${NC}"
+    echo "本地四线程下载测试："
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -R -P 4 -t 30 -O 5${NC}"
+    echo "JSON 结果（建议执行并把三个文件发给我）："
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -t 30 -O 5 -J > upload.json${NC}"
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -R -t 30 -O 5 -J > download.json${NC}"
+    echo -e "  ${CYAN}iperf3 -c ${PUBLIC_IP} -p ${IPERF_PORT} -R -P 4 -t 30 -O 5 -J > download-4streams.json${NC}"
+    warn "测试完成后请停止 iperf3；脚本不会自动修改防火墙或云安全组"
+}
+
+start_iperf3_server() {
+    title "启动 iperf3 测试服务"
+    install_iperf3 || return 1
+
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${IPERF_PORT}$" && \
+       ! systemctl is-active --quiet vless-iperf3.service 2>/dev/null; then
+        error "TCP ${IPERF_PORT} 端口已被其他程序占用"
+        return 1
+    fi
+
+    cat > "$IPERF_SERVICE" <<EOF
+[Unit]
+Description=Temporary VLESS Manager iperf3 test server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/iperf3 -s -p ${IPERF_PORT}
+Restart=no
+RuntimeMaxSec=30min
+User=nobody
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl start vless-iperf3.service
+    sleep 1
+    if ! systemctl is-active --quiet vless-iperf3.service; then
+        error "iperf3 启动失败"
+        journalctl -u vless-iperf3.service -n 20 --no-pager
+        return 1
+    fi
+    info "iperf3 测试服务已启动（未设置开机自启，30 分钟后自动停止）"
+    show_iperf3_commands
+}
+
+stop_iperf3_server() {
+    title "停止 iperf3 测试服务"
+    systemctl disable --now vless-iperf3.service >/dev/null 2>&1 || true
+    rm -f "$IPERF_SERVICE"
+    systemctl daemon-reload
+    info "iperf3 测试服务已停止，systemd 单元已删除"
+}
+
+show_iperf3_status() {
+    title "iperf3 服务状态"
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        warn "iperf3 尚未安装"
+        return
+    fi
+    if systemctl is-active --quiet vless-iperf3.service 2>/dev/null; then
+        info "iperf3 正在运行"
+        ss -ltnp 2>/dev/null | grep -E ":${IPERF_PORT}[[:space:]]" || true
+        show_iperf3_commands
+    else
+        warn "iperf3 当前未运行"
+    fi
+}
+
+network_test_menu() {
+    while true; do
+        clear
+        title "BBR / iperf3 网络测试"
+        echo -e "  ${GREEN}1.${NC} 检测 BBR 状态"
+        echo -e "  ${GREEN}2.${NC} 开启 BBR（仅 bbr + fq）"
+        echo -e "  ${GREEN}3.${NC} 安装 iperf3"
+        echo -e "  ${GREEN}4.${NC} 启动 iperf3 测试服务"
+        echo -e "  ${GREEN}5.${NC} 停止 iperf3 测试服务"
+        echo -e "  ${GREEN}6.${NC} 查看 iperf3 状态与测试命令"
+        echo -e "  ${GREEN}0.${NC} 返回主菜单"
+        echo ""
+        read -rp "请选择: " NET_OPT
+        case "$NET_OPT" in
+            1) show_bbr_status ;;
+            2) enable_bbr ;;
+            3) install_iperf3 ;;
+            4) start_iperf3_server ;;
+            5) stop_iperf3_server ;;
+            6) show_iperf3_status ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+        echo ""
+        read -rp "按 Enter 继续..." _
+    done
+}
+
+# ============================================================
 # 一键更新 Xray
 # ============================================================
 update_xray() {
@@ -1900,7 +2121,7 @@ main_menu() {
         systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.1${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.2${NC}          ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
@@ -1922,6 +2143,7 @@ main_menu() {
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Xray        ${GREEN}14.${NC} 更新管理脚本"
         echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} IPv4 / IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} BBR / iperf3 网络测试"
         echo -e "${BLUE}║${NC}   ${RED}16.${NC} 卸载 Xray         ${RED}0.${NC}  退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -1944,6 +2166,7 @@ main_menu() {
             14) update_script ;;
             15) ip_priority_menu ;;
             16) uninstall_xray ;;
+            17) network_test_menu ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
