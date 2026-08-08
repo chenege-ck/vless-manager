@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 v6.2
+# VLESS 智能节点控制台 v6.3
 # Reality + WS + 用户管理 + Telegram + BBR/iperf3
 
 RED='\033[0;31m'
@@ -13,8 +13,9 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 USER_DB="/usr/local/etc/xray/users.db"
 XRAY_BIN="/usr/local/bin/xray"
 META_REALITY="/usr/local/etc/xray/meta-reality.conf"
-META_WS="/usr/local/etc/xray/meta-ws.conf"
 META="/usr/local/etc/xray/meta.conf"
+SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
+SS_PORT=8668
 TG_DIR="/usr/local/lib/vless-manager"
 TG_SCRIPT="${TG_DIR}/vless_tg_bot.py"
 TG_CONFIG="/etc/vless-manager/bot.conf"
@@ -235,13 +236,9 @@ load_meta() {
     REALITY_SNI=""
     REALITY_PORT=""
     REALITY_SHORTID=""
-
-    WS_PORT=""
-    WS_PATH=""
-    WS_DOMAIN=""
-    WS_CF_PORT=""
-    WS_TLS=""
-    CERT_DIR=""
+    SS_PORT=8668
+    SS_METHOD="aes-256-gcm"
+    SS_PASSWORD=""
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -250,37 +247,15 @@ load_meta() {
         REALITY_PORT=$(read_kv "$META_REALITY" "REALITY_PORT")
         REALITY_SHORTID=$(read_kv "$META_REALITY" "REALITY_SHORTID")
     fi
-
-    if [[ -f "$META_WS" ]]; then
-        WS_PORT=$(read_kv "$META_WS" "WS_PORT")
-        WS_PATH=$(read_kv "$META_WS" "WS_PATH")
-        WS_DOMAIN=$(read_kv "$META_WS" "WS_DOMAIN")
-        WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
-        WS_TLS=$(read_kv "$META_WS" "WS_TLS")
-        CERT_DIR=$(read_kv "$META_WS" "CERT_DIR")
-        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
-    fi
-
-    if [[ ! -f "$META_REALITY" && ! -f "$META_WS" && -f "$META" ]]; then
-        REALITY_PRIVATE_KEY=$(read_kv "$META" "REALITY_PRIVATE_KEY")
-        REALITY_PUBLIC_KEY=$(read_kv "$META" "REALITY_PUBLIC_KEY")
-        REALITY_SNI=$(read_kv "$META" "REALITY_SNI")
-        REALITY_PORT=$(read_kv "$META" "REALITY_PORT")
-        REALITY_SHORTID=$(read_kv "$META" "REALITY_SHORTID")
-
-        WS_PORT=$(read_kv "$META" "WS_PORT")
-        WS_PATH=$(read_kv "$META" "WS_PATH")
-        WS_DOMAIN=$(read_kv "$META" "WS_DOMAIN")
-        WS_CF_PORT=$(read_kv "$META" "WS_CF_PORT")
-        WS_TLS=$(read_kv "$META" "WS_TLS")
-        CERT_DIR=$(read_kv "$META" "CERT_DIR")
-        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
+    if [[ -f "$SS_CONFIG" ]]; then
+        SS_PORT=$(read_kv "$SS_CONFIG" "SS_PORT")
+        SS_METHOD=$(read_kv "$SS_CONFIG" "SS_METHOD")
+        SS_PASSWORD=$(read_kv "$SS_CONFIG" "SS_PASSWORD")
     fi
 }
 
-# 检查哪些节点已启用
 has_reality() { [[ -f "$META_REALITY" ]]; }
-has_ws()      { [[ -f "$META_WS" ]]; }
+has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
 
 # ============================================================
 # 配置校验
@@ -461,13 +436,13 @@ init_config() {
     echo ""
     echo "当前节点状态："
     has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
-    has_ws      && echo -e "  ${GREEN}✓${NC} WS+CF   已启用" || echo -e "  ${RED}✗${NC} WS+CF   未启用"
+    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
     echo ""
     echo "请选择要操作的节点："
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
-    echo -e "  ${GREEN}2.${NC} 配置 VLESS + WS + CF"
+    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
     has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
-    has_ws      && echo -e "  ${RED}4.${NC} 移除 WS+CF 节点"
+    has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
     echo ""
     read -rp "选择: " MODE_SEL
     case $MODE_SEL in
@@ -479,14 +454,7 @@ init_config() {
             fi
             init_reality
             ;;
-        2)
-            if has_ws; then
-                warn "WS+CF 节点已存在，重新配置将覆盖"
-                read -rp "确认继续？[y/N]: " C
-                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            fi
-            init_ws_cf
-            ;;
+        2) init_shadowsocks ;;
         3)
             has_reality || { error "Reality 节点未启用"; return; }
             read -rp "确认移除 Reality 节点？[y/N]: " C
@@ -498,14 +466,14 @@ init_config() {
             info "Reality 节点已移除"
             ;;
         4)
-            has_ws || { error "WS+CF 节点未启用"; return; }
-            read -rp "确认移除 WS+CF 节点？[y/N]: " C
+            has_shadowsocks || { error "Shadowsocks 节点未启用"; return; }
+            read -rp "确认移除 Shadowsocks 节点？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            rm -f "$META_WS"
+            rm -f "$SS_CONFIG"
             rebuild_config
             _inject_all_users
             _start_xray
-            info "WS+CF 节点已移除"
+            info "Shadowsocks 节点已移除"
             ;;
         *) error "无效选择" ;;
     esac
@@ -549,74 +517,71 @@ EOF
 }
 
 # ============================================================
+# 初始化 Shadowsocks（共享密码入口）
 # ============================================================
-# 初始化 WS+CF（保留原创建逻辑）
-# ============================================================
-init_ws_cf() {
-    while true; do
-        read -rp "监听端口 [默认 8445]: " WS_PORT
-        WS_PORT=${WS_PORT:-8445}
-        check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
-    done
-
-    read -rp "WS 路径 [默认 /vless]: " WS_PATH
-    WS_PATH=${WS_PATH:-/vless}
-
-    read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
-    [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
-
-    local CERT_DIR="/usr/local/etc/xray/ssl"
-    mkdir -p "$CERT_DIR"
-    info "正在生成自签证书..."
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-        -keyout "${CERT_DIR}/ws.key" \
-        -out "${CERT_DIR}/ws.crt" \
-        -days 3650 \
-        -subj "/CN=${WS_DOMAIN}" \
-        -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null
-
-    chmod 640 "${CERT_DIR}/ws.key"
-    chown root:nogroup "${CERT_DIR}/ws.key" 2>/dev/null || true
-    chmod 644 "${CERT_DIR}/ws.crt"
-
-    info "自签证书生成完成"
-
-    cat > "$META_WS" <<EOF
-WS_PORT=${WS_PORT}
-WS_PATH=${WS_PATH}
-WS_DOMAIN=${WS_DOMAIN}
-WS_CF_PORT=${WS_PORT}
-WS_TLS=tls
-CERT_DIR=${CERT_DIR}
+init_shadowsocks() {
+    title "配置 Shadowsocks"
+    local EXISTING_PASSWORD
+    load_meta
+    if has_shadowsocks; then
+        warn "Shadowsocks 已存在，重新配置会生成新密码并使旧密码失效"
+        read -rp "确认继续？[y/N]: " C
+        [[ "$C" != "y" && "$C" != "Y" ]] && return
+    fi
+    check_port "$SS_PORT" || {
+        error "端口 ${SS_PORT} 已被其他程序占用"
+        return 1
+    }
+    SS_METHOD="aes-256-gcm"
+    SS_PASSWORD=$(openssl rand -base64 32 | tr -d '=+/\n' | cut -c1-32)
+    [[ ${#SS_PASSWORD} -ge 24 ]] || { error "随机密码生成失败"; return 1; }
+    cat > "$SS_CONFIG" <<EOF
+SS_PORT=${SS_PORT}
+SS_METHOD=${SS_METHOD}
+SS_PASSWORD=${SS_PASSWORD}
 EOF
-    chmod 600 "$META_WS"
-
-    rebuild_config
+    chmod 600 "$SS_CONFIG"
+    rebuild_config || return 1
     _inject_all_users
-    _start_xray
-    info "WS+CF 节点配置完成"
+    _start_xray || return 1
+    info "Shadowsocks 配置完成"
+    show_protocol_links
+}
+
+show_protocol_links() {
+    load_meta
+    local SERVER_IP SS_USERINFO SS_LINK
+    SERVER_IP=$(get_public_ip)
     echo ""
-    echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
-    echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启${GREEN}橙云代理${NC}"
-    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}（不要用严格模式）"
-    echo -e "3. 客户端配置："
-    echo -e "   地址   : ${WS_DOMAIN}"
-    echo -e "   端口   : ${WS_PORT}"
-    echo -e "   WS路径 : ${WS_PATH}"
-    echo -e "   TLS    : 开启"
-    echo -e "   SNI    : ${WS_DOMAIN}"
+    echo -e "${GREEN}===== 协议节点信息 =====${NC}"
+    if has_reality; then
+        echo -e "${CYAN}Reality${NC}: ${SERVER_IP}:${REALITY_PORT}"
+    fi
+    if has_shadowsocks; then
+        SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+        SS_LINK="ss://${SS_USERINFO}@${SERVER_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
+        echo -e "${CYAN}Shadowsocks${NC}: ${SERVER_IP}:${SS_PORT}"
+        echo -e "加密   : ${SS_METHOD}"
+        echo -e "密码   : ${SS_PASSWORD}"
+        echo -e "分享链接:"
+        echo "$SS_LINK"
+    fi
     echo ""
 }
 
+show_ss_link() {
+    has_shadowsocks || { error "Shadowsocks 节点尚未配置"; return 1; }
+    show_protocol_links
+}
+
 # ============================================================
-# 根据已有 meta 重建 config.json（支持双节点）
+# 根据已有 meta 重建 config.json（仅 Reality + Shadowsocks）
 # 保留节点结构，只修复 JSON 合法性
 # ============================================================
 rebuild_config() {
     load_meta
     local IP_PRIO=""
     [[ -f "$META_REALITY" ]] && IP_PRIO=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    [[ -z "$IP_PRIO" && -f "$META_WS" ]] && IP_PRIO=$(read_kv "$META_WS" "IP_PRIORITY")
     [[ -z "$IP_PRIO" && -f "$META" ]] && IP_PRIO=$(read_kv "$META" "IP_PRIORITY")
     IP_PRIO=${IP_PRIO:-AsIs}
     local INBOUNDS=""
@@ -644,29 +609,18 @@ rebuild_config() {
     },"
     fi
 
-    if has_ws; then
-        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
+    if has_shadowsocks; then
         INBOUNDS="${INBOUNDS}
     {
-      \"port\": ${WS_PORT},
+      \"port\": ${SS_PORT},
       \"listen\": \"0.0.0.0\",
-      \"protocol\": \"vless\",
-      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
-      \"streamSettings\": {
-        \"network\": \"ws\",
-        \"security\": \"tls\",
-        \"tlsSettings\": {
-          \"certificates\": [
-            {
-              \"certificateFile\": \"${CERT_DIR}/ws.crt\",
-              \"keyFile\": \"${CERT_DIR}/ws.key\"
-            }
-          ]
-        },
-        \"wsSettings\": { \"path\": \"${WS_PATH}\", \"host\": \"${WS_DOMAIN}\" }
+      \"protocol\": \"shadowsocks\",
+      \"settings\": {
+        \"method\": \"${SS_METHOD}\",
+        \"password\": \"${SS_PASSWORD}\",
+        \"network\": \"tcp,udp\"
       },
-      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
-      \"tag\": \"inbound-ws\"
+      \"tag\": \"inbound-shadowsocks\"
     },"
     fi
 
@@ -747,7 +701,7 @@ for inbound in cfg["inbounds"]:
         continue
     clients = inbound["settings"]["clients"]
     clients = [c for c in clients if c.get("id") != uuid]
-    if node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws"):
+    if node in ("both", "reality") and tag == "inbound-reality":
         flow = "xtls-rprx-vision" if tag == "inbound-reality" else ""
         clients.append({"id": uuid, "flow": flow, "email": name, "comment": expire})
     inbound["settings"]["clients"] = clients
@@ -811,30 +765,6 @@ _print_link() {
         echo "$LINK"
     fi
 
-    if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
-        WS_CF_PORT=${WS_CF_PORT:-443}
-        WS_TLS=${WS_TLS:-tls}
-
-        local ENCODED_PATH
-        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
-
-        local ENCODED_NAME
-        ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
-
-        echo ""
-        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
-        echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : ${WS_CF_PORT}"
-        echo -e "WS路径 : ${WS_PATH}"
-        echo -e "TLS    : $( [[ "$WS_TLS" == "tls" ]] && echo "开启" || echo "关闭" )"
-        echo -e "SNI    : ${WS_DOMAIN}"
-
-        local LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=${WS_TLS}&sni=${WS_DOMAIN}#${ENCODED_NAME}"
-
-        echo -e "${CYAN}分享链接:${NC}"
-        echo "$LINK"
-    fi
-
     echo ""
 }
 
@@ -857,24 +787,10 @@ add_user() {
     fi
 
     local NODE="both"
-    if has_reality && has_ws; then
-        echo ""
-        echo "请选择加入的节点："
-        echo -e "  ${GREEN}1.${NC} 两个节点都加入"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
-        read -rp "选择 [1/2/3，默认1]: " NODE_SEL
-        case ${NODE_SEL:-1} in
-            2) NODE="reality" ;;
-            3) NODE="ws" ;;
-            *) NODE="both" ;;
-        esac
-    elif has_reality; then
+    if has_reality; then
         NODE="reality"
-    elif has_ws; then
-        NODE="ws"
     else
-        error "尚未配置任何节点，请先选择菜单 1 初始化"
+        error "尚未配置 Reality 节点，请先选择菜单 1 初始化"
         return
     fi
 
@@ -945,24 +861,7 @@ delete_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local USER_NODE
-    USER_NODE=$(get_user_field "$USERNAME" 5)
-    USER_NODE=${USER_NODE:-both}
-
-    local DEL_NODE="both"
-    if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
-        echo ""
-        echo "删除哪个节点的权限？"
-        echo -e "  ${GREEN}1.${NC} 两个节点都删除（彻底删除用户）"
-        echo -e "  ${GREEN}2.${NC} 仅删除 Reality 权限"
-        echo -e "  ${GREEN}3.${NC} 仅删除 WS+CF 权限"
-        read -rp "选择 [1/2/3，默认1]: " DEL_SEL
-        case ${DEL_SEL:-1} in
-            2) DEL_NODE="reality" ;;
-            3) DEL_NODE="ws" ;;
-            *) DEL_NODE="both" ;;
-        esac
-    fi
+    local DEL_NODE="reality"
 
     python3 - <<PYEOF
 import json
@@ -973,14 +872,14 @@ for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
     if "clients" not in inbound.get("settings", {}):
         continue
-    if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
+    if del_node == "reality" and tag == "inbound-reality":
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
 with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
-    if [[ "$DEL_NODE" == "both" ]]; then
+    if [[ "$DEL_NODE" == "reality" ]]; then
         # 用 python 精确删除，避免 sed 前缀误匹配
         python3 - <<PYEOF
 from pathlib import Path
@@ -990,30 +889,6 @@ out = [l for l in lines if not (l.startswith("$USERNAME:") and l.split(":")[0] =
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已彻底删除"
-    else
-        local NEW_NODE
-        if [[ "$DEL_NODE" == "reality" ]]; then
-            NEW_NODE="ws"
-        else
-            NEW_NODE="reality"
-        fi
-        python3 - <<PYEOF
-from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = []
-for line in lines:
-    if not line.startswith("$USERNAME:"):
-        out.append(line)
-        continue
-    parts = line.split(":")
-    if len(parts) < 5:
-        parts += ["both"] * (5 - len(parts))
-    parts[4] = "$NEW_NODE"
-    out.append(":".join(parts[:5]))
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-        info "用户 ${USERNAME} 的 ${DEL_NODE} 节点权限已移除，保留 ${NEW_NODE} 节点"
     fi
 
     validate_xray_config || {
@@ -1107,26 +982,7 @@ toggle_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local USER_NODE
-    USER_NODE=$(get_user_field "$USERNAME" 5)
-    USER_NODE=${USER_NODE:-both}
-
-    local OP_NODE="both"
-    if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
-        echo ""
-        echo "操作哪个节点？"
-        echo -e "  ${GREEN}1.${NC} 两个节点"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
-        read -rp "选择 [1/2/3，默认1]: " OP_SEL
-        case ${OP_SEL:-1} in
-            2) OP_NODE="reality" ;;
-            3) OP_NODE="ws" ;;
-            *) OP_NODE="both" ;;
-        esac
-    else
-        OP_NODE="$USER_NODE"
-    fi
+    local OP_NODE="reality"
 
     if [[ "$ACTION" == "disable" ]]; then
         python3 - <<PYEOF
@@ -1138,7 +994,7 @@ for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
     if "clients" not in inbound.get("settings", {}):
         continue
-    if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
+    if op_node == "reality" and tag == "inbound-reality":
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
 with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
@@ -1424,17 +1280,17 @@ show_info() {
         echo ""
     fi
 
-    if has_ws; then
-        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
-        echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : ${WS_PORT}"
-        echo -e "WS路径 : ${WS_PATH}"
-        echo -e "TLS    : 开启（自签证书）"
-        echo -e "协议   : VLESS+WS+TLS"
+    if has_shadowsocks; then
+        echo -e "${CYAN}── Shadowsocks 节点 ──${NC}"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${SS_PORT}"
+        echo -e "加密   : ${SS_METHOD}"
+        echo -e "密码   : ${SS_PASSWORD}"
+        echo -e "协议   : Shadowsocks"
         echo ""
     fi
 
-    if ! has_reality && ! has_ws; then
+    if ! has_reality && ! has_shadowsocks; then
         warn "尚未配置任何节点，请选择菜单 1 或 2 初始化"
     fi
 }
@@ -1712,7 +1568,7 @@ telegram_bot_menu() {
 get_ip_priority_mode() {
     local ds=""
     [[ -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META_WS" ]] && ds=$(read_kv "$META_WS" "IP_PRIORITY")
+    [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
     [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
     case "$ds" in
         UseIPv4v6) echo "IPv4 优先（v4失败自动切v6）" ;;
@@ -1726,7 +1582,7 @@ get_ip_priority_mode() {
 _save_ip_priority() {
     local ds="$1"
     local saved=0
-    for f in "$META_REALITY" "$META_WS" "$META"; do
+    for f in "$META_REALITY" "$META"; do
         [[ -f "$f" ]] || continue
         if grep -q "^IP_PRIORITY=" "$f" 2>/dev/null; then
             sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$f"
@@ -1775,7 +1631,7 @@ ip_priority_menu() {
 
     _save_ip_priority "$DS"
 
-    if has_reality || has_ws; then
+    if has_reality || has_shadowsocks; then
         rebuild_config
         _inject_all_users
         _start_xray
@@ -2110,7 +1966,7 @@ main_menu() {
 
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
-        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
+        has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
 
         local STATUS_COLOR=$RED
@@ -2121,7 +1977,7 @@ main_menu() {
         systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.2${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.3${NC}          ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
