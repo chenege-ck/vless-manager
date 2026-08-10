@@ -658,8 +658,18 @@ init_hy2() {
         error "自签名证书生成失败"
         return 1
     fi
-    chmod 600 "$HY2_KEY"
     chmod 644 "$HY2_CERT"
+    chmod 640 "$HY2_KEY"
+    # hysteria-server.service 可能以非 root 专用用户运行（新版安装脚本会创建
+    # hysteria 系统用户），若证书/私钥仍归 root 且权限 600，该用户读不到私钥，
+    # 会导致 "启动失败"。这里动态探测服务实际运行用户并调整属主，兼容 root/非root
+    # 两种安装方式。
+    local HY2_SVC_USER
+    HY2_SVC_USER=$(systemctl show -p User --value "$HY2_SERVICE" 2>/dev/null)
+    if [[ -n "$HY2_SVC_USER" && "$HY2_SVC_USER" != "root" ]]; then
+        chown root:"$HY2_SVC_USER" "$HY2_KEY" "$HY2_CERT" "$HY2_DIR" 2>/dev/null
+        chmod 750 "$HY2_DIR"
+    fi
 
     mkdir -p "$(dirname "$HY2_META")"
     cat > "$HY2_META" <<EOF
