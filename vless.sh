@@ -13,6 +13,7 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 USER_DB="/usr/local/etc/xray/users.db"
 XRAY_BIN="/usr/local/bin/xray"
 META_REALITY="/usr/local/etc/xray/meta-reality.conf"
+META_WS="/usr/local/etc/xray/meta-ws.conf"
 META="/usr/local/etc/xray/meta.conf"
 SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
 SS_PORT=8668
@@ -247,6 +248,12 @@ load_meta() {
     SS_PORT=8668
     SS_METHOD="aes-256-gcm"
     SS_PASSWORD=""
+    WS_PORT=""
+    WS_PATH=""
+    WS_DOMAIN=""
+    WS_CF_PORT="443"
+    WS_TLS="tls"
+    CERT_DIR="/usr/local/etc/xray/ssl"
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -260,9 +267,21 @@ load_meta() {
         SS_METHOD=$(read_kv "$SS_CONFIG" "SS_METHOD")
         SS_PASSWORD=$(read_kv "$SS_CONFIG" "SS_PASSWORD")
     fi
+    if [[ -f "$META_WS" ]]; then
+        WS_PORT=$(read_kv "$META_WS" "WS_PORT")
+        WS_PATH=$(read_kv "$META_WS" "WS_PATH")
+        WS_DOMAIN=$(read_kv "$META_WS" "WS_DOMAIN")
+        WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
+        WS_TLS=$(read_kv "$META_WS" "WS_TLS")
+        CERT_DIR=$(read_kv "$META_WS" "CERT_DIR")
+        WS_CF_PORT=${WS_CF_PORT:-443}
+        WS_TLS=${WS_TLS:-tls}
+        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
+    fi
 }
 
 has_reality() { [[ -f "$META_REALITY" ]]; }
+has_ws() { [[ -f "$META_WS" ]]; }
 has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
 has_hy2() { [[ -f "$HY2_META" ]]; }
 
@@ -510,16 +529,19 @@ init_config() {
     echo ""
     echo "当前节点状态："
     has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_ws && echo -e "  ${GREEN}✓${NC} WS+CF 已启用" || echo -e "  ${RED}✗${NC} WS+CF 未启用"
     has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
     has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
     echo ""
     echo "请选择要操作的节点："
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
-    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
+    echo -e "  ${GREEN}2.${NC} 配置 VLESS + WS + CF"
+    echo -e "  ${GREEN}3.${NC} 配置 Shadowsocks + aes-256-gcm"
     echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
-    has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
-    has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
-    has_hy2 && echo -e "  ${RED}6.${NC} 移除 Hysteria2 节点"
+    has_reality && echo -e "  ${RED}4.${NC} 移除 Reality 节点"
+    has_ws && echo -e "  ${RED}6.${NC} 移除 WS+CF 节点"
+    has_shadowsocks && echo -e "  ${RED}7.${NC} 移除 Shadowsocks 节点"
+    has_hy2 && echo -e "  ${RED}8.${NC} 移除 Hysteria2 节点"
     echo ""
     read -rp "选择: " MODE_SEL
     case $MODE_SEL in
@@ -531,8 +553,16 @@ init_config() {
             fi
             init_reality
             ;;
-        2) init_shadowsocks ;;
-        3)
+        2)
+            if has_ws; then
+                warn "WS+CF 节点已存在，重新配置将覆盖"
+                read -rp "确认继续？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            fi
+            init_ws_cf
+            ;;
+        3) init_shadowsocks ;;
+        4)
             has_reality || { error "Reality 节点未启用"; return; }
             read -rp "确认移除 Reality 节点？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
@@ -542,7 +572,18 @@ init_config() {
             _start_xray
             info "Reality 节点已移除"
             ;;
-        4)
+        5) init_hy2 ;;
+        6)
+            has_ws || { error "WS+CF 节点未启用"; return; }
+            read -rp "确认移除 WS+CF 节点？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            rm -f "$META_WS"
+            rebuild_config
+            _inject_all_users
+            _start_xray
+            info "WS+CF 节点已移除"
+            ;;
+        7)
             has_shadowsocks || { error "Shadowsocks 节点未启用"; return; }
             read -rp "确认移除 Shadowsocks 节点？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
@@ -552,15 +593,10 @@ init_config() {
             _start_xray
             info "Shadowsocks 节点已移除"
             ;;
-        5) init_hy2 ;;
-        6) remove_hy2 ;;
+        8) remove_hy2 ;;
         *) error "无效选择" ;;
     esac
 }
-
-# ============================================================
-# 初始化 Reality（保留原创建逻辑）
-# ============================================================
 init_reality() {
     gen_keypair
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
@@ -635,6 +671,18 @@ show_protocol_links() {
     echo -e "${GREEN}===== 协议节点信息 =====${NC}"
     if has_reality; then
         echo -e "${CYAN}Reality${NC}: ${SERVER_IP}:${REALITY_PORT}"
+    fi
+    if has_ws; then
+        local WS_PATH_SHOW WS_NAME_SHOW WS_LINK_SHOW
+        WS_PATH_SHOW=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+        WS_NAME_SHOW=$(python3 -c "import urllib.parse; print(urllib.parse.quote('WS+CF'))")
+        WS_LINK_SHOW="vless://UUID@${WS_DOMAIN}:${WS_CF_PORT:-443}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${WS_PATH_SHOW}&security=tls&sni=${WS_DOMAIN}#${WS_NAME_SHOW}"
+        echo -e "${CYAN}WS+CF${NC}: ${WS_DOMAIN}:${WS_CF_PORT:-443}"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "TLS    : 开启"
+        echo -e "SNI    : ${WS_DOMAIN}"
+        echo -e "分享链接（UUID请替换为用户UUID）:"
+        echo "$WS_LINK_SHOW"
     fi
     if has_shadowsocks; then
         SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
@@ -878,6 +926,29 @@ rebuild_config() {
     },"
     fi
 
+    if has_ws; then
+        INBOUNDS="${INBOUNDS}
+    {
+      \"port\": ${WS_PORT},
+      \"listen\": \"0.0.0.0\",
+      \"protocol\": \"vless\",
+      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
+      \"streamSettings\": {
+        \"network\": \"ws\",
+        \"security\": \"tls\",
+        \"tlsSettings\": {
+          \"certificates\": [{
+            \"certificateFile\": \"${CERT_DIR}/ws.crt\",
+            \"keyFile\": \"${CERT_DIR}/ws.key\"
+          }]
+        },
+        \"wsSettings\": { \"path\": \"${WS_PATH}\", \"host\": \"${WS_DOMAIN}\" }
+      },
+      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
+      \"tag\": \"inbound-ws\"
+    },"
+    fi
+
     if has_shadowsocks; then
         INBOUNDS="${INBOUNDS}
     {
@@ -894,30 +965,16 @@ rebuild_config() {
     fi
 
     INBOUNDS="${INBOUNDS%,}"
-
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": { "loglevel": "warning" },
   "stats": {},
   "policy": {
-    "levels": {
-      "0": {
-        "statsUserUplink": true,
-        "statsUserDownlink": true
-      }
-    }
+    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } }
   },
-  "api": {
-    "tag": "api",
-    "listen": "127.0.0.1:10085",
-    "services": ["StatsService"]
-  },
-  "routing": {
-    "rules": []
-  },
-  "inbounds": [
-    ${INBOUNDS}
-  ],
+  "api": { "tag": "api", "listen": "127.0.0.1:10085", "services": ["StatsService"] },
+  "routing": { "rules": [] },
+  "inbounds": [ ${INBOUNDS} ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "${IP_PRIO}" } },
     { "protocol": "blackhole", "tag": "block" }
@@ -925,10 +982,6 @@ rebuild_config() {
 }
 EOF
 }
-
-# ============================================================
-# 启动 xray（先校验后重启）
-# ============================================================
 _start_xray() {
     validate_xray_config || return 1
     systemctl enable xray >/dev/null 2>&1
@@ -947,43 +1000,23 @@ _start_xray() {
 # 注入用户到 config.json（指定节点类型）
 # ============================================================
 _inject_user() {
-    local UUID=$1
-    local NAME=$2
-    local EXPIRE=$3
-    local NODE=$4
-
-    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_EXPIRE="$EXPIRE" INJECT_NODE="$NODE" \
-    INJECT_CONFIG="$XRAY_CONFIG" python3 - <<'PYEOF'
+    local UUID=$1 NAME=$2 EXPIRE=$3 NODE=${4:-both}
+    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_EXPIRE="$EXPIRE" INJECT_NODE="$NODE" INJECT_CONFIG="$XRAY_CONFIG" python3 - <<'PYEOF'
 import json, os
-uuid   = os.environ["INJECT_UUID"]
-name   = os.environ["INJECT_NAME"]
-expire = os.environ["INJECT_EXPIRE"]
-node   = os.environ["INJECT_NODE"]
-cfg_path = os.environ["INJECT_CONFIG"]
-
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-for inbound in cfg["inbounds"]:
-    tag = inbound.get("tag", "")
-    if "clients" not in inbound.get("settings", {}):
-        continue
-    clients = inbound["settings"]["clients"]
-    clients = [c for c in clients if c.get("id") != uuid]
-    if node in ("both", "reality") and tag == "inbound-reality":
-        clients.append({"id": uuid, "flow": "xtls-rprx-vision", "email": name, "comment": expire})
-    if node in ("both", "ws") and tag == "inbound-ws":
-        clients.append({"id": uuid, "email": name, "comment": expire})
-    inbound["settings"]["clients"] = clients
-
-with open(cfg_path, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
+uuid=os.environ['INJECT_UUID']; name=os.environ['INJECT_NAME']; expire=os.environ['INJECT_EXPIRE']; node=os.environ['INJECT_NODE']; path=os.environ['INJECT_CONFIG']
+with open(path, encoding='utf-8') as f: cfg=json.load(f)
+for inbound in cfg.get('inbounds', []):
+    tag=inbound.get('tag',''); settings=inbound.get('settings',{})
+    if 'clients' not in settings: continue
+    clients=[c for c in settings['clients'] if c.get('id') != uuid]
+    if node in ('both','reality') and tag=='inbound-reality':
+        clients.append({'id':uuid,'flow':'xtls-rprx-vision','email':name,'comment':expire})
+    elif node in ('both','ws') and tag=='inbound-ws':
+        clients.append({'id':uuid,'email':name,'comment':expire})
+    settings['clients']=clients
+with open(path,'w',encoding='utf-8') as f: json.dump(cfg,f,indent=2)
 PYEOF
 }
-
-# ============================================================
-# 重建后将所有 active 用户按节点类型重新注入
-# ============================================================
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
     normalize_user_db
@@ -998,29 +1031,19 @@ _inject_all_users() {
 # 打印节点分享链接
 # ============================================================
 _print_link() {
-    local USERNAME=$1
-    local UUID=$2
-    local EXPIRE=$3
-    local NODE=${4:-both}
+    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both}
     load_meta
-
-    local EXPIRE_SHOW
-    EXPIRE_SHOW=$(expire_display "$EXPIRE")
-
     echo ""
     echo -e "${GREEN}===== 节点信息 =====${NC}"
     echo -e "用户名 : ${USERNAME}"
     echo -e "UUID   : ${UUID}"
-    echo -e "到期   : ${EXPIRE_SHOW}"
+    echo -e "到期   : $(expire_display "$EXPIRE")"
     echo -e "节点   : ${NODE}"
 
     if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
-        local SERVER_IP
+        local SERVER_IP SHORTID
         SERVER_IP=$(get_public_ip)
-
-        local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
-
+        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG',encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
         echo -e "地址   : ${SERVER_IP}"
@@ -1028,20 +1051,25 @@ _print_link() {
         echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
         echo -e "SNI    : ${REALITY_SNI}"
         echo -e "ShortID: ${SHORTID}"
-
-        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
-
         echo -e "${CYAN}分享链接:${NC}"
-        echo "$LINK"
+        echo "vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
     fi
-
+    if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
+        local ENCODED_PATH ENCODED_NAME
+        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+        ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
+        echo ""
+        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
+        echo -e "域名   : ${WS_DOMAIN}"
+        echo -e "端口   : ${WS_CF_PORT:-443}"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "TLS    : 开启"
+        echo -e "SNI    : ${WS_DOMAIN}"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT:-443}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=tls&sni=${WS_DOMAIN}#${ENCODED_NAME}"
+    fi
     echo ""
 }
-
-# ============================================================
-# ============================================================
-# 添加用户
-# ============================================================
 add_user() {
     title "添加用户"
     load_meta
@@ -1056,31 +1084,71 @@ add_user() {
         return
     fi
 
-    echo ""
-    echo "请选择用户节点类型："
-    echo "  1. Reality"
-    echo "  2. WS+CF"
-    echo "  3. Reality + WS+CF"
-    read -rp "选择 [默认3]: " NODE_SEL
+    local NODE="both"
+    if has_reality && has_ws; then
+        echo ""
+        echo "请选择加入的节点："
+        echo -e "  ${GREEN}1.${NC} 两个节点都加入"
+        echo -e "  ${GREEN}2.${NC} 仅 Reality"
+        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        read -rp "选择 [1/2/3，默认1]: " NODE_SEL
+        case ${NODE_SEL:-1} in
+            2) NODE="reality" ;;
+            3) NODE="ws" ;;
+            *) NODE="both" ;;
+        esac
+    elif has_reality; then
+        NODE="reality"
+    elif has_ws; then
+        NODE="ws"
+    else
+        error "尚未配置任何节点，请先选择菜单 1 初始化"
+        return
+    fi
 
-    case ${NODE_SEL:-3} in
-        1) has_reality || { error "Reality 未配置"; return; }; NODE="reality" ;;
-        2) has_ws || { error "WS+CF 未配置"; return; }; NODE="ws" ;;
-        *) NODE="both" ;;
-    esac
-
-    read -rp "到期天数 [默认999天]: " DAYS
+    read -rp "到期天数 [默认 999 天]: " DAYS
     DAYS=${DAYS:-999}
-    [[ "$DAYS" =~ ^[0-9]+$ ]] || { error "天数错误"; return; }
+
+    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+        error "到期天数必须是纯数字"
+        return
+    fi
 
     EXPIRE=$(expire_noon_str "$DAYS")
+    [[ -z "$EXPIRE" ]] && error "到期时间计算失败" && return
+
     UUID=$(cat /proc/sys/kernel/random/uuid)
-
     echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
-
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
-    validate_xray_config || { error "配置校验失败"; return; }
-    _start_xray || { error "Xray启动失败"; return; }
+
+    validate_xray_config || {
+        # UUID 唯一，用 UUID 定位回滚，安全精确
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+        rebuild_config
+        _inject_all_users
+        error "配置校验失败，已回滚本次添加"
+        return 1
+    }
+
+    _start_xray || {
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+        rebuild_config
+        _inject_all_users
+        error "Xray 重启失败，已回滚本次添加"
+        return 1
+    }
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
@@ -1092,59 +1160,31 @@ delete_user() {
     title "删除用户"
     normalize_user_db
     list_users_brief
-
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
     validate_username "$USERNAME" || return
-
-    # 精确匹配：用户名后紧跟冒号，避免前缀误删
-    if ! user_exists "$USERNAME"; then
-        error "用户不存在"
-        return
-    fi
-
+    user_exists "$USERNAME" || { error "用户不存在"; return; }
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local DEL_NODE="reality"
-
     python3 - <<PYEOF
 import json
-del_node = "$DEL_NODE"
-with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-for inbound in cfg["inbounds"]:
-    tag = inbound.get("tag", "")
-    if "clients" not in inbound.get("settings", {}):
-        continue
-    if del_node == "reality" and tag == "inbound-reality":
-        clients = inbound["settings"]["clients"]
-        inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
-with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
+p="$XRAY_CONFIG"; uid="$UUID"
+with open(p,encoding='utf-8') as f: cfg=json.load(f)
+for inbound in cfg.get('inbounds',[]):
+    if 'clients' in inbound.get('settings',{}):
+        inbound['settings']['clients']=[c for c in inbound['settings']['clients'] if c.get('id')!=uid]
+with open(p,'w',encoding='utf-8') as f: json.dump(cfg,f,indent=2)
 PYEOF
-
-    if [[ "$DEL_NODE" == "reality" ]]; then
-        # 用 python 精确删除，避免 sed 前缀误匹配
-        python3 - <<PYEOF
+    python3 - <<PYEOF
 from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = [l for l in lines if not (l.startswith("$USERNAME:") and l.split(":")[0] == "$USERNAME")]
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+p=Path("$USER_DB")
+out=[x for x in p.read_text(encoding='utf-8',errors='ignore').splitlines() if not x.startswith("$USERNAME:")]
+p.write_text("\n".join(out)+("\n" if out else ""),encoding='utf-8')
 PYEOF
-        info "用户 ${USERNAME} 已彻底删除"
-    fi
-
-    validate_xray_config || {
-        rebuild_config
-        _inject_all_users
-    }
-    systemctl restart xray
+    validate_xray_config || { rebuild_config; _inject_all_users; }
+    _start_xray
+    info "用户 ${USERNAME} 已彻底删除（Reality / WS+CF 同步移除）"
 }
-
-# ============================================================
-# 重置到期时间
-# ============================================================
 renew_user() {
     title "重置到期时间"
     normalize_user_db
@@ -1226,7 +1266,26 @@ toggle_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local OP_NODE="reality"
+    local USER_NODE
+    USER_NODE=$(get_user_field "$USERNAME" 5)
+    USER_NODE=${USER_NODE:-both}
+
+    local OP_NODE="both"
+    if has_reality && has_ws && [[ "$USER_NODE" == "both" ]]; then
+        echo ""
+        echo "操作哪个节点？"
+        echo -e "  ${GREEN}1.${NC} 两个节点"
+        echo -e "  ${GREEN}2.${NC} 仅 Reality"
+        echo -e "  ${GREEN}3.${NC} 仅 WS+CF"
+        read -rp "选择 [1/2/3，默认1]: " OP_SEL
+        case ${OP_SEL:-1} in
+            2) OP_NODE="reality" ;;
+            3) OP_NODE="ws" ;;
+            *) OP_NODE="both" ;;
+        esac
+    else
+        OP_NODE="$USER_NODE"
+    fi
 
     if [[ "$ACTION" == "disable" ]]; then
         python3 - <<PYEOF
@@ -1238,7 +1297,7 @@ for inbound in cfg["inbounds"]:
     tag = inbound.get("tag", "")
     if "clients" not in inbound.get("settings", {}):
         continue
-    if op_node == "reality" and tag == "inbound-reality":
+    if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
         clients = inbound["settings"]["clients"]
         inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
 with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
@@ -1535,6 +1594,29 @@ show_info() {
         echo ""
     fi
 
+    if has_ws; then
+        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
+        echo -e "域名   : ${WS_DOMAIN}"
+        echo -e "端口   : ${WS_CF_PORT:-443}"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "TLS    : 开启"
+        echo -e "SNI    : ${WS_DOMAIN}"
+        echo -e "协议   : VLESS+WS+TLS+CF"
+        if [[ -f "$USER_DB" ]]; then
+            echo -e "${CYAN}分享链接:${NC}"
+            local WNAME WUUID WEXP WSTATUS WNODE WLINK WPATHENC
+            WPATHENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
+            while IFS=: read -r WNAME WUUID WEXP WSTATUS WNODE; do
+                [[ "$WSTATUS" != "active" ]] && continue
+                WNODE=${WNODE:-both}
+                [[ "$WNODE" != "ws" && "$WNODE" != "both" ]] && continue
+                WLINK="vless://${WUUID}@${WS_DOMAIN}:${WS_CF_PORT:-443}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${WPATHENC}&security=tls&sni=${WS_DOMAIN}#${WNAME}-ws"
+                echo "[${WNAME}] ${WLINK}"
+            done < "$USER_DB"
+        fi
+        echo ""
+    fi
+
     if has_shadowsocks; then
         local SS_USERINFO_SHOW SS_LINK_SHOW
         SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
@@ -1571,7 +1653,7 @@ show_info() {
         echo ""
     fi
 
-    if ! has_reality && ! has_shadowsocks && ! has_hy2; then
+    if ! has_reality && ! has_ws && ! has_shadowsocks && ! has_hy2; then
         warn "尚未配置任何节点，请选择菜单 2 初始化"
     fi
 }
@@ -2321,6 +2403,7 @@ main_menu() {
 
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
+        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS+CF"
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
         has_hy2 && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
