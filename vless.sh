@@ -13,6 +13,7 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 USER_DB="/usr/local/etc/xray/users.db"
 XRAY_BIN="/usr/local/bin/xray"
 META_REALITY="/usr/local/etc/xray/meta-reality.conf"
+META_WS="/usr/local/etc/xray/meta-ws.conf"
 META="/usr/local/etc/xray/meta.conf"
 SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
 SS_PORT=8668
@@ -247,6 +248,12 @@ load_meta() {
     SS_PORT=8668
     SS_METHOD="aes-256-gcm"
     SS_PASSWORD=""
+    WS_PORT=""
+    WS_PATH=""
+    WS_DOMAIN=""
+    WS_CF_PORT=""
+    WS_TLS=""
+    CERT_DIR="/usr/local/etc/xray/ssl"
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -260,9 +267,18 @@ load_meta() {
         SS_METHOD=$(read_kv "$SS_CONFIG" "SS_METHOD")
         SS_PASSWORD=$(read_kv "$SS_CONFIG" "SS_PASSWORD")
     fi
+    if [[ -f "$META_WS" ]]; then
+        WS_PORT=$(read_kv "$META_WS" "WS_PORT")
+        WS_PATH=$(read_kv "$META_WS" "WS_PATH")
+        WS_DOMAIN=$(read_kv "$META_WS" "WS_DOMAIN")
+        WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
+        WS_TLS=$(read_kv "$META_WS" "WS_TLS")
+    fi
 }
 
 has_reality() { [[ -f "$META_REALITY" ]]; }
+
+has_ws()      { [[ -f "$META_WS" ]]; }
 has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
 has_hy2() { [[ -f "$HY2_META" ]]; }
 
@@ -448,12 +464,14 @@ init_config() {
 
     echo ""
     echo "当前节点状态："
-    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用"
+    has_ws && echo -e "  ${GREEN}✓${NC} WS+CF 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
     has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
     has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
     echo ""
     echo "请选择要操作的节点："
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
+    echo -e "  ${GREEN}6.${NC} 配置 VLESS + WS + CF"
     echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
     echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
     has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
@@ -500,6 +518,62 @@ init_config() {
 # ============================================================
 # 初始化 Reality（保留原创建逻辑）
 # ============================================================
+init_ws_cf() {
+    while true; do
+        read -rp "监听端口 [默认 8445]: " WS_PORT
+        WS_PORT=${WS_PORT:-8445}
+        check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
+    done
+
+    read -rp "WS 路径 [默认 /vless]: " WS_PATH
+    WS_PATH=${WS_PATH:-/vless}
+
+    read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
+    [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return
+
+    local CERT_DIR="/usr/local/etc/xray/ssl"
+    mkdir -p "$CERT_DIR"
+    info "正在生成自签证书..."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "${CERT_DIR}/ws.key" \
+        -out "${CERT_DIR}/ws.crt" \
+        -days 3650 \
+        -subj "/CN=${WS_DOMAIN}" \
+        -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null
+
+    chmod 640 "${CERT_DIR}/ws.key"
+    chown root:nogroup "${CERT_DIR}/ws.key" 2>/dev/null || true
+    chmod 644 "${CERT_DIR}/ws.crt"
+
+    info "自签证书生成完成"
+
+    cat > "$META_WS" <<EOF
+WS_PORT=${WS_PORT}
+WS_PATH=${WS_PATH}
+WS_DOMAIN=${WS_DOMAIN}
+WS_CF_PORT=${WS_PORT}
+WS_TLS=tls
+CERT_DIR=${CERT_DIR}
+EOF
+    chmod 600 "$META_WS"
+
+    rebuild_config
+    _inject_all_users
+    _start_xray
+    info "WS+CF 节点配置完成"
+    echo ""
+    echo -e "${YELLOW}═══ Cloudflare 配置说明 ═══${NC}"
+    echo -e "1. CF 域名解析：${WS_DOMAIN} → 本机 IP，开启${GREEN}橙云代理${NC}"
+    echo -e "2. CF SSL 模式设为 ${GREEN}完全（Full）${NC}（不要用严格模式）"
+    echo -e "3. 客户端配置："
+    echo -e "   地址   : ${WS_DOMAIN}"
+    echo -e "   端口   : ${WS_PORT}"
+    echo -e "   WS路径 : ${WS_PATH}"
+    echo -e "   TLS    : 开启"
+    echo -e "   SNI    : ${WS_DOMAIN}"
+    echo ""
+}
+
 init_reality() {
     gen_keypair
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
@@ -541,6 +615,30 @@ init_shadowsocks() {
     title "配置 Shadowsocks"
     local EXISTING_PASSWORD
     load_meta
+    if has_ws; then
+        INBOUNDS="${INBOUNDS}
+    {
+      "port": ${WS_PORT},
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": { "clients": [], "decryption": "none" },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${CERT_DIR}/ws.crt",
+              "keyFile": "${CERT_DIR}/ws.key"
+            }
+          ]
+        },
+        "wsSettings": { "path": "${WS_PATH}", "host": "${WS_DOMAIN}" }
+      },
+      "tag": "inbound-ws"
+    },"
+    fi
+
     if has_shadowsocks; then
         warn "Shadowsocks 已存在，重新配置会生成新密码并使旧密码失效"
         read -rp "确认继续？[y/N]: " C
@@ -2285,6 +2383,7 @@ main_menu() {
 
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
+        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS-CF"
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
         has_hy2 && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
