@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 v6.3
+# VLESS 智能节点控制台 v6.5
 # Reality + WS + 用户管理 + Telegram + BBR/iperf3
 
 RED='\033[0;31m'
@@ -16,6 +16,14 @@ META_REALITY="/usr/local/etc/xray/meta-reality.conf"
 META="/usr/local/etc/xray/meta.conf"
 SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
 SS_PORT=8668
+HY2_BIN="/usr/local/bin/hysteria"
+HY2_DIR="/etc/hysteria"
+HY2_CONFIG="${HY2_DIR}/config.yaml"
+HY2_CERT="${HY2_DIR}/hy2-cert.pem"
+HY2_KEY="${HY2_DIR}/hy2-key.pem"
+HY2_META="/usr/local/etc/xray/hysteria2.conf"
+HY2_SERVICE="hysteria-server"
+HY2_PORT_DEFAULT=8999
 TG_DIR="/usr/local/lib/vless-manager"
 TG_SCRIPT="${TG_DIR}/vless_tg_bot.py"
 TG_CONFIG="/etc/vless-manager/bot.conf"
@@ -256,6 +264,7 @@ load_meta() {
 
 has_reality() { [[ -f "$META_REALITY" ]]; }
 has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
+has_hy2() { [[ -f "$HY2_META" ]]; }
 
 # ============================================================
 # 配置校验
@@ -422,6 +431,10 @@ check_port() {
     ss -tlnp | grep -q ":${1} " && return 1 || return 0
 }
 
+check_port_udp() {
+    ss -ulnp | grep -q ":${1} " && return 1 || return 0
+}
+
 # ============================================================
 # 初始化配置 - 选择协议
 # ============================================================
@@ -437,12 +450,15 @@ init_config() {
     echo "当前节点状态："
     has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
     has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
+    has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
     echo ""
     echo "请选择要操作的节点："
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
     echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
+    echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
     has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
     has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
+    has_hy2 && echo -e "  ${RED}6.${NC} 移除 Hysteria2 节点"
     echo ""
     read -rp "选择: " MODE_SEL
     case $MODE_SEL in
@@ -475,6 +491,8 @@ init_config() {
             _start_xray
             info "Shadowsocks 节点已移除"
             ;;
+        5) init_hy2 ;;
+        6) remove_hy2 ;;
         *) error "无效选择" ;;
     esac
 }
@@ -572,6 +590,180 @@ show_protocol_links() {
 show_ss_link() {
     has_shadowsocks || { error "Shadowsocks 节点尚未配置"; return 1; }
     show_protocol_links
+}
+
+# ============================================================
+# Hysteria2 —— 完全独立的协议节点
+# 不使用 Xray，走独立的 hysteria 二进制 + 独立 systemd 服务
+# (hysteria-server.service)，config.json / TG 流量统计均不涉及。
+# 证书为自签名，客户端需开启"跳过证书验证"(insecure/allowInsecure)。
+# ============================================================
+install_hy2_binary() {
+    if [[ -x "$HY2_BIN" ]]; then
+        return 0
+    fi
+    title "安装 Hysteria2 内核"
+    if ! command -v curl >/dev/null 2>&1; then
+        error "缺少 curl，请先执行: apt update && apt install -y curl"
+        return 1
+    fi
+    bash <(curl -fsSL https://get.hy2.sh/)
+    if [[ ! -x "$HY2_BIN" ]]; then
+        error "Hysteria2 内核安装失败，请检查网络后重试"
+        return 1
+    fi
+    info "Hysteria2 内核安装完成"
+}
+
+init_hy2() {
+    title "配置 Hysteria2"
+
+    if has_hy2; then
+        warn "Hysteria2 已存在，重新配置将生成新密码/证书并使旧链接失效"
+        read -rp "确认继续？[y/N]: " C
+        [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    fi
+
+    local HY2_PORT HY2_SNI HY2_PASSWORD
+    read -rp "监听端口 [默认 ${HY2_PORT_DEFAULT}]: " HY2_PORT
+    HY2_PORT=${HY2_PORT:-$HY2_PORT_DEFAULT}
+    if ! [[ "$HY2_PORT" =~ ^[0-9]+$ ]] || (( HY2_PORT < 1 || HY2_PORT > 65535 )); then
+        error "端口必须是 1-65535 之间的数字"
+        return 1
+    fi
+    check_port_udp "$HY2_PORT" || {
+        error "UDP 端口 ${HY2_PORT} 已被占用，请换一个"
+        return 1
+    }
+
+    read -rp "伪装域名（自签证书CN + 回落目标）[默认 www.bing.com]: " HY2_SNI
+    HY2_SNI=${HY2_SNI:-www.bing.com}
+
+    install_hy2_binary || return 1
+
+    mkdir -p "$HY2_DIR"
+    HY2_PASSWORD=$(openssl rand -hex 16)
+    if [[ -z "$HY2_PASSWORD" ]]; then
+        error "密码生成失败"
+        return 1
+    fi
+
+    # 自动生成自签名证书（10 年有效期），无需域名和 ACME
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$HY2_KEY" -out "$HY2_CERT" \
+        -days 3650 -subj "/CN=${HY2_SNI}" \
+        -addext "subjectAltName=DNS:${HY2_SNI}" >/dev/null 2>&1
+
+    if [[ ! -s "$HY2_CERT" || ! -s "$HY2_KEY" ]]; then
+        error "自签名证书生成失败"
+        return 1
+    fi
+    chmod 600 "$HY2_KEY"
+    chmod 644 "$HY2_CERT"
+
+    mkdir -p "$(dirname "$HY2_META")"
+    cat > "$HY2_META" <<EOF
+HY2_PORT=${HY2_PORT}
+HY2_PASSWORD=${HY2_PASSWORD}
+HY2_SNI=${HY2_SNI}
+EOF
+    chmod 600 "$HY2_META"
+
+    _rebuild_hy2_config
+
+    systemctl enable "$HY2_SERVICE" >/dev/null 2>&1
+    systemctl restart "$HY2_SERVICE"
+    sleep 1
+    if systemctl is-active --quiet "$HY2_SERVICE"; then
+        info "Hysteria2 配置完成（端口 ${HY2_PORT}/UDP，自签名证书）"
+        _print_hy2_link
+    else
+        error "Hysteria2 启动失败，运行 journalctl -u ${HY2_SERVICE} -n 20 查看日志"
+        rm -f "$HY2_META"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# 根据 $HY2_META 中已保存的端口/密码/SNI，加上当前 IP_PRIORITY，
+# 重新生成 config.yaml。证书和密码不会变，只重写文件内容。
+# 用于：1) init_hy2 首次生成  2) 菜单15 切换 v4/v6 优先级后同步
+# ------------------------------------------------------------
+_rebuild_hy2_config() {
+    has_hy2 || return 0
+    local HY2_PORT HY2_PASSWORD HY2_SNI HY2_MODE
+    HY2_PORT=$(read_kv "$HY2_META" "HY2_PORT")
+    HY2_PASSWORD=$(read_kv "$HY2_META" "HY2_PASSWORD")
+    HY2_SNI=$(read_kv "$HY2_META" "HY2_SNI")
+    HY2_MODE=$(_ip_priority_to_hy2_mode "$(_read_ip_priority)")
+
+    cat > "$HY2_CONFIG" <<EOF
+listen: :${HY2_PORT}
+
+tls:
+  cert: ${HY2_CERT}
+  key: ${HY2_KEY}
+
+auth:
+  type: password
+  password: ${HY2_PASSWORD}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${HY2_SNI}
+    rewriteHost: true
+
+outbounds:
+  - name: direct
+    type: direct
+    direct:
+      mode: ${HY2_MODE}
+
+ignoreClientBandwidth: false
+EOF
+    chmod 600 "$HY2_CONFIG"
+
+    # 服务已在运行时才需要重启生效；首次安装时由 init_hy2 统一启动
+    systemctl is-active --quiet "$HY2_SERVICE" && systemctl restart "$HY2_SERVICE"
+}
+
+remove_hy2() {
+    has_hy2 || { error "Hysteria2 节点未启用"; return 1; }
+    read -rp "确认移除 Hysteria2 节点？[y/N]: " C
+    [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    systemctl stop "$HY2_SERVICE" 2>/dev/null
+    systemctl disable "$HY2_SERVICE" 2>/dev/null
+    rm -f "$HY2_CONFIG" "$HY2_CERT" "$HY2_KEY" "$HY2_META"
+    info "Hysteria2 节点已移除（内核程序保留；如需彻底卸载内核，可手动执行: bash <(curl -fsSL https://get.hy2.sh/) --remove）"
+}
+
+_print_hy2_link() {
+    has_hy2 || return 1
+    local HY2_PORT HY2_PASSWORD HY2_SNI SERVER_IP LINK HY2_MODE_DESC
+    HY2_PORT=$(read_kv "$HY2_META" "HY2_PORT")
+    HY2_PASSWORD=$(read_kv "$HY2_META" "HY2_PASSWORD")
+    HY2_SNI=$(read_kv "$HY2_META" "HY2_SNI")
+    SERVER_IP=$(get_public_ip)
+    LINK="hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?sni=${HY2_SNI}&insecure=1#Hysteria2-${HY2_PORT}"
+    HY2_MODE_DESC=$(get_ip_priority_mode)
+
+    echo ""
+    echo -e "${GREEN}===== Hysteria2 节点信息 =====${NC}"
+    echo -e "地址   : ${SERVER_IP}"
+    echo -e "端口   : ${HY2_PORT} (UDP)"
+    echo -e "密码   : ${HY2_PASSWORD}"
+    echo -e "SNI    : ${HY2_SNI}"
+    echo -e "出站   : ${HY2_MODE_DESC}（菜单15可调整，Reality/SS/HY2 共用）"
+    echo -e "证书   : 自签名，客户端需开启「跳过证书验证 / insecure」"
+    echo -e "${CYAN}分享链接:${NC}"
+    echo "$LINK"
+    echo ""
+}
+
+show_hy2_link() {
+    has_hy2 || { error "Hysteria2 节点尚未配置"; return 1; }
+    _print_hy2_link
 }
 
 # ============================================================
@@ -1289,8 +1481,26 @@ show_info() {
         echo ""
     fi
 
-    if ! has_reality && ! has_shadowsocks; then
-        warn "尚未配置任何节点，请选择菜单 1 或 2 初始化"
+    if has_hy2; then
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_VER_SHOW
+        HY2_STATUS=$(systemctl is-active "$HY2_SERVICE" 2>/dev/null)
+        HY2_PORT_SHOW=$(read_kv "$HY2_META" "HY2_PORT")
+        HY2_PASSWORD_SHOW=$(read_kv "$HY2_META" "HY2_PASSWORD")
+        HY2_SNI_SHOW=$(read_kv "$HY2_META" "HY2_SNI")
+        HY2_VER_SHOW=$("$HY2_BIN" version 2>/dev/null | head -1)
+        echo -e "${CYAN}── Hysteria2 节点（独立进程）──${NC}"
+        echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${HY2_PORT_SHOW} (UDP)"
+        echo -e "密码   : ${HY2_PASSWORD_SHOW}"
+        echo -e "SNI    : ${HY2_SNI_SHOW}"
+        echo -e "内核   : ${HY2_VER_SHOW:-未知}（菜单18可一键更新）"
+        echo -e "协议   : Hysteria2（自签名证书，客户端需 insecure）"
+        echo ""
+    fi
+
+    if ! has_reality && ! has_shadowsocks && ! has_hy2; then
+        warn "尚未配置任何节点，请选择菜单 2 初始化"
     fi
 }
 # ============================================================
@@ -1605,6 +1815,18 @@ _save_ip_priority() {
     [[ -f "$META_REALITY" ]] && sed -i '/^IP_PRIORITY=/d' "$META_REALITY"
 }
 
+# Xray domainStrategy -> Hysteria2 outbounds.direct.mode 的映射
+# 两者语义一一对应，用同一份 IP_PRIORITY 驱动两个协议
+_ip_priority_to_hy2_mode() {
+    case "$1" in
+        UseIPv4v6) echo "46" ;;   # IPv4 优先，失败切 v6
+        UseIPv6v4) echo "64" ;;   # IPv6 优先，失败切 v4
+        UseIPv4)   echo "4" ;;    # 仅 IPv4
+        UseIPv6)   echo "6" ;;    # 仅 IPv6
+        *)         echo "auto" ;; # 系统默认，双栈 happy-eyeballs
+    esac
+}
+
 ip_priority_menu() {
     title "网络优先级（IPv4/IPv6）"
     load_meta
@@ -1614,12 +1836,13 @@ ip_priority_menu() {
 
     echo ""
     echo -e "当前模式：${CYAN}${CURRENT_MODE}${NC}"
+    echo -e "${YELLOW}（该设置对 Reality / Shadowsocks / Hysteria2 统一生效）${NC}"
     echo ""
     echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
     echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
     echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4，v6 完全不用"
     echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6，v4 完全不用"
-    echo -e "  ${GREEN}5.${NC} 系统默认   — 由 Xray 自动决定（AsIs）"
+    echo -e "  ${GREEN}5.${NC} 系统默认   — 由各协议自动决定（AsIs / auto）"
     echo -e "  ${GREEN}0.${NC} 返回"
     echo ""
     read -rp "选择: " OPT
@@ -1642,6 +1865,10 @@ ip_priority_menu() {
         rebuild_config
         _inject_all_users
         _start_xray
+    fi
+
+    if has_hy2; then
+        _rebuild_hy2_config
     fi
 
     echo ""
@@ -1898,6 +2125,55 @@ update_xray() {
 }
 
 # ============================================================
+# 一键更新 Hysteria2 内核到官方最新版
+# 只更新二进制，不改动 config.yaml / 证书 / 密码，更新后自动重启
+# ============================================================
+update_hy2() {
+    title "更新 Hysteria2 内核..."
+
+    if [[ ! -x "$HY2_BIN" ]]; then
+        error "尚未安装 Hysteria2，请先在菜单 2 中配置"
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        error "缺少 curl，请先执行: apt update && apt install -y curl"
+        return 1
+    fi
+
+    local CURRENT_VER NEW_VER
+    CURRENT_VER=$("$HY2_BIN" version 2>/dev/null | head -1)
+    info "当前版本: ${CURRENT_VER:-未知}"
+    info "正在从官方渠道 (get.hy2.sh) 下载最新版本..."
+
+    bash <(curl -fsSL https://get.hy2.sh/)
+
+    if [[ ! -x "$HY2_BIN" ]]; then
+        error "更新失败，Hysteria2 二进制丢失，请检查网络连接后重试"
+        return 1
+    fi
+
+    NEW_VER=$("$HY2_BIN" version 2>/dev/null | head -1)
+    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
+        info "已是最新版本: ${NEW_VER:-未知}"
+    else
+        info "更新完成: ${CURRENT_VER:-未知} → ${NEW_VER:-未知}"
+    fi
+
+    if has_hy2; then
+        systemctl restart "$HY2_SERVICE"
+        sleep 1
+        if systemctl is-active --quiet "$HY2_SERVICE"; then
+            info "Hysteria2 服务已重启，配置/证书/密码均未改动"
+        else
+            error "Hysteria2 重启失败，运行 journalctl -u ${HY2_SERVICE} -n 20 查看日志"
+            return 1
+        fi
+    else
+        info "当前未配置 Hysteria2 节点，内核已更新，暂无运行中的服务"
+    fi
+}
+
+# ============================================================
 # 更新脚本到最新版本
 # ============================================================
 update_script() {
@@ -1974,6 +2250,7 @@ main_menu() {
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
+        has_hy2 && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
 
         local STATUS_COLOR=$RED
@@ -1984,7 +2261,7 @@ main_menu() {
         systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.3${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.5${NC}          ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
@@ -2007,6 +2284,7 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Xray        ${GREEN}14.${NC} 更新管理脚本"
         echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} IPv4 / IPv6 优先级"
         echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} BBR / iperf3 网络测试"
+        echo -e "${BLUE}║${NC}   ${GREEN}18.${NC} 更新 Hysteria2 内核"
         echo -e "${BLUE}║${NC}   ${RED}16.${NC} 卸载 Xray         ${RED}0.${NC}  退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -2030,6 +2308,7 @@ main_menu() {
             15) ip_priority_menu ;;
             16) uninstall_xray ;;
             17) network_test_menu ;;
+            18) update_hy2 ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项，请重新选择" ;;
         esac
