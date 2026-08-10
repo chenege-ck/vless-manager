@@ -580,9 +580,8 @@ show_ss_link() {
 # ============================================================
 rebuild_config() {
     load_meta
-    local IP_PRIO=""
-    [[ -f "$META_REALITY" ]] && IP_PRIO=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    [[ -z "$IP_PRIO" && -f "$META" ]] && IP_PRIO=$(read_kv "$META" "IP_PRIORITY")
+    local IP_PRIO
+    IP_PRIO=$(_read_ip_priority)
     IP_PRIO=${IP_PRIO:-AsIs}
     local INBOUNDS=""
 
@@ -1565,11 +1564,25 @@ telegram_bot_menu() {
 # IP 优先级设置 — 通过 Xray freedom domainStrategy 控制
 # gai.conf 对 Xray 无效，必须在 config.json 中设置
 # ============================================================
-get_ip_priority_mode() {
+
+# ------------------------------------------------------------
+# IP_PRIORITY 统一保存在 $META（meta.conf）中，不与 $META_REALITY
+# 混存 —— 因为 init_reality() 重新配置节点时会用 `cat >` 整体覆盖
+# $META_REALITY，混存会导致每次重建 Reality 节点后 IP 优先级设置
+# 被静默清空、悄悄回退成 AsIs。这里同时保留对旧版本残留数据
+# （曾经错误地存在 $META_REALITY 里）的读取兼容，避免升级脚本后
+# 已有用户的设置丢失。
+# ------------------------------------------------------------
+_read_ip_priority() {
     local ds=""
-    [[ -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
+    [[ -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
+    [[ -z "$ds" && -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
+    echo "$ds"
+}
+
+get_ip_priority_mode() {
+    local ds
+    ds=$(_read_ip_priority)
     case "$ds" in
         UseIPv4v6) echo "IPv4 优先（v4失败自动切v6）" ;;
         UseIPv6v4) echo "IPv6 优先（v6失败自动切v4）" ;;
@@ -1581,21 +1594,15 @@ get_ip_priority_mode() {
 
 _save_ip_priority() {
     local ds="$1"
-    local saved=0
-    for f in "$META_REALITY" "$META"; do
-        [[ -f "$f" ]] || continue
-        if grep -q "^IP_PRIORITY=" "$f" 2>/dev/null; then
-            sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$f"
-        else
-            echo "IP_PRIORITY=${ds}" >> "$f"
-        fi
-        saved=1
-    done
-    # 如果一个 meta 文件都没有（未初始化），暂存到 META
-    if [[ $saved -eq 0 ]]; then
-        mkdir -p "$(dirname "$META")"
+    mkdir -p "$(dirname "$META")"
+    touch "$META"
+    if grep -q "^IP_PRIORITY=" "$META" 2>/dev/null; then
+        sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$META"
+    else
         echo "IP_PRIORITY=${ds}" >> "$META"
     fi
+    # 清掉旧版本可能残留在 META_REALITY 里的设置，避免两处数据不一致
+    [[ -f "$META_REALITY" ]] && sed -i '/^IP_PRIORITY=/d' "$META_REALITY"
 }
 
 ip_priority_menu() {
