@@ -689,7 +689,7 @@ EOF
         _print_hy2_link
     else
         error "Hysteria2 启动失败，运行 journalctl -u ${HY2_SERVICE} -n 20 查看日志"
-        rm -f "$HY2_META"
+        warn "配置记录已保留（未删除），修复问题后可在菜单重新执行「配置 Hysteria2」或手动 systemctl restart ${HY2_SERVICE} 重试，无需从头再配一遍"
         return 1
     fi
 }
@@ -732,7 +732,14 @@ outbounds:
 
 ignoreClientBandwidth: false
 EOF
-    chmod 600 "$HY2_CONFIG"
+    chmod 640 "$HY2_CONFIG"
+    # 同证书/私钥：config.yaml 也要让 hysteria-server.service 的实际运行用户可读，
+    # 否则会报 "open /etc/hysteria/config.yaml: permission denied"。
+    local HY2_SVC_USER
+    HY2_SVC_USER=$(systemctl show -p User --value "$HY2_SERVICE" 2>/dev/null)
+    if [[ -n "$HY2_SVC_USER" && "$HY2_SVC_USER" != "root" ]]; then
+        chown root:"$HY2_SVC_USER" "$HY2_CONFIG" 2>/dev/null
+    fi
 
     # 服务已在运行时才需要重启生效；首次安装时由 init_hy2 统一启动
     systemctl is-active --quiet "$HY2_SERVICE" && systemctl restart "$HY2_SERVICE"
@@ -1478,26 +1485,43 @@ show_info() {
         echo -e "SNI    : ${REALITY_SNI}"
         echo -e "ShortID: ${SHORTID}"
         echo -e "协议   : VLESS+Reality+TCP"
+        if [[ -f "$USER_DB" ]]; then
+            echo -e "${CYAN}分享链接:${NC}"
+            local RNAME RUUID REXP RSTATUS RNODE RLINK
+            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE; do
+                [[ "$RSTATUS" != "active" ]] && continue
+                RNODE=${RNODE:-both}
+                [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
+                RLINK="vless://${RUUID}@${PUBLIC_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${RNAME}-reality"
+                echo "[${RNAME}] ${RLINK}"
+            done < "$USER_DB"
+        fi
         echo ""
     fi
 
     if has_shadowsocks; then
+        local SS_USERINFO_SHOW SS_LINK_SHOW
+        SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+        SS_LINK_SHOW="ss://${SS_USERINFO_SHOW}@${PUBLIC_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
         echo -e "${CYAN}── Shadowsocks 节点 ──${NC}"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${SS_PORT}"
         echo -e "加密   : ${SS_METHOD}"
         echo -e "密码   : ${SS_PASSWORD}"
         echo -e "协议   : Shadowsocks"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$SS_LINK_SHOW"
         echo ""
     fi
 
     if has_hy2; then
-        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_VER_SHOW
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_VER_SHOW HY2_LINK_SHOW
         HY2_STATUS=$(systemctl is-active "$HY2_SERVICE" 2>/dev/null)
         HY2_PORT_SHOW=$(read_kv "$HY2_META" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$HY2_META" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$HY2_META" "HY2_SNI")
         HY2_VER_SHOW=$("$HY2_BIN" version 2>/dev/null | head -1)
+        HY2_LINK_SHOW="hy2://${HY2_PASSWORD_SHOW}@${PUBLIC_IP}:${HY2_PORT_SHOW}/?sni=${HY2_SNI_SHOW}&insecure=1#Hysteria2-${HY2_PORT_SHOW}"
         echo -e "${CYAN}── Hysteria2 节点（独立进程）──${NC}"
         echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
@@ -1506,6 +1530,8 @@ show_info() {
         echo -e "SNI    : ${HY2_SNI_SHOW}"
         echo -e "内核   : ${HY2_VER_SHOW:-未知}（菜单18可一键更新）"
         echo -e "协议   : Hysteria2（自签名证书，客户端需 insecure）"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$HY2_LINK_SHOW"
         echo ""
     fi
 
