@@ -13,7 +13,6 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 USER_DB="/usr/local/etc/xray/users.db"
 XRAY_BIN="/usr/local/bin/xray"
 META_REALITY="/usr/local/etc/xray/meta-reality.conf"
-META_WS="/usr/local/etc/xray/meta-ws.conf"
 META="/usr/local/etc/xray/meta.conf"
 SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
 SS_PORT=8668
@@ -248,12 +247,6 @@ load_meta() {
     SS_PORT=8668
     SS_METHOD="aes-256-gcm"
     SS_PASSWORD=""
-    WS_PORT=""
-    WS_PATH=""
-    WS_DOMAIN=""
-    WS_CF_PORT=""
-    WS_TLS=""
-    CERT_DIR="/usr/local/etc/xray/ssl"
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -267,18 +260,9 @@ load_meta() {
         SS_METHOD=$(read_kv "$SS_CONFIG" "SS_METHOD")
         SS_PASSWORD=$(read_kv "$SS_CONFIG" "SS_PASSWORD")
     fi
-    if [[ -f "$META_WS" ]]; then
-        WS_PORT=$(read_kv "$META_WS" "WS_PORT")
-        WS_PATH=$(read_kv "$META_WS" "WS_PATH")
-        WS_DOMAIN=$(read_kv "$META_WS" "WS_DOMAIN")
-        WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
-        WS_TLS=$(read_kv "$META_WS" "WS_TLS")
-    fi
 }
 
 has_reality() { [[ -f "$META_REALITY" ]]; }
-
-has_ws()      { [[ -f "$META_WS" ]]; }
 has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
 has_hy2() { [[ -f "$HY2_META" ]]; }
 
@@ -454,70 +438,6 @@ check_port_udp() {
 # ============================================================
 # 初始化配置 - 选择协议
 # ============================================================
-init_config() {
-    title "节点配置..."
-    mkdir -p /usr/local/etc/xray
-    touch "$USER_DB"
-    chmod 600 "$USER_DB"
-    normalize_user_db
-    load_meta
-
-    echo ""
-    echo "当前节点状态："
-    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用"
-    has_ws && echo -e "  ${GREEN}✓${NC} WS+CF 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
-    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
-    has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
-    echo ""
-    echo "请选择要操作的节点："
-    echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
-    echo -e "  ${GREEN}6.${NC} 配置 VLESS + WS + CF"
-    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
-    echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
-    has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
-    has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
-    has_hy2 && echo -e "  ${RED}6.${NC} 移除 Hysteria2 节点"
-    echo ""
-    read -rp "选择: " MODE_SEL
-    case $MODE_SEL in
-        1)
-            if has_reality; then
-                warn "Reality 节点已存在，重新配置将覆盖"
-                read -rp "确认继续？[y/N]: " C
-                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            fi
-            init_reality
-            ;;
-        2) init_shadowsocks ;;
-        3)
-            has_reality || { error "Reality 节点未启用"; return; }
-            read -rp "确认移除 Reality 节点？[y/N]: " C
-            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            rm -f "$META_REALITY"
-            rebuild_config
-            _inject_all_users
-            _start_xray
-            info "Reality 节点已移除"
-            ;;
-        4)
-            has_shadowsocks || { error "Shadowsocks 节点未启用"; return; }
-            read -rp "确认移除 Shadowsocks 节点？[y/N]: " C
-            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            rm -f "$SS_CONFIG"
-            rebuild_config
-            _inject_all_users
-            _start_xray
-            info "Shadowsocks 节点已移除"
-            ;;
-        5) init_hy2 ;;
-        6) remove_hy2 ;;
-        *) error "无效选择" ;;
-    esac
-}
-
-# ============================================================
-# 初始化 Reality（保留原创建逻辑）
-# ============================================================
 init_ws_cf() {
     while true; do
         read -rp "监听端口 [默认 8445]: " WS_PORT
@@ -574,6 +494,73 @@ EOF
     echo ""
 }
 
+# ============================================================
+# 根据已有 meta 重建 config.json（支持双节点）
+# 保留节点结构，只修复 JSON 合法性
+# ============================================================
+
+init_config() {
+    title "节点配置..."
+    mkdir -p /usr/local/etc/xray
+    touch "$USER_DB"
+    chmod 600 "$USER_DB"
+    normalize_user_db
+    load_meta
+
+    echo ""
+    echo "当前节点状态："
+    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
+    has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
+    echo ""
+    echo "请选择要操作的节点："
+    echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
+    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
+    echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
+    has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
+    has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
+    has_hy2 && echo -e "  ${RED}6.${NC} 移除 Hysteria2 节点"
+    echo ""
+    read -rp "选择: " MODE_SEL
+    case $MODE_SEL in
+        1)
+            if has_reality; then
+                warn "Reality 节点已存在，重新配置将覆盖"
+                read -rp "确认继续？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            fi
+            init_reality
+            ;;
+        2) init_shadowsocks ;;
+        3)
+            has_reality || { error "Reality 节点未启用"; return; }
+            read -rp "确认移除 Reality 节点？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            rm -f "$META_REALITY"
+            rebuild_config
+            _inject_all_users
+            _start_xray
+            info "Reality 节点已移除"
+            ;;
+        4)
+            has_shadowsocks || { error "Shadowsocks 节点未启用"; return; }
+            read -rp "确认移除 Shadowsocks 节点？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+            rm -f "$SS_CONFIG"
+            rebuild_config
+            _inject_all_users
+            _start_xray
+            info "Shadowsocks 节点已移除"
+            ;;
+        5) init_hy2 ;;
+        6) remove_hy2 ;;
+        *) error "无效选择" ;;
+    esac
+}
+
+# ============================================================
+# 初始化 Reality（保留原创建逻辑）
+# ============================================================
 init_reality() {
     gen_keypair
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
@@ -615,30 +602,6 @@ init_shadowsocks() {
     title "配置 Shadowsocks"
     local EXISTING_PASSWORD
     load_meta
-    if has_ws; then
-        INBOUNDS="${INBOUNDS}
-    {
-      "port": ${WS_PORT},
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": { "clients": [], "decryption": "none" },
-      "streamSettings": {
-        "network": "ws",
-        "security": "tls",
-        "tlsSettings": {
-          "certificates": [
-            {
-              "certificateFile": "${CERT_DIR}/ws.crt",
-              "keyFile": "${CERT_DIR}/ws.key"
-            }
-          ]
-        },
-        "wsSettings": { "path": "${WS_PATH}", "host": "${WS_DOMAIN}" }
-      },
-      "tag": "inbound-ws"
-    },"
-    fi
-
     if has_shadowsocks; then
         warn "Shadowsocks 已存在，重新配置会生成新密码并使旧密码失效"
         read -rp "确认继续？[y/N]: " C
@@ -1008,8 +971,9 @@ for inbound in cfg["inbounds"]:
     clients = inbound["settings"]["clients"]
     clients = [c for c in clients if c.get("id") != uuid]
     if node in ("both", "reality") and tag == "inbound-reality":
-        flow = "xtls-rprx-vision" if tag == "inbound-reality" else ""
-        clients.append({"id": uuid, "flow": flow, "email": name, "comment": expire})
+        clients.append({"id": uuid, "flow": "xtls-rprx-vision", "email": name, "comment": expire})
+    if node in ("both", "ws") and tag == "inbound-ws":
+        clients.append({"id": uuid, "email": name, "comment": expire})
     inbound["settings"]["clients"] = clients
 
 with open(cfg_path, "w", encoding="utf-8") as f:
@@ -1092,57 +1056,31 @@ add_user() {
         return
     fi
 
-    local NODE="both"
-    if has_reality; then
-        NODE="reality"
-    else
-        error "尚未配置 Reality 节点，请先选择菜单 1 初始化"
-        return
-    fi
+    echo ""
+    echo "请选择用户节点类型："
+    echo "  1. Reality"
+    echo "  2. WS+CF"
+    echo "  3. Reality + WS+CF"
+    read -rp "选择 [默认3]: " NODE_SEL
 
-    read -rp "到期天数 [默认 999 天]: " DAYS
+    case ${NODE_SEL:-3} in
+        1) has_reality || { error "Reality 未配置"; return; }; NODE="reality" ;;
+        2) has_ws || { error "WS+CF 未配置"; return; }; NODE="ws" ;;
+        *) NODE="both" ;;
+    esac
+
+    read -rp "到期天数 [默认999天]: " DAYS
     DAYS=${DAYS:-999}
-
-    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
-        error "到期天数必须是纯数字"
-        return
-    fi
+    [[ "$DAYS" =~ ^[0-9]+$ ]] || { error "天数错误"; return; }
 
     EXPIRE=$(expire_noon_str "$DAYS")
-    [[ -z "$EXPIRE" ]] && error "到期时间计算失败" && return
-
     UUID=$(cat /proc/sys/kernel/random/uuid)
+
     echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
+
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
-
-    validate_xray_config || {
-        # UUID 唯一，用 UUID 定位回滚，安全精确
-        python3 - <<PYEOF
-from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-        rebuild_config
-        _inject_all_users
-        error "配置校验失败，已回滚本次添加"
-        return 1
-    }
-
-    _start_xray || {
-        python3 - <<PYEOF
-from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-        rebuild_config
-        _inject_all_users
-        error "Xray 重启失败，已回滚本次添加"
-        return 1
-    }
+    validate_xray_config || { error "配置校验失败"; return; }
+    _start_xray || { error "Xray启动失败"; return; }
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
@@ -2383,7 +2321,6 @@ main_menu() {
 
         local MODE_STR=""
         has_reality && MODE_STR="Reality"
-        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS-CF"
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
         has_hy2 && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
