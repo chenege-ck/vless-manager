@@ -246,7 +246,7 @@ load_meta() {
     REALITY_PORT=""
     REALITY_SHORTID=""
     SS_PORT=8668
-    SS_METHOD="aes-256-gcm"
+    SS_METHOD="2022-blake3-aes-128-gcm"
     SS_PASSWORD=""
     WS_PORT=""
     WS_PATH=""
@@ -472,7 +472,7 @@ init_config() {
     echo ""
     echo "请选择要操作的节点："
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
-    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + aes-256-gcm"
+    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + 2022-blake3-aes-128-gcm"
     echo -e "  ${GREEN}7.${NC} 配置 VLESS + WS + TLS"
     echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
     has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
@@ -581,9 +581,9 @@ init_shadowsocks() {
         error "端口 ${SS_PORT} 已被其他程序占用"
         return 1
     }
-    SS_METHOD="aes-256-gcm"
-    SS_PASSWORD=$(openssl rand -base64 32 | tr -d '=+/\n' | cut -c1-32)
-    [[ ${#SS_PASSWORD} -ge 24 ]] || { error "随机密码生成失败"; return 1; }
+    SS_METHOD="2022-blake3-aes-128-gcm"
+    SS_PASSWORD=$(openssl rand -base64 16)
+    [[ -n "$SS_PASSWORD" ]] || { error "随机密码生成失败"; return 1; }
     cat > "$SS_CONFIG" <<EOF
 SS_PORT=${SS_PORT}
 SS_METHOD=${SS_METHOD}
