@@ -2317,6 +2317,7 @@ main_menu
 #TG|import os
 #TG|import re
 #TG|import secrets
+#TG|import socket
 #TG|import sqlite3
 #TG|import subprocess
 #TG|import threading
@@ -2740,12 +2741,43 @@ main_menu
 #TG|    return float(m.group(1)) if m else None
 #TG|
 #TG|
+#TG|def measure_tcp_latency(host: str, port: int = 80, timeout: float = 4.0) -> Optional[float]:
+#TG|    """TCP Ping：测量到目标 host:port 的 TCP 连接建立耗时（毫秒）。"""
+#TG|    try:
+#TG|        t0 = time.monotonic()
+#TG|        with socket.create_connection((host, port), timeout=timeout):
+#TG|            return (time.monotonic() - t0) * 1000.0
+#TG|    except Exception:
+#TG|        return None
+#TG|
+#TG|
+#TG|CARRIER_TARGETS = [
+#TG|    ("联通", "sc-cu-v4.ip.zstaticcdn.com", 80),
+#TG|    ("移动", "sc-cm-v4.ip.zstaticcdn.com", 80),
+#TG|    ("电信", "sc-ct-v4.ip.zstaticcdn.com", 80),
+#TG|]
+#TG|
+#TG|
 #TG|def ping_text(host: str = "1.1.1.1") -> str:
+#TG|    lines = ["📡 <b>延迟测试</b>", ""]
+#TG|    # ICMP Ping 目标主机（默认 1.1.1.1）
 #TG|    lat = measure_ping_latency(host)
 #TG|    if lat is None:
-#TG|        return f"📡 <b>延迟测试</b>\n\n<code>{html.escape(host)}</code> <b>无响应</b>（ping 失败或超时）"
-#TG|    level = "🟢" if lat < 100 else ("🟡" if lat < 250 else "🔴")
-#TG|    return f"📡 <b>延迟测试</b>\n\n<code>{html.escape(host)}</code> → {level} <b>{lat:.1f} ms</b> 平均延迟"
+#TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> <b>无响应</b>")
+#TG|    else:
+#TG|        level = "🟢" if lat < 100 else ("🟡" if lat < 250 else "🔴")
+#TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> → {level} <b>{lat:.1f} ms</b>")
+#TG|    lines.append("")
+#TG|    # 三大运营商 TCP Ping
+#TG|    for name, c_host, c_port in CARRIER_TARGETS:
+#TG|        c_lat = measure_tcp_latency(c_host, c_port)
+#TG|        label = f"{name} TCP"
+#TG|        if c_lat is None:
+#TG|            lines.append(f"{label} <b>无响应</b>")
+#TG|        else:
+#TG|            c_level = "🟢" if c_lat < 100 else ("🟡" if c_lat < 250 else "🔴")
+#TG|            lines.append(f"{label} → {c_level} <b>{c_lat:.1f} ms</b>")
+#TG|    return "\n".join(lines)
 #TG|
 #TG|
 #TG|def run_scheduler(token: str, users_path: Path, db_path: Path, config_path: Path, stop: threading.Event) -> None:
