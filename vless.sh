@@ -2742,10 +2742,12 @@ main_menu
 #TG|
 #TG|
 #TG|def measure_tcp_latency(host: str, port: int = 80, timeout: float = 4.0) -> Optional[float]:
-#TG|    """TCP Ping：测量到目标 host:port 的 TCP 连接建立耗时（毫秒）。"""
+#TG|    """TCP Ping：先解析 IP（不计时），再测纯 TCP 握手耗时（毫秒）。"""
 #TG|    try:
+#TG|        # 先解析域名拿到 IP，DNS 时间不计入延迟
+#TG|        ip = socket.gethostbyname(host)
 #TG|        t0 = time.monotonic()
-#TG|        with socket.create_connection((host, port), timeout=timeout):
+#TG|        with socket.create_connection((ip, port), timeout=timeout):
 #TG|            return (time.monotonic() - t0) * 1000.0
 #TG|    except Exception:
 #TG|        return None
