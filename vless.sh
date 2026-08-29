@@ -1817,6 +1817,12 @@ except (KeyError, TypeError, json.JSONDecodeError):
 PYEOF
 )
     [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,}$ ]] || { error "Token 验证失败，未取得机器人用户名"; return 1; }
+
+    # 注册 Telegram 命令快捷键（/ 弹出的命令菜单）
+    curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
+        -d '{"commands":[{"command":"start","description":"帮助 / 命令列表"},{"command":"users","description":"用户与到期概览"},{"command":"user","description":"用户详情与流量：/user 用户名"},{"command":"today","description":"今日全部流量"},{"command":"month","description":"本月全部流量"},{"command":"report","description":"全部用户流量报告"},{"command":"ping","description":"延迟测试（含三网 TCP）"},{"command":"expiring","description":"7天内到期用户"},{"command":"status","description":"机器人状态"}]}' \
+        >/dev/null 2>&1 && info "已注册 Telegram 命令快捷键" || warn "命令快捷键注册失败（不影响使用）"
+
     BIND_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
     BIND_URL="https://t.me/${BOT_USERNAME}?start=${BIND_TOKEN}"
 
