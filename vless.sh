@@ -1,6 +1,6 @@
 #!/bin/bash
-# VLESS 智能节点控制台 v6.6
-# Reality + WS + 用户管理 + Telegram
+# VLESS 智能节点控制台 (sing-box) v1.0
+# Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -9,32 +9,36 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
-USER_DB="/usr/local/etc/xray/users.db"
-XRAY_BIN="/usr/local/bin/xray"
-META_REALITY="/usr/local/etc/xray/meta-reality.conf"
-META_WS="/usr/local/etc/xray/meta-ws.conf"
-META="/usr/local/etc/xray/meta.conf"
-SS_CONFIG="/usr/local/etc/xray/shadowsocks.conf"
-SS_PORT=8668
-HY2_BIN="/usr/local/bin/hysteria"
-HY2_DIR="/etc/hysteria"
-HY2_CONFIG="${HY2_DIR}/config.yaml"
-HY2_CERT="${HY2_DIR}/hy2-cert.pem"
-HY2_KEY="${HY2_DIR}/hy2-key.pem"
-HY2_META="/usr/local/etc/xray/hysteria2.conf"
-HY2_SERVICE="hysteria-server"
-HY2_PORT_DEFAULT=8999
-TG_DIR="/usr/local/lib/vless-manager"
-TG_SCRIPT="${TG_DIR}/vless_tg_bot.py"
-TG_CONFIG="/etc/vless-manager/bot.conf"
-TRAFFIC_DB="/usr/local/etc/xray/traffic.db"
+# ============== 路径 ==============
+SBOX_BIN="/usr/local/bin/sing-box"
+SBOX_CONFIG="/etc/sing-box/config.json"
+SBOX_DIR="/etc/sing-box"
+USER_DB="${SBOX_DIR}/users.db"
+META_REALITY="${SBOX_DIR}/meta-reality.conf"
+META_SS="${SBOX_DIR}/meta-ss.conf"
+META_WS="${SBOX_DIR}/meta-ws.conf"
+META_HY2="${SBOX_DIR}/meta-hy2.conf"
+META="${SBOX_DIR}/meta.conf"
+SERVICE_NAME="sing-box"
 
+# ============== 默认端口 ==============
+SS_PORT_DEFAULT=8668
+HY2_PORT_DEFAULT=8999
+
+# ============== 工具函数 ==============
 info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
 warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
+# ============== 安全读取 key=value 配置 ==============
+read_kv() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file"
+}
+
+# ============== 用户名校验 ==============
 validate_username() {
     local value="$1"
     [[ -z "$value" ]] && { error "用户名不能为空"; return 1; }
@@ -49,13 +53,15 @@ validate_username() {
     return 0
 }
 
+# ============== UUID 校验 ==============
 validate_uuid() {
     [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
-        error "用户数据库中的 UUID 格式异常，操作已停止"
+        error "UUID 格式异常"
         return 1
     }
 }
 
+# ============== 用户数据库操作 ==============
 user_exists() {
     awk -F: -v n="$1" '$1==n {found=1; exit} END {exit !found}' "$USER_DB" 2>/dev/null
 }
@@ -64,55 +70,42 @@ get_user_field() {
     awk -F: -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$USER_DB" 2>/dev/null
 }
 
+# ============== 权限检查 ==============
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
-# ============================================================
-# 仅支持 Debian
-# ============================================================
+
+# ============== 系统检查（仅 Debian） ==============
 check_system() {
     local OS_ID CODENAME
     OS_ID=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
     CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
-
     if [[ "$OS_ID" != "debian" ]]; then
         error "本脚本仅支持 Debian 11/12/13，不支持当前系统"
         exit 1
     fi
-
     case "$CODENAME" in
         bullseye|bookworm|trixie) ;;
-        *)
-            error "仅支持 Debian 11/12/13，当前版本代号: ${CODENAME:-unknown}"
-            exit 1
-            ;;
+        *) error "仅支持 Debian 11/12/13，当前: ${CODENAME:-unknown}"; exit 1 ;;
     esac
 }
 
-# ============================================================
-# 设置系统时区为上海
-# ============================================================
+# ============== 设置上海时区 ==============
 set_shanghai_timezone() {
     title "设置系统时区"
-
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-timezone Asia/Shanghai 2>/dev/null
     else
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
         echo "Asia/Shanghai" > /etc/timezone
     fi
-
     if [[ "$(readlink -f /etc/localtime 2>/dev/null)" == "/usr/share/zoneinfo/Asia/Shanghai" ]]; then
-        info "系统时区已设置为 Asia/Shanghai（上海）"
+        info "系统时区已设置为 Asia/Shanghai"
     else
         warn "时区设置可能未生效，请手动执行: timedatectl set-timezone Asia/Shanghai"
     fi
 }
 
-# ============================================================
-# 上海时间工具
-# ============================================================
-now_shanghai_ts() {
-    TZ=Asia/Shanghai date +%s
-}
+# ============== 上海时间工具 ==============
+now_shanghai_ts() { TZ=Asia/Shanghai date +%s; }
 
 expire_noon_str() {
     local days="$1"
@@ -121,19 +114,13 @@ expire_noon_str() {
 
 expire_to_ts() {
     local expire="$1"
-
     if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
-        local d="${expire%%_*}"
-        local t="${expire#*_}"
-        TZ=Asia/Shanghai date -d "${d} ${t//-/:}" +%s 2>/dev/null
-        return
+        local d="${expire%%_*}" t="${expire#*_}"
+        TZ=Asia/Shanghai date -d "${d} ${t//-/:}" +%s 2>/dev/null; return
     fi
-
     if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        TZ=Asia/Shanghai date -d "${expire} 12:00:00" +%s 2>/dev/null
-        return
+        TZ=Asia/Shanghai date -d "${expire} 12:00:00" +%s 2>/dev/null; return
     fi
-
     local normalized="${expire/T/ }"
     TZ=Asia/Shanghai date -d "$normalized" +%s 2>/dev/null
 }
@@ -141,9 +128,7 @@ expire_to_ts() {
 expire_display() {
     local expire="$1"
     if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
-        local d="${expire%%_*}"
-        local t="${expire#*_}"
-        echo "${d} ${t//-/:}"
+        local d="${expire%%_*}" t="${expire#*_}"; echo "${d} ${t//-/:}"
     elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
         echo "${expire/T/ }"
     elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
@@ -153,26 +138,12 @@ expire_display() {
     fi
 }
 
-# ============================================================
-# 安全读取 key=value 配置，避免 source 执行任意内容
-# ============================================================
-read_kv() {
-    local file="$1"
-    local key="$2"
-    [[ -f "$file" ]] || return 1
-    awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file"
-}
-
-# ============================================================
-# 获取公网 IP（失败兜底）
-# ============================================================
+# ============== 获取公网 IP ==============
 get_public_ip() {
     local ip=""
-    # 先尝试 IPv4
     ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)
-    # IPv4 全失败则尝试 IPv6（纯 IPv6 机器）
     if [[ -z "$ip" ]]; then
         ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
         [[ -z "$ip" ]] && ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)
@@ -180,9 +151,12 @@ get_public_ip() {
     echo "${ip:-<请手动填写服务器IP>}"
 }
 
-# ============================================================
-# users.db 统一格式：NAME:UUID:EXPIRE:STATUS:NODE
-# ============================================================
+# ============== 端口检查 ==============
+check_port()     { ss -tlnp | grep -q ":${1} " && return 1 || return 0; }
+check_port_udp() { ss -ulnp | grep -q ":${1} " && return 1 || return 0; }
+
+# ============== 用户数据库格式化 ==============
+# 格式: NAME:UUID:EXPIRE:STATUS:NODE
 normalize_user_db() {
     [[ ! -f "$USER_DB" ]] && return 0
     python3 - <<PYEOF
@@ -194,7 +168,7 @@ lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
 out = []
 changed = False
 
-def normalize_expire(exp: str) -> str:
+def normalize_expire(exp):
     exp = exp.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
         return exp + "_12-00-00"
@@ -226,11 +200,9 @@ for line in lines:
             changed = True
     else:
         continue
-
     expire2 = normalize_expire(expire)
     if expire2 != expire:
         changed = True
-
     out.append(":".join([name, uuid, expire2, status, node]))
 
 if changed:
@@ -238,24 +210,13 @@ if changed:
 PYEOF
 }
 
-# ============================================================
-# 加载元数据（不再 source）
-# ============================================================
+# ============== 加载元数据 ==============
 load_meta() {
-    REALITY_PRIVATE_KEY=""
-    REALITY_PUBLIC_KEY=""
-    REALITY_SNI=""
-    REALITY_PORT=""
-    REALITY_SHORTID=""
-    SS_PORT=8668
-    SS_METHOD="2022-blake3-aes-128-gcm"
-    SS_PASSWORD=""
-    WS_PORT=""
-    WS_PATH=""
-    WS_DOMAIN=""
-    WS_CF_PORT=""
-    WS_TLS=""
-    CERT_DIR=""
+    REALITY_PRIVATE_KEY=""  REALITY_PUBLIC_KEY=""  REALITY_SNI=""
+    REALITY_PORT=""  REALITY_SHORTID=""
+    SS_PORT=""  SS_METHOD=""  SS_PASSWORD=""
+    WS_PORT=""  WS_PATH=""  WS_DOMAIN=""  WS_CF_PORT=""  WS_TLS=""  CERT_DIR=""
+    HY2_PORT=""  HY2_PASSWORD=""  HY2_SNI=""
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -264,10 +225,10 @@ load_meta() {
         REALITY_PORT=$(read_kv "$META_REALITY" "REALITY_PORT")
         REALITY_SHORTID=$(read_kv "$META_REALITY" "REALITY_SHORTID")
     fi
-    if [[ -f "$SS_CONFIG" ]]; then
-        SS_PORT=$(read_kv "$SS_CONFIG" "SS_PORT")
-        SS_METHOD=$(read_kv "$SS_CONFIG" "SS_METHOD")
-        SS_PASSWORD=$(read_kv "$SS_CONFIG" "SS_PASSWORD")
+    if [[ -f "$META_SS" ]]; then
+        SS_PORT=$(read_kv "$META_SS" "SS_PORT")
+        SS_METHOD=$(read_kv "$META_SS" "SS_METHOD")
+        SS_PASSWORD=$(read_kv "$META_SS" "SS_PASSWORD")
     fi
     if [[ -f "$META_WS" ]]; then
         WS_PORT=$(read_kv "$META_WS" "WS_PORT")
@@ -276,34 +237,63 @@ load_meta() {
         WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
         WS_TLS=$(read_kv "$META_WS" "WS_TLS")
         CERT_DIR=$(read_kv "$META_WS" "CERT_DIR")
-        CERT_DIR=${CERT_DIR:-/usr/local/etc/xray/ssl}
+        CERT_DIR=${CERT_DIR:-/etc/sing-box/ssl}
+    fi
+    if [[ -f "$META_HY2" ]]; then
+        HY2_PORT=$(read_kv "$META_HY2" "HY2_PORT")
+        HY2_PASSWORD=$(read_kv "$META_HY2" "HY2_PASSWORD")
+        HY2_SNI=$(read_kv "$META_HY2" "HY2_SNI")
     fi
 }
 
-has_reality() { [[ -f "$META_REALITY" ]]; }
-has_shadowsocks() { [[ -f "$SS_CONFIG" ]]; }
-has_ws() { [[ -f "$META_WS" ]]; }
-has_hy2() { [[ -f "$HY2_META" ]]; }
+# ============== 节点存在检查 ==============
+has_reality()     { [[ -f "$META_REALITY" ]]; }
+has_shadowsocks() { [[ -f "$META_SS" ]]; }
+has_ws()          { [[ -f "$META_WS" ]]; }
+has_hy2()         { [[ -f "$META_HY2" ]]; }
 
-# ============================================================
-# 配置校验
-# ============================================================
-validate_xray_config() {
-    [[ ! -f "$XRAY_CONFIG" ]] && error "配置文件不存在: $XRAY_CONFIG" && return 1
-
-    python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$XRAY_CONFIG" >/dev/null 2>&1
+# ============== sing-box 配置校验 ==============
+validate_sbox_config() {
+    [[ ! -f "$SBOX_CONFIG" ]] && error "配置文件不存在: $SBOX_CONFIG" && return 1
+    python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$SBOX_CONFIG" >/dev/null 2>&1
     if [[ $? -ne 0 ]]; then
-        error "config.json 不是合法 JSON"
-        return 1
+        error "config.json 不是合法 JSON"; return 1
     fi
-
-    "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1
+    "$SBOX_BIN" check -c "$SBOX_CONFIG" >/dev/null 2>&1
     if [[ $? -ne 0 ]]; then
-        error "Xray 配置校验失败，未执行重启"
-        return 1
+        error "sing-box 配置校验失败"; return 1
     fi
-
     return 0
+}
+
+# ============== 启动 sing-box ==============
+_start_sbox() {
+    validate_sbox_config || return 1
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl restart "$SERVICE_NAME"
+    sleep 1
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        info "sing-box 已启动"; return 0
+    else
+        error "sing-box 启动失败，运行 journalctl -u $SERVICE_NAME -n 20 查看日志"
+        return 1
+    fi
+}
+
+# ============== 分割线 ==============
+# ============================================================
+# 安装依赖
+# ============================================================
+install_deps() {
+    title "安装依赖..."
+    info "正在更新 apt 索引..."
+    if ! apt-get update -qq; then
+        warn "apt 更新失败，尝试自动修复软件源..."
+        fix_apt || return 1
+    fi
+    apt-get install -y -qq curl openssl python3
+    [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
+    info "依赖安装完成"
 }
 
 # ============================================================
@@ -312,11 +302,8 @@ validate_xray_config() {
 fix_apt() {
     local CODENAME
     CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
-
-    [[ -z "$CODENAME" ]] && error "无法识别 Debian 版本代号" && return 1
-
+    [[ -z "$CODENAME" ]] && error "无法识别 Debian 版本" && return 1
     cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%s) 2>/dev/null
-
     case "$CODENAME" in
         bullseye)
             cat > /etc/apt/sources.list <<EOF
@@ -348,661 +335,292 @@ deb http://security.debian.org/debian-security trixie-security main contrib non-
 deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
 EOF
             ;;
-        *)
-            error "不支持的 Debian 版本代号: $CODENAME"
-            return 1
-            ;;
+        *) error "不支持的版本: $CODENAME"; return 1 ;;
     esac
-
     apt-get update -qq
-    if [[ $? -ne 0 ]]; then
-        error "apt 源修复后仍然更新失败，请手动检查 /etc/apt/sources.list"
-        return 1
-    fi
-
+    [[ $? -ne 0 ]] && error "apt 源修复后仍然失败" && return 1
     info "apt 源已修复: ${CODENAME}"
     return 0
 }
 
 # ============================================================
-# 安装依赖
+# 安装 sing-box
 # ============================================================
-install_deps() {
-    title "安装依赖..."
-
-    info "正在使用当前 apt 软件源更新索引..."
-    if ! apt-get update -qq; then
-        warn "当前 apt 软件源更新失败"
-        warn "自动修复会备份并覆盖 /etc/apt/sources.list"
-
-        local REPAIR_APT
-        read -rp "apt 更新失败，是否自动修复软件源？[y/N]: " REPAIR_APT
-        if [[ "$REPAIR_APT" == "y" || "$REPAIR_APT" == "Y" ]]; then
-            fix_apt || return 1
-        else
-            error "已取消修复 apt 源，未修改 /etc/apt/sources.list"
-            return 1
-        fi
-    else
-        info "当前 apt 软件源可用，保持原配置不变"
-    fi
-
-    apt-get install -y -qq curl unzip openssl python3
-    [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
-    info "依赖安装完成"
-}
-
-# ============================================================
-# ============================================================
-# 安装 xray
-# ============================================================
-install_xray() {
-    title "安装 Xray..."
-    if [[ -f "$XRAY_BIN" ]]; then
-        warn "Xray 已安装，跳过"
-        return
+install_sbox() {
+    title "安装 sing-box..."
+    if [[ -f "$SBOX_BIN" ]]; then
+        warn "sing-box 已安装，跳过安装步骤"
+        return 0
     fi
     install_deps || return 1
 
-    [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
-    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
-    bash /tmp/xray-install.sh install
-    [[ $? -ne 0 ]] && error "安装失败，请检查网络" && exit 1
+    info "正在下载 sing-box..."
+    bash <(curl -fsSL https://sing-box.app/deb-install.sh) 2>/dev/null
+    if [[ ! -f "$SBOX_BIN" ]]; then
+        # 备用：从 GitHub releases 手动安装
+        info "官方脚本安装失败，尝试从 GitHub releases 安装..."
+        local ARCH
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64)  ARCH="amd64" ;;
+            aarch64) ARCH="arm64" ;;
+            armv7l)  ARCH="armv7" ;;
+            *) error "不支持的架构: $ARCH"; return 1 ;;
+        esac
+        local VER
+        VER=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name','').lstrip('v'))" 2>/dev/null)
+        [[ -z "$VER" ]] && error "无法获取 sing-box 最新版本" && return 1
+        local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}.tar.gz"
+        curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败"; return 1; }
+        tar -xzf /tmp/sing-box.tar.gz -C /tmp/
+        local DIR_NAME="sing-box-${VER}-linux-${ARCH}"
+        cp "/tmp/${DIR_NAME}/sing-box" "$SBOX_BIN"
+        chmod +x "$SBOX_BIN"
+        rm -rf /tmp/sing-box.tar.gz "/tmp/${DIR_NAME}"
 
-    [[ -f "${XRAY_CONFIG}.bak" ]] && mv "${XRAY_CONFIG}.bak" "$XRAY_CONFIG" && info "已恢复原配置"
-    info "Xray 安装成功"
+        # 创建 systemd 服务
+        printf '%s\n' \
+            "[Unit]" \
+            "Description=sing-box service" \
+            "Documentation=https://sing-box.sagernet.org" \
+            "After=network.target nss-lookup.target" \
+            "" \
+            "[Service]" \
+            "Type=simple" \
+            "ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json" \
+            "Restart=on-failure" \
+            "RestartSec=10" \
+            "LimitNOFILE=infinity" \
+            "" \
+            "[Install]" \
+            "WantedBy=multi-user.target" \
+            > /etc/systemd/system/sing-box.service
+        systemctl daemon-reload
+    fi
+
+    [[ -x "$SBOX_BIN" ]] || { error "sing-box 安装失败"; return 1; }
+    mkdir -p "$SBOX_DIR"
+    info "sing-box 安装成功: $($SBOX_BIN version 2>/dev/null | head -1)"
 }
 
 # ============================================================
-# 卸载 xray
+# 卸载 sing-box
 # ============================================================
-uninstall_xray() {
-    title "卸载 Xray..."
+uninstall_sbox() {
+    title "卸载 sing-box..."
     read -rp "确认卸载？将删除所有配置和用户数据 [y/N]: " CONFIRM
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
 
-    systemctl stop xray 2>/dev/null
-    systemctl disable xray 2>/dev/null
-    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
-    bash /tmp/xray-install.sh remove
-    rm -rf /usr/local/etc/xray
-    rm -f /var/log/xray/access.log /var/log/xray/error.log
+    systemctl stop "$SERVICE_NAME" 2>/dev/null
+    systemctl disable "$SERVICE_NAME" 2>/dev/null
+    rm -f "$SBOX_BIN"
+    rm -f /etc/systemd/system/sing-box.service
+    rm -rf "$SBOX_DIR"
     crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
-    rm -f /usr/local/bin/c
-    info "Xray 已完全卸载"
+    systemctl daemon-reload
+    info "sing-box 已完全卸载"
     exit 0
 }
 
 # ============================================================
-# 生成密钥对
+# 生成 Reality 密钥对
 # ============================================================
 gen_keypair() {
     local OUTPUT
-    OUTPUT=$($XRAY_BIN x25519 2>/dev/null)
+    OUTPUT=$("$SBOX_BIN" generate reality-keypair 2>/dev/null)
     PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey\|Public" | awk '{print $NF}')
+    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey" | awk '{print $NF}')
 }
 
 # ============================================================
-# 检查端口是否占用
+# IP 优先级设置
 # ============================================================
-check_port() {
-    ss -tlnp | grep -q ":${1} " && return 1 || return 0
+_read_ip_priority() {
+    local ds=""
+    [[ -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
+    echo "$ds"
 }
 
-check_port_udp() {
-    ss -ulnp | grep -q ":${1} " && return 1 || return 0
-}
-
-# ============================================================
-# 初始化配置 - 选择协议
-# ============================================================
-init_config() {
-    title "节点配置..."
-    mkdir -p /usr/local/etc/xray
-    touch "$USER_DB"
-    chmod 600 "$USER_DB"
-    normalize_user_db
-    load_meta
-
-    echo ""
-    echo "当前节点状态："
-    has_reality && echo -e "  ${GREEN}✓${NC} Reality 已启用" || echo -e "  ${RED}✗${NC} Reality 未启用"
-    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
-    has_ws && echo -e "  ${GREEN}✓${NC} WS+CF 已启用" || echo -e "  ${RED}✗${NC} WS+CF 未启用"
-    has_hy2 && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用" || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
-    echo ""
-    echo "请选择要操作的节点："
-    echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
-    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks + 2022-blake3-aes-128-gcm"
-    echo -e "  ${GREEN}7.${NC} 配置 VLESS + WS + TLS"
-    echo -e "  ${GREEN}5.${NC} 配置 Hysteria2（独立进程，不进 Xray/TG 统计）"
-    has_reality && echo -e "  ${RED}3.${NC} 移除 Reality 节点"
-    has_shadowsocks && echo -e "  ${RED}4.${NC} 移除 Shadowsocks 节点"
-    has_ws && echo -e "  ${RED}8.${NC} 移除 WS+CF 节点"
-    has_hy2 && echo -e "  ${RED}6.${NC} 移除 Hysteria2 节点"
-    echo ""
-    read -rp "选择: " MODE_SEL
-    case $MODE_SEL in
-        1)
-            if has_reality; then
-                warn "Reality 节点已存在，重新配置将覆盖"
-                read -rp "确认继续？[y/N]: " C
-                [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            fi
-            init_reality
-            ;;
-        2) init_shadowsocks ;;
-        7) init_ws_cf ;;
-        3)
-            has_reality || { error "Reality 节点未启用"; return; }
-            read -rp "确认移除 Reality 节点？[y/N]: " C
-            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            rm -f "$META_REALITY"
-            rebuild_config
-            _inject_all_users
-            _start_xray
-            info "Reality 节点已移除"
-            ;;
-        4)
-            has_shadowsocks || { error "Shadowsocks 节点未启用"; return; }
-            read -rp "确认移除 Shadowsocks 节点？[y/N]: " C
-            [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-            rm -f "$SS_CONFIG"
-            rebuild_config
-            _inject_all_users
-            _start_xray
-            info "Shadowsocks 节点已移除"
-            ;;
-        8)
-            has_ws || { error "WS+CF 节点未启用"; return; }
-            read -rp "确认移除 WS+CF 节点？[y/N]: " C
-            [[ "$C" != "y" && "$C" != "Y" ]] && return
-            rm -f "$META_WS"
-            rebuild_config
-            _inject_all_users
-            _start_xray
-            info "WS+CF 节点已移除"
-            ;;
-        5) init_hy2 ;;
-        6) remove_hy2 ;;
-        *) error "无效选择" ;;
+_get_ip_priority_desc() {
+    local ds
+    ds=$(_read_ip_priority)
+    case "$ds" in
+        prefer_ipv4) echo "IPv4 优先（v4失败自动切v6）" ;;
+        prefer_ipv6) echo "IPv6 优先（v6失败自动切v4）" ;;
+        ipv4_only)   echo "仅 IPv4" ;;
+        ipv6_only)   echo "仅 IPv6" ;;
+        *)           echo "系统默认" ;;
     esac
 }
 
-# ============================================================
-# 初始化 Reality（保留原创建逻辑）
-# ============================================================
-init_reality() {
-    gen_keypair
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败"
-        return
-    fi
-
-    while true; do
-        read -rp "监听端口 [默认 8443]: " REALITY_PORT
-        REALITY_PORT=${REALITY_PORT:-8443}
-        check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用，请换一个"
-    done
-
-    read -rp "伪装域名 [默认 www.apple.com]: " REALITY_SNI
-    REALITY_SNI=${REALITY_SNI:-www.apple.com}
-    local REALITY_SHORTID
-    REALITY_SHORTID=$(openssl rand -hex 4)
-
-    cat > "$META_REALITY" <<EOF
-REALITY_PRIVATE_KEY=${PRIVATE_KEY}
-REALITY_PUBLIC_KEY=${PUBLIC_KEY}
-REALITY_SNI=${REALITY_SNI}
-REALITY_PORT=${REALITY_PORT}
-REALITY_SHORTID=${REALITY_SHORTID}
-EOF
-    chmod 600 "$META_REALITY"
-
-    rebuild_config
-    _inject_all_users
-    _start_xray
-    info "Reality 节点配置完成"
-    info "公钥: ${PUBLIC_KEY}"
-}
-
-# ============================================================
-# 初始化 Shadowsocks（共享密码入口）
-# ============================================================
-init_shadowsocks() {
-    title "配置 Shadowsocks"
-    local EXISTING_PASSWORD
-    load_meta
-    if has_shadowsocks; then
-        warn "Shadowsocks 已存在，重新配置会生成新密码并使旧密码失效"
-        read -rp "确认继续？[y/N]: " C
-        [[ "$C" != "y" && "$C" != "Y" ]] && return
-    fi
-    check_port "$SS_PORT" || {
-        error "端口 ${SS_PORT} 已被其他程序占用"
-        return 1
-    }
-    SS_METHOD="2022-blake3-aes-128-gcm"
-    SS_PASSWORD=$(openssl rand -base64 16)
-    [[ -n "$SS_PASSWORD" ]] || { error "随机密码生成失败"; return 1; }
-    cat > "$SS_CONFIG" <<EOF
-SS_PORT=${SS_PORT}
-SS_METHOD=${SS_METHOD}
-SS_PASSWORD=${SS_PASSWORD}
-EOF
-    chmod 600 "$SS_CONFIG"
-    rebuild_config || return 1
-    _inject_all_users
-    _start_xray || return 1
-    info "Shadowsocks 配置完成"
-    show_protocol_links
-}
-
-show_protocol_links() {
-    load_meta
-    local SERVER_IP SS_USERINFO SS_LINK
-    SERVER_IP=$(get_public_ip)
-    echo ""
-    echo -e "${GREEN}===== 协议节点信息 =====${NC}"
-    if has_reality; then
-        echo -e "${CYAN}Reality${NC}: ${SERVER_IP}:${REALITY_PORT}"
-    fi
-    if has_shadowsocks; then
-        SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
-        SS_LINK="ss://${SS_USERINFO}@${SERVER_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
-        echo -e "${CYAN}Shadowsocks${NC}: ${SERVER_IP}:${SS_PORT}"
-        echo -e "加密   : ${SS_METHOD}"
-        echo -e "密码   : ${SS_PASSWORD}"
-        echo -e "分享链接:"
-        echo "$SS_LINK"
-    fi
-    echo ""
-}
-
-show_ss_link() {
-    has_shadowsocks || { error "Shadowsocks 节点尚未配置"; return 1; }
-    show_protocol_links
-}
-
-# ============================================================
-# 初始化 WS+CF
-# ============================================================
-init_ws_cf() {
-    title "配置 VLESS + WS + TLS"
-    while true; do
-        read -rp "监听端口 [默认 8445]: " WS_PORT
-        WS_PORT=${WS_PORT:-8445}
-        check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用，请换一个"
-    done
-    read -rp "WS 路径 [默认 /vless]: " WS_PATH
-    WS_PATH=${WS_PATH:-/vless}
-    read -rp "你的域名（已在 CF 解析的域名）: " WS_DOMAIN
-    [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return 1
-
-    CERT_DIR="/usr/local/etc/xray/ssl"
-    mkdir -p "$CERT_DIR"
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-        -keyout "${CERT_DIR}/ws.key" -out "${CERT_DIR}/ws.crt" \
-        -days 3650 -subj "/CN=${WS_DOMAIN}" \
-        -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null || {
-        error "自签证书生成失败"
-        return 1
-    }
-    chmod 640 "${CERT_DIR}/ws.key"
-    chown root:nogroup "${CERT_DIR}/ws.key" 2>/dev/null || true
-    chmod 644 "${CERT_DIR}/ws.crt"
-    cat > "$META_WS" <<EOF
-WS_PORT=${WS_PORT}
-WS_PATH=${WS_PATH}
-WS_DOMAIN=${WS_DOMAIN}
-WS_CF_PORT=${WS_PORT}
-WS_TLS=tls
-CERT_DIR=${CERT_DIR}
-EOF
-    chmod 600 "$META_WS"
-    rebuild_config || return 1
-    _inject_all_users
-    _start_xray || return 1
-    info "WS+CF 节点配置完成"
-    echo -e "${YELLOW}CF 配置：${NC}${WS_DOMAIN} 解析到本机并开启橙云，SSL 模式使用完全（Full）"
-}
-
-# ============================================================
-# Hysteria2 —— 完全独立的协议节点
-# 不使用 Xray，走独立的 hysteria 二进制 + 独立 systemd 服务
-# (hysteria-server.service)，config.json / TG 流量统计均不涉及。
-# 证书为自签名，客户端需开启"跳过证书验证"(insecure/allowInsecure)。
-# ============================================================
-install_hy2_binary() {
-    if [[ -x "$HY2_BIN" ]]; then
-        return 0
-    fi
-    title "安装 Hysteria2 内核"
-    if ! command -v curl >/dev/null 2>&1; then
-        error "缺少 curl，请先执行: apt update && apt install -y curl"
-        return 1
-    fi
-    bash <(curl -fsSL https://get.hy2.sh/)
-    if [[ ! -x "$HY2_BIN" ]]; then
-        error "Hysteria2 内核安装失败，请检查网络后重试"
-        return 1
-    fi
-    info "Hysteria2 内核安装完成"
-}
-
-init_hy2() {
-    title "配置 Hysteria2"
-
-    if has_hy2; then
-        warn "Hysteria2 已存在，重新配置将生成新密码/证书并使旧链接失效"
-        read -rp "确认继续？[y/N]: " C
-        [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    fi
-
-    local HY2_PORT HY2_SNI HY2_PASSWORD
-    read -rp "监听端口 [默认 ${HY2_PORT_DEFAULT}]: " HY2_PORT
-    HY2_PORT=${HY2_PORT:-$HY2_PORT_DEFAULT}
-    if ! [[ "$HY2_PORT" =~ ^[0-9]+$ ]] || (( HY2_PORT < 1 || HY2_PORT > 65535 )); then
-        error "端口必须是 1-65535 之间的数字"
-        return 1
-    fi
-    check_port_udp "$HY2_PORT" || {
-        error "UDP 端口 ${HY2_PORT} 已被占用，请换一个"
-        return 1
-    }
-
-    read -rp "伪装域名（自签证书CN + 回落目标）[默认 www.bing.com]: " HY2_SNI
-    HY2_SNI=${HY2_SNI:-www.bing.com}
-
-    install_hy2_binary || return 1
-
-    mkdir -p "$HY2_DIR"
-    HY2_PASSWORD=$(openssl rand -hex 16)
-    if [[ -z "$HY2_PASSWORD" ]]; then
-        error "密码生成失败"
-        return 1
-    fi
-
-    # 自动生成自签名证书（10 年有效期），无需域名和 ACME
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$HY2_KEY" -out "$HY2_CERT" \
-        -days 3650 -subj "/CN=${HY2_SNI}" \
-        -addext "subjectAltName=DNS:${HY2_SNI}" >/dev/null 2>&1
-
-    if [[ ! -s "$HY2_CERT" || ! -s "$HY2_KEY" ]]; then
-        error "自签名证书生成失败"
-        return 1
-    fi
-    chmod 644 "$HY2_CERT"
-    chmod 640 "$HY2_KEY"
-    # hysteria-server.service 可能以非 root 专用用户运行（新版安装脚本会创建
-    # hysteria 系统用户），若证书/私钥仍归 root 且权限 600，该用户读不到私钥，
-    # 会导致 "启动失败"。这里动态探测服务实际运行用户并调整属主，兼容 root/非root
-    # 两种安装方式。
-    local HY2_SVC_USER
-    HY2_SVC_USER=$(systemctl show -p User --value "$HY2_SERVICE" 2>/dev/null)
-    if [[ -n "$HY2_SVC_USER" && "$HY2_SVC_USER" != "root" ]]; then
-        chown root:"$HY2_SVC_USER" "$HY2_KEY" "$HY2_CERT" "$HY2_DIR" 2>/dev/null
-        chmod 750 "$HY2_DIR"
-    fi
-
-    mkdir -p "$(dirname "$HY2_META")"
-    cat > "$HY2_META" <<EOF
-HY2_PORT=${HY2_PORT}
-HY2_PASSWORD=${HY2_PASSWORD}
-HY2_SNI=${HY2_SNI}
-EOF
-    chmod 600 "$HY2_META"
-
-    _rebuild_hy2_config
-
-    systemctl enable "$HY2_SERVICE" >/dev/null 2>&1
-    systemctl restart "$HY2_SERVICE"
-    sleep 1
-    if systemctl is-active --quiet "$HY2_SERVICE"; then
-        info "Hysteria2 配置完成（端口 ${HY2_PORT}/UDP，自签名证书）"
-        _print_hy2_link
+_save_ip_priority() {
+    local ds="$1"
+    mkdir -p "$(dirname "$META")"
+    touch "$META"
+    if grep -q "^IP_PRIORITY=" "$META" 2>/dev/null; then
+        sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$META"
     else
-        error "Hysteria2 启动失败，运行 journalctl -u ${HY2_SERVICE} -n 20 查看日志"
-        warn "配置记录已保留（未删除），修复问题后可在菜单重新执行「配置 Hysteria2」或手动 systemctl restart ${HY2_SERVICE} 重试，无需从头再配一遍"
-        return 1
+        echo "IP_PRIORITY=${ds}" >> "$META"
     fi
 }
 
-# ------------------------------------------------------------
-# 根据 $HY2_META 中已保存的端口/密码/SNI，加上当前 IP_PRIORITY，
-# 重新生成 config.yaml。证书和密码不会变，只重写文件内容。
-# 用于：1) init_hy2 首次生成  2) 菜单15 切换 v4/v6 优先级后同步
-# ------------------------------------------------------------
-_rebuild_hy2_config() {
-    has_hy2 || return 0
-    local HY2_PORT HY2_PASSWORD HY2_SNI HY2_MODE
-    HY2_PORT=$(read_kv "$HY2_META" "HY2_PORT")
-    HY2_PASSWORD=$(read_kv "$HY2_META" "HY2_PASSWORD")
-    HY2_SNI=$(read_kv "$HY2_META" "HY2_SNI")
-    HY2_MODE=$(_ip_priority_to_hy2_mode "$(_read_ip_priority)")
-
-    cat > "$HY2_CONFIG" <<EOF
-listen: :${HY2_PORT}
-
-tls:
-  cert: ${HY2_CERT}
-  key: ${HY2_KEY}
-
-auth:
-  type: password
-  password: ${HY2_PASSWORD}
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://${HY2_SNI}
-    rewriteHost: true
-
-outbounds:
-  - name: direct
-    type: direct
-    direct:
-      mode: ${HY2_MODE}
-
-ignoreClientBandwidth: false
-EOF
-    chmod 640 "$HY2_CONFIG"
-    # 同证书/私钥：config.yaml 也要让 hysteria-server.service 的实际运行用户可读，
-    # 否则会报 "open /etc/hysteria/config.yaml: permission denied"。
-    local HY2_SVC_USER
-    HY2_SVC_USER=$(systemctl show -p User --value "$HY2_SERVICE" 2>/dev/null)
-    if [[ -n "$HY2_SVC_USER" && "$HY2_SVC_USER" != "root" ]]; then
-        chown root:"$HY2_SVC_USER" "$HY2_CONFIG" 2>/dev/null
+ip_priority_menu() {
+    title "网络优先级（IPv4/IPv6）"
+    load_meta
+    local CURRENT_DESC
+    CURRENT_DESC=$(_get_ip_priority_desc)
+    echo ""
+    echo -e "当前模式：${CYAN}${CURRENT_DESC}${NC}"
+    echo -e "${YELLOW}（Reality / SS / WS / Hysteria2 统一生效）${NC}"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
+    echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
+    echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4"
+    echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6"
+    echo -e "  ${GREEN}5.${NC} 系统默认"
+    echo -e "  ${GREEN}0.${NC} 返回"
+    echo ""
+    read -rp "选择: " OPT
+    local DS=""
+    local DESC=""
+    case "$OPT" in
+        1) DS="prefer_ipv4"; DESC="IPv4 优先" ;;
+        2) DS="prefer_ipv6"; DESC="IPv6 优先" ;;
+        3) DS="ipv4_only";   DESC="仅 IPv4" ;;
+        4) DS="ipv6_only";   DESC="仅 IPv6" ;;
+        5) DS="AsIs";        DESC="系统默认" ;;
+        0) return ;;
+        *) warn "无效选项"; return ;;
+    esac
+    _save_ip_priority "$DS"
+    if has_reality || has_shadowsocks || has_ws || has_hy2; then
+        rebuild_config
+        _inject_all_users
+        _start_sbox
     fi
-
-    # 服务已在运行时才需要重启生效；首次安装时由 init_hy2 统一启动
-    systemctl is-active --quiet "$HY2_SERVICE" && systemctl restart "$HY2_SERVICE"
-}
-
-remove_hy2() {
-    has_hy2 || { error "Hysteria2 节点未启用"; return 1; }
-    read -rp "确认移除 Hysteria2 节点？[y/N]: " C
-    [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    systemctl stop "$HY2_SERVICE" 2>/dev/null
-    systemctl disable "$HY2_SERVICE" 2>/dev/null
-    rm -f "$HY2_CONFIG" "$HY2_CERT" "$HY2_KEY" "$HY2_META"
-    info "Hysteria2 节点已移除（内核程序保留；如需彻底卸载内核，可手动执行: bash <(curl -fsSL https://get.hy2.sh/) --remove）"
-}
-
-_print_hy2_link() {
-    has_hy2 || return 1
-    local HY2_PORT HY2_PASSWORD HY2_SNI SERVER_IP LINK HY2_MODE_DESC
-    HY2_PORT=$(read_kv "$HY2_META" "HY2_PORT")
-    HY2_PASSWORD=$(read_kv "$HY2_META" "HY2_PASSWORD")
-    HY2_SNI=$(read_kv "$HY2_META" "HY2_SNI")
-    SERVER_IP=$(get_public_ip)
-    LINK="hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?sni=${HY2_SNI}&insecure=1#Hysteria2-${HY2_PORT}"
-    HY2_MODE_DESC=$(get_ip_priority_mode)
-
-    echo ""
-    echo -e "${GREEN}===== Hysteria2 节点信息 =====${NC}"
-    echo -e "地址   : ${SERVER_IP}"
-    echo -e "端口   : ${HY2_PORT} (UDP)"
-    echo -e "密码   : ${HY2_PASSWORD}"
-    echo -e "SNI    : ${HY2_SNI}"
-    echo -e "出站   : ${HY2_MODE_DESC}（菜单15可调整，Reality/SS/HY2 共用）"
-    echo -e "证书   : 自签名，客户端需开启「跳过证书验证 / insecure」"
-    echo -e "${CYAN}分享链接:${NC}"
-    echo "$LINK"
-    echo ""
-}
-
-show_hy2_link() {
-    has_hy2 || { error "Hysteria2 节点尚未配置"; return 1; }
-    _print_hy2_link
+    info "已生效：${DESC}"
 }
 
 # ============================================================
-# 根据已有 meta 重建 config.json（仅 Reality + Shadowsocks）
-# 保留节点结构，只修复 JSON 合法性
+# 根据已有 meta 重建 sing-box config.json
 # ============================================================
 rebuild_config() {
     load_meta
     local IP_PRIO
     IP_PRIO=$(_read_ip_priority)
-    IP_PRIO=${IP_PRIO:-AsIs}
-    local INBOUNDS=""
 
-    if has_reality; then
-        INBOUNDS="${INBOUNDS}
-    {
-      \"port\": ${REALITY_PORT},
-      \"protocol\": \"vless\",
-      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
-      \"streamSettings\": {
-        \"network\": \"tcp\",
-        \"security\": \"reality\",
-        \"realitySettings\": {
-          \"show\": false,
-          \"dest\": \"${REALITY_SNI}:443\",
-          \"xver\": 0,
-          \"serverNames\": [\"${REALITY_SNI}\"],
-          \"privateKey\": \"${REALITY_PRIVATE_KEY}\",
-          \"shortIds\": [\"${REALITY_SHORTID}\"]
+    HAS_REALITY=0; has_reality && HAS_REALITY=1
+    HAS_SS=0; has_shadowsocks && HAS_SS=1
+    HAS_WS=0; has_ws && HAS_WS=1
+    HAS_HY2=0; has_hy2 && HAS_HY2=1
+
+    python3 - <<PYEOF
+import json, os
+
+cfg = {"log": {"level": "warn", "timestamp": True}, "inbounds": [], "outbounds": []}
+
+if os.environ.get("HAS_REALITY") == "1":
+    cfg["inbounds"].append({
+        "type": "vless", "tag": "inbound-reality",
+        "listen": "::", "listen_port": int(os.environ["REALITY_PORT"]),
+        "sniff": True, "sniff_override_destination": True, "users": [],
+        "tls": {
+            "enabled": True, "server_name": os.environ["REALITY_SNI"],
+            "reality": {
+                "enabled": True,
+                "handshake": {"server": os.environ["REALITY_SNI"], "server_port": 443},
+                "private_key": os.environ["REALITY_PRIVATE_KEY"],
+                "short_id": [os.environ["REALITY_SHORTID"]]
+            }
         }
-      },
-      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
-      \"tag\": \"inbound-reality\"
-    },"
-    fi
+    })
 
-    if has_shadowsocks; then
-        INBOUNDS="${INBOUNDS}
-    {
-      \"port\": ${SS_PORT},
-      \"listen\": \"0.0.0.0\",
-      \"protocol\": \"shadowsocks\",
-      \"settings\": { \"method\": \"${SS_METHOD}\", \"password\": \"${SS_PASSWORD}\", \"network\": \"tcp,udp\" },
-      \"tag\": \"inbound-shadowsocks\"
-    },"
-    fi
+if os.environ.get("HAS_SS") == "1":
+    cfg["inbounds"].append({
+        "type": "shadowsocks", "tag": "inbound-shadowsocks",
+        "listen": "::", "listen_port": int(os.environ["SS_PORT"]),
+        "method": os.environ["SS_METHOD"], "password": os.environ["SS_PASSWORD"]
+    })
 
-    if has_ws; then
-        INBOUNDS="${INBOUNDS}
-    {
-      \"port\": ${WS_PORT},
-      \"listen\": \"0.0.0.0\",
-      \"protocol\": \"vless\",
-      \"settings\": { \"clients\": [], \"decryption\": \"none\" },
-      \"streamSettings\": {
-        \"network\": \"ws\",
-        \"security\": \"tls\",
-        \"tlsSettings\": { \"certificates\": [{ \"certificateFile\": \"${CERT_DIR}/ws.crt\", \"keyFile\": \"${CERT_DIR}/ws.key\" }] },
-        \"wsSettings\": { \"path\": \"${WS_PATH}\", \"host\": \"${WS_DOMAIN}\" }
-      },
-      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] },
-      \"tag\": \"inbound-ws\"
-    },"
-    fi
+if os.environ.get("HAS_WS") == "1":
+    cfg["inbounds"].append({
+        "type": "vless", "tag": "inbound-ws",
+        "listen": "::", "listen_port": int(os.environ["WS_PORT"]),
+        "sniff": True, "sniff_override_destination": True, "users": [],
+        "tls": {
+            "enabled": True,
+            "certificate_path": os.environ["CERT_DIR"] + "/ws.crt",
+            "key_path": os.environ["CERT_DIR"] + "/ws.key"
+        },
+        "transport": {
+            "type": "ws", "path": os.environ["WS_PATH"],
+            "max_early_data": 2048,
+            "early_data_header_name": "Sec-WebSocket-Protocol"
+        }
+    })
 
-    INBOUNDS="${INBOUNDS%,}"
+if os.environ.get("HAS_HY2") == "1":
+    cfg["inbounds"].append({
+        "type": "hysteria2", "tag": "inbound-hy2",
+        "listen": "::", "listen_port": int(os.environ["HY2_PORT"]),
+        "users": [{"name": "shared", "password": os.environ["HY2_PASSWORD"]}],
+        "tls": {
+            "enabled": True,
+            "certificate_path": os.environ["HY2_CERT"],
+            "key_path": os.environ["HY2_KEY"]
+        }
+    })
 
-    cat > "$XRAY_CONFIG" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "stats": {},
-  "policy": {
-    "levels": {
-      "0": {
-        "statsUserUplink": true,
-        "statsUserDownlink": true
-      }
-    }
-  },
-  "api": {
-    "tag": "api",
-    "listen": "127.0.0.1:10085",
-    "services": ["StatsService"]
-  },
-  "routing": {
-    "rules": []
-  },
-  "inbounds": [
-    ${INBOUNDS}
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "${IP_PRIO}" } },
-    { "protocol": "blackhole", "tag": "block" }
-  ]
-}
-EOF
+ds = os.environ.get("IP_PRIO", "")
+outbound = {"type": "direct", "tag": "direct"}
+if ds and ds != "AsIs":
+    outbound["domain_strategy"] = ds
+
+cfg["outbounds"] = [outbound, {"type": "block", "tag": "block"}]
+
+with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
 }
 
 # ============================================================
-# 启动 xray（先校验后重启）
-# ============================================================
-_start_xray() {
-    validate_xray_config || return 1
-    systemctl enable xray >/dev/null 2>&1
-    systemctl restart xray
-    sleep 1
-    if systemctl is-active --quiet xray; then
-        info "Xray 已启动"
-        return 0
-    else
-        error "Xray 启动失败，运行 journalctl -u xray -n 20 查看日志"
-        return 1
-    fi
-}
-
-# ============================================================
-# 注入用户到 config.json（指定节点类型）
+# 注入用户到 config.json（Reality 和 WS）
 # ============================================================
 _inject_user() {
-    local UUID=$1
-    local NAME=$2
-    local EXPIRE=$3
-    local NODE=$4
+    local UUID=$1 NAME=$2 EXPIRE=$3 NODE=$4
 
-    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_EXPIRE="$EXPIRE" INJECT_NODE="$NODE" \
-    INJECT_CONFIG="$XRAY_CONFIG" python3 - <<'PYEOF'
+    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" \
+    INJECT_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
 import json, os
-uuid   = os.environ["INJECT_UUID"]
-name   = os.environ["INJECT_NAME"]
-expire = os.environ["INJECT_EXPIRE"]
-node   = os.environ["INJECT_NODE"]
+uuid = os.environ["INJECT_UUID"]
+name = os.environ["INJECT_NAME"]
+node = os.environ["INJECT_NODE"]
 cfg_path = os.environ["INJECT_CONFIG"]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
-for inbound in cfg["inbounds"]:
+for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
-    if "clients" not in inbound.get("settings", {}):
+    users = inbound.get("users")
+    if users is None:
         continue
-    clients = inbound["settings"]["clients"]
-    clients = [c for c in clients if c.get("id") != uuid]
-    if node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws"):
-        flow = "xtls-rprx-vision" if tag == "inbound-reality" else ""
-        clients.append({"id": uuid, "flow": flow, "email": name, "comment": expire})
-    inbound["settings"]["clients"] = clients
+    # 移除已存在的同 UUID 用户
+    inbound["users"] = [u for u in users if u.get("uuid") != uuid]
+    # 按节点类型注入
+    should_add = False
+    if node == "both":
+        should_add = True
+    elif node == "reality" and tag == "inbound-reality":
+        should_add = True
+    elif node == "ws" and tag == "inbound-ws":
+        should_add = True
+    if should_add:
+        user_entry = {"name": name, "uuid": uuid}
+        if tag == "inbound-reality":
+            user_entry["flow"] = "xtls-rprx-vision"
+        inbound["users"].append(user_entry)
 
 with open(cfg_path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
@@ -1010,7 +628,7 @@ PYEOF
 }
 
 # ============================================================
-# 重建后将所有 active 用户按节点类型重新注入
+# 重建后将所有 active 用户重新注入
 # ============================================================
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
@@ -1023,13 +641,295 @@ _inject_all_users() {
 }
 
 # ============================================================
-# 打印节点分享链接
+# 初始化 Reality 节点
+# ============================================================
+init_reality() {
+    title "配置 VLESS + Reality"
+    gen_keypair
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        error "密钥生成失败"; return 1
+    fi
+
+    while true; do
+        read -rp "监听端口 [默认 8443]: " REALITY_PORT
+        REALITY_PORT=${REALITY_PORT:-8443}
+        check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用"
+    done
+
+    read -rp "伪装域名 [默认 www.apple.com]: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-www.apple.com}
+    local REALITY_SHORTID
+    REALITY_SHORTID=$(openssl rand -hex 8)
+
+    cat > "$META_REALITY" <<EOF
+REALITY_PRIVATE_KEY=${PRIVATE_KEY}
+REALITY_PUBLIC_KEY=${PUBLIC_KEY}
+REALITY_SNI=${REALITY_SNI}
+REALITY_PORT=${REALITY_PORT}
+REALITY_SHORTID=${REALITY_SHORTID}
+EOF
+    chmod 600 "$META_REALITY"
+
+    rebuild_config
+    _inject_all_users
+    _start_sbox
+    info "Reality 节点配置完成"
+    info "公钥: ${PUBLIC_KEY}"
+}
+
+# ============================================================
+# 初始化 Shadowsocks 节点
+# ============================================================
+init_shadowsocks() {
+    title "配置 Shadowsocks"
+    if has_shadowsocks; then
+        warn "Shadowsocks 已存在，重新配置会生成新密码"
+        read -rp "确认继续？[y/N]: " C
+        [[ "$C" != "y" && "$C" != "Y" ]] && return
+    fi
+    local PORT=${SS_PORT_DEFAULT}
+    while true; do
+        read -rp "监听端口 [默认 ${PORT}]: " PORT
+        PORT=${PORT:-$SS_PORT_DEFAULT}
+        check_port "$PORT" && break || warn "端口 ${PORT} 已被占用"
+    done
+
+    SS_PORT=$PORT
+    SS_METHOD="2022-blake3-aes-128-gcm"
+    SS_PASSWORD=$(openssl rand -base64 16)
+    [[ -n "$SS_PASSWORD" ]] || { error "密码生成失败"; return 1; }
+
+    cat > "$META_SS" <<EOF
+SS_PORT=${SS_PORT}
+SS_METHOD=${SS_METHOD}
+SS_PASSWORD=${SS_PASSWORD}
+EOF
+    chmod 600 "$META_SS"
+
+    rebuild_config || return 1
+    _start_sbox || return 1
+    info "Shadowsocks 配置完成"
+    _print_ss_link
+}
+
+_print_ss_link() {
+    load_meta
+    [[ -z "$SS_PASSWORD" ]] && return
+    local SERVER_IP
+    SERVER_IP=$(get_public_ip)
+    local USERINFO
+    USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+    echo ""
+    echo -e "${GREEN}===== Shadowsocks 信息 =====${NC}"
+    echo -e "地址   : ${SERVER_IP}"
+    echo -e "端口   : ${SS_PORT}"
+    echo -e "加密   : ${SS_METHOD}"
+    echo -e "密码   : ${SS_PASSWORD}"
+    echo -e "${CYAN}分享链接:${NC}"
+    echo "ss://${USERINFO}@${SERVER_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
+    echo ""
+}
+
+# ============================================================
+# 初始化 WS+CF 节点
+# ============================================================
+init_ws_cf() {
+    title "配置 VLESS + WS + TLS"
+    while true; do
+        read -rp "监听端口 [默认 8445]: " WS_PORT
+        WS_PORT=${WS_PORT:-8445}
+        check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用"
+    done
+    read -rp "WS 路径 [默认 /vless]: " WS_PATH
+    WS_PATH=${WS_PATH:-/vless}
+    read -rp "你的域名（已在 CF 解析）: " WS_DOMAIN
+    [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return 1
+
+    CERT_DIR="/etc/sing-box/ssl"
+    mkdir -p "$CERT_DIR"
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "${CERT_DIR}/ws.key" -out "${CERT_DIR}/ws.crt" \
+        -days 3650 -subj "/CN=${WS_DOMAIN}" \
+        -addext "subjectAltName=DNS:${WS_DOMAIN}" 2>/dev/null || {
+        error "自签证书生成失败"; return 1
+    }
+    chmod 640 "${CERT_DIR}/ws.key"
+    chmod 644 "${CERT_DIR}/ws.crt"
+
+    cat > "$META_WS" <<EOF
+WS_PORT=${WS_PORT}
+WS_PATH=${WS_PATH}
+WS_DOMAIN=${WS_DOMAIN}
+WS_CF_PORT=${WS_PORT}
+WS_TLS=tls
+CERT_DIR=${CERT_DIR}
+EOF
+    chmod 600 "$META_WS"
+
+    rebuild_config || return 1
+    _inject_all_users
+    _start_sbox || return 1
+    info "WS+CF 节点配置完成"
+    echo -e "${YELLOW}CF 配置：${NC}${WS_DOMAIN} 解析到本机并开启橙云，SSL 使用完全（Full）"
+}
+
+# ============================================================
+# Hysteria2（合并进 sing-box）
+# ============================================================
+init_hy2() {
+    title "配置 Hysteria2"
+
+    if has_hy2; then
+        warn "Hysteria2 已存在，重新配置将生成新密码/证书"
+        read -rp "确认继续？[y/N]: " C
+        [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    fi
+
+    local PORT SNI
+    read -rp "监听端口 [默认 ${HY2_PORT_DEFAULT}]: " PORT
+    PORT=${PORT:-$HY2_PORT_DEFAULT}
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+        error "端口必须是 1-65535"; return 1
+    fi
+    check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
+
+    read -rp "伪装域名（证书 CN）[默认 www.bing.com]: " SNI
+    SNI=${SNI:-www.bing.com}
+
+    HY2_PORT=$PORT
+    HY2_SNI=$SNI
+    HY2_PASSWORD=$(openssl rand -hex 16)
+    [[ -n "$HY2_PASSWORD" ]] || { error "密码生成失败"; return 1; }
+
+    # 自签名证书
+    HY2_CERT="${SBOX_DIR}/hy2-cert.pem"
+    HY2_KEY="${SBOX_DIR}/hy2-key.pem"
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$HY2_KEY" -out "$HY2_CERT" \
+        -days 3650 -subj "/CN=${HY2_SNI}" \
+        -addext "subjectAltName=DNS:${HY2_SNI}" >/dev/null 2>&1
+    [[ -s "$HY2_CERT" && -s "$HY2_KEY" ]] || { error "证书生成失败"; return 1; }
+    chmod 644 "$HY2_CERT" && chmod 640 "$HY2_KEY"
+
+    cat > "$META_HY2" <<EOF
+HY2_PORT=${HY2_PORT}
+HY2_PASSWORD=${HY2_PASSWORD}
+HY2_SNI=${HY2_SNI}
+HY2_CERT=${HY2_CERT}
+HY2_KEY=${HY2_KEY}
+EOF
+    chmod 600 "$META_HY2"
+
+    rebuild_config || return 1
+    _start_sbox || return 1
+    info "Hysteria2 配置完成（端口 ${HY2_PORT}/UDP，自签名证书）"
+    _print_hy2_link
+}
+
+remove_hy2() {
+    has_hy2 || { error "Hysteria2 未启用"; return 1; }
+    read -rp "确认移除 Hysteria2？[y/N]: " C
+    [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    load_meta
+    rm -f "$META_HY2" "$HY2_CERT" "$HY2_KEY"
+    rebuild_config
+    _inject_all_users
+    _start_sbox
+    info "Hysteria2 已移除"
+}
+
+_print_hy2_link() {
+    has_hy2 || return 1
+    local HY2_PORT HY2_PASSWORD HY2_SNI SERVER_IP
+    HY2_PORT=$(read_kv "$META_HY2" "HY2_PORT")
+    HY2_PASSWORD=$(read_kv "$META_HY2" "HY2_PASSWORD")
+    HY2_SNI=$(read_kv "$META_HY2" "HY2_SNI")
+    SERVER_IP=$(get_public_ip)
+    echo ""
+    echo -e "${GREEN}===== Hysteria2 信息 =====${NC}"
+    echo -e "地址   : ${SERVER_IP}"
+    echo -e "端口   : ${HY2_PORT} (UDP)"
+    echo -e "密码   : ${HY2_PASSWORD}"
+    echo -e "SNI    : ${HY2_SNI}"
+    echo -e "证书   : 自签名，客户端需 insecure"
+    echo -e "${CYAN}分享链接:${NC}"
+    echo "hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?sni=${HY2_SNI}&insecure=1#Hysteria2-${HY2_PORT}"
+    echo ""
+}
+
+show_hy2_link() {
+    has_hy2 || { error "Hysteria2 尚未配置"; return 1; }
+    _print_hy2_link
+}
+
+# ============================================================
+# 节点配置选择菜单
+# ============================================================
+init_config() {
+    title "节点配置..."
+    mkdir -p "$SBOX_DIR"
+    touch "$USER_DB" && chmod 600 "$USER_DB"
+    normalize_user_db
+    load_meta
+
+    echo ""
+    echo "当前节点状态："
+    has_reality     && echo -e "  ${GREEN}✓${NC} Reality 已启用"    || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
+    has_ws          && echo -e "  ${GREEN}✓${NC} WS+CF 已启用"      || echo -e "  ${RED}✗${NC} WS+CF 未启用"
+    has_hy2         && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用"  || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
+    echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks"
+    echo -e "  ${GREEN}3.${NC} 配置 VLESS + WS + TLS"
+    echo -e "  ${GREEN}4.${NC} 配置 Hysteria2"
+    has_reality     && echo -e "  ${RED}5.${NC} 移除 Reality"
+    has_shadowsocks && echo -e "  ${RED}6.${NC} 移除 Shadowsocks"
+    has_ws          && echo -e "  ${RED}7.${NC} 移除 WS+CF"
+    has_hy2         && echo -e "  ${RED}8.${NC} 移除 Hysteria2"
+    echo ""
+    read -rp "选择: " MODE_SEL
+    case $MODE_SEL in
+        1)
+            if has_reality; then
+                warn "Reality 已存在，重新配置将覆盖"
+                read -rp "确认？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && return
+            fi
+            init_reality ;;
+        2) init_shadowsocks ;;
+        3) init_ws_cf ;;
+        4) init_hy2 ;;
+        5)
+            has_reality || { error "Reality 未启用"; return; }
+            read -rp "确认移除 Reality？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && return
+            rm -f "$META_REALITY"
+            rebuild_config; _inject_all_users; _start_sbox
+            info "Reality 已移除" ;;
+        6)
+            has_shadowsocks || { error "SS 未启用"; return; }
+            read -rp "确认移除 Shadowsocks？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && return
+            rm -f "$META_SS"
+            rebuild_config; _inject_all_users; _start_sbox
+            info "Shadowsocks 已移除" ;;
+        7)
+            has_ws || { error "WS 未启用"; return; }
+            read -rp "确认移除 WS+CF？[y/N]: " C
+            [[ "$C" != "y" && "$C" != "Y" ]] && return
+            rm -f "$META_WS"
+            rebuild_config; _inject_all_users; _start_sbox
+            info "WS+CF 已移除" ;;
+        8) remove_hy2 ;;
+        *) error "无效选择" ;;
+    esac
+}
+# ============================================================
+# 打印用户分享链接
 # ============================================================
 _print_link() {
-    local USERNAME=$1
-    local UUID=$2
-    local EXPIRE=$3
-    local NODE=${4:-both}
+    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both}
     load_meta
 
     local EXPIRE_SHOW
@@ -1043,11 +943,15 @@ _print_link() {
     echo -e "节点   : ${NODE}"
 
     if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
-        local SERVER_IP
+        local SERVER_IP SHORTID
         SERVER_IP=$(get_public_ip)
-
-        local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+        SHORTID=$(python3 -c "
+import json
+d=json.load(open('$SBOX_CONFIG', encoding='utf-8'))
+for i in d.get('inbounds',[]):
+    if i.get('tag')=='inbound-reality':
+        print(i['tls']['reality']['short_id'][0]); break
+" 2>/dev/null)
 
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
@@ -1058,7 +962,6 @@ _print_link() {
         echo -e "ShortID: ${SHORTID}"
 
         local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
-
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -1078,7 +981,6 @@ _print_link() {
         echo -e "${CYAN}分享链接:${NC}"
         echo "$WS_LINK"
     fi
-
     echo ""
 }
 
@@ -1094,8 +996,7 @@ add_user() {
     validate_username "$USERNAME" || return
 
     if user_exists "$USERNAME"; then
-        error "用户 ${USERNAME} 已存在"
-        return
+        error "用户 ${USERNAME} 已存在"; return
     fi
 
     local NODE="both"
@@ -1116,27 +1017,24 @@ add_user() {
     elif has_ws; then
         NODE="ws"
     else
-        error "尚未配置 Reality 或 WS 节点，请先选择菜单 1 或 7 初始化"
+        error "尚未配置 Reality 或 WS 节点，请先初始化"
         return
     fi
 
     read -rp "到期天数 [默认 999 天]: " DAYS
     DAYS=${DAYS:-999}
-
     if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
-        error "到期天数必须是纯数字"
-        return
+        error "天数必须是纯数字"; return
     fi
 
     EXPIRE=$(expire_noon_str "$DAYS")
-    [[ -z "$EXPIRE" ]] && error "到期时间计算失败" && return
+    [[ -z "$EXPIRE" ]] && { error "到期时间计算失败"; return; }
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
     echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
 
-    validate_xray_config || {
-        # UUID 唯一，用 UUID 定位回滚，安全精确
+    validate_sbox_config || {
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1144,13 +1042,11 @@ lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        rebuild_config
-        _inject_all_users
-        error "配置校验失败，已回滚本次添加"
-        return 1
+        rebuild_config; _inject_all_users
+        error "配置校验失败，已回滚本次添加"; return 1
     }
 
-    _start_xray || {
+    _start_sbox || {
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1158,10 +1054,8 @@ lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        rebuild_config
-        _inject_all_users
-        error "Xray 重启失败，已回滚本次添加"
-        return 1
+        rebuild_config; _inject_all_users
+        error "启动失败，已回滚本次添加"; return 1
     }
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
@@ -1179,10 +1073,8 @@ delete_user() {
     [[ -z "$USERNAME" ]] && return
     validate_username "$USERNAME" || return
 
-    # 精确匹配：用户名后紧跟冒号，避免前缀误删
     if ! user_exists "$USERNAME"; then
-        error "用户不存在"
-        return
+        error "用户不存在"; return
     fi
 
     UUID=$(get_user_field "$USERNAME" 2)
@@ -1190,9 +1082,10 @@ delete_user() {
     local USER_NODE DEL_NODE="both"
     USER_NODE=$(get_user_field "$USERNAME" 5)
     USER_NODE=${USER_NODE:-both}
+
     if [[ "$USER_NODE" == "both" ]] && has_reality && has_ws; then
         echo "删除哪个节点的权限？"
-        echo "  1. Reality + WS（彻底删除用户）"
+        echo "  1. Reality + WS（彻底删除）"
         echo "  2. 仅 Reality"
         echo "  3. 仅 WS"
         read -rp "选择 [1/2/3，默认1]: " DEL_SEL
@@ -1201,24 +1094,25 @@ delete_user() {
         DEL_NODE="$USER_NODE"
     fi
 
+    # 从 config.json 移除
     python3 - <<PYEOF
 import json
 del_node = "$DEL_NODE"
-with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
+with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
-for inbound in cfg["inbounds"]:
+for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
-    if "clients" not in inbound.get("settings", {}):
+    users = inbound.get("users")
+    if users is None:
         continue
     if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
-        clients = inbound["settings"]["clients"]
-        inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
-with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
+        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
+with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
     if [[ "$DEL_NODE" == "both" || "$DEL_NODE" == "$USER_NODE" ]]; then
-        # 用 python 精确删除，避免 sed 前缀误匹配
+        # 彻底删除
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1228,6 +1122,7 @@ p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已彻底删除"
     else
+        # 部分删除：只移除一个节点
         local NEW_NODE
         [[ "$DEL_NODE" == "reality" ]] && NEW_NODE="ws" || NEW_NODE="reality"
         DB_PATH="$USER_DB" TARGET_USER="$USERNAME" NEW_NODE="$NEW_NODE" python3 - <<'PYEOF'
@@ -1246,75 +1141,8 @@ PYEOF
         info "用户 ${USERNAME} 已移除 ${DEL_NODE} 权限，保留 ${NEW_NODE}"
     fi
 
-    validate_xray_config || {
-        rebuild_config
-        _inject_all_users
-    }
-    systemctl restart xray
-}
-
-# ============================================================
-# 重置到期时间
-# ============================================================
-renew_user() {
-    title "重置到期时间"
-    normalize_user_db
-    list_users_brief
-
-    read -rp "输入用户名: " USERNAME
-    [[ -z "$USERNAME" ]] && return
-    validate_username "$USERNAME" || return
-
-    if ! user_exists "$USERNAME"; then
-        error "用户不存在"
-        return
-    fi
-
-    read -rp "续期天数 [默认 999 天]: " DAYS
-    DAYS=${DAYS:-999}
-
-    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
-        error "续期天数必须是纯数字"
-        return
-    fi
-
-    NEW_EXPIRE=$(expire_noon_str "$DAYS")
-    [[ -z "$NEW_EXPIRE" ]] && error "到期时间计算失败" && return
-
-    UUID=$(get_user_field "$USERNAME" 2)
-    validate_uuid "$UUID" || return
-    local STATUS NODE
-    STATUS=$(get_user_field "$USERNAME" 4)
-    NODE=$(get_user_field "$USERNAME" 5)
-    NODE=${NODE:-both}
-    STATUS=${STATUS:-active}
-
-    # 续期后统一恢复为 active（无论原来是什么状态）
-    local NEW_STATUS="active"
-
-    python3 - <<PYEOF
-from pathlib import Path
-p = Path("$USER_DB")
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = []
-for line in lines:
-    parts = line.split(":")
-    if len(parts) >= 2 and parts[0] == "$USERNAME" and parts[1] == "$UUID":
-        out.append("$USERNAME:$UUID:$NEW_EXPIRE:$NEW_STATUS:$NODE")
-    else:
-        out.append(line)
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-
-    # 无论原来 active 还是 disabled，续期后都重新注入并启动
-    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
-    validate_xray_config && systemctl restart xray
-
-    if [[ "$STATUS" == "disabled" ]]; then
-        info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}，已自动恢复启用"
-    else
-        info "用户 ${USERNAME} 到期时间已更新为 ${NEW_EXPIRE}"
-    fi
+    validate_sbox_config || { rebuild_config; _inject_all_users; }
+    systemctl restart "$SERVICE_NAME"
 }
 
 # ============================================================
@@ -1331,8 +1159,7 @@ toggle_user() {
     validate_username "$USERNAME" || return
 
     if ! user_exists "$USERNAME"; then
-        error "用户不存在"
-        return
+        error "用户不存在"; return
     fi
 
     UUID=$(get_user_field "$USERNAME" 2)
@@ -1343,22 +1170,24 @@ toggle_user() {
     OP_NODE="$USER_NODE"
 
     if [[ "$ACTION" == "disable" ]]; then
+        # 从 config.json 移除
         python3 - <<PYEOF
 import json
 op_node = "$OP_NODE"
-with open("$XRAY_CONFIG", "r", encoding="utf-8") as f:
+with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
-for inbound in cfg["inbounds"]:
+for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
-    if "clients" not in inbound.get("settings", {}):
+    users = inbound.get("users")
+    if users is None:
         continue
     if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
-        clients = inbound["settings"]["clients"]
-        inbound["settings"]["clients"] = [c for c in clients if c.get("id") != "$UUID"]
-with open("$XRAY_CONFIG", "w", encoding="utf-8") as f:
+        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
+with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
+        # 更新 db 状态
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1366,8 +1195,7 @@ lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:"):
-        out.append(line)
-        continue
+        out.append(line); continue
     parts = line.split(":")
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
@@ -1375,18 +1203,17 @@ for line in lines:
     out.append(":".join(parts[:5]))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        info "用户 ${USERNAME} 已禁用（节点: ${OP_NODE}）"
+        info "用户 ${USERNAME} 已禁用"
     else
+        # 启用
         local EXPIRE
         EXPIRE=$(get_user_field "$USERNAME" 3)
-
-        # 检查是否已过期，过期不允许直接启用
         local EXPIRE_TS NOW_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
         NOW_TS=$(now_shanghai_ts)
         if [[ -n "$EXPIRE_TS" ]] && (( NOW_TS >= EXPIRE_TS )); then
             warn "用户 ${USERNAME} 已过期（$(expire_display "$EXPIRE")），无法启用"
-            warn "请先使用菜单 8 重置到期时间再启用"
+            warn "请先重置到期时间再启用"
             return
         fi
 
@@ -1399,8 +1226,7 @@ lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     if not line.startswith("$USERNAME:"):
-        out.append(line)
-        continue
+        out.append(line); continue
     parts = line.split(":")
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
@@ -1408,94 +1234,73 @@ for line in lines:
     out.append(":".join(parts[:5]))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        info "用户 ${USERNAME} 已启用（节点: ${OP_NODE}）"
+        info "用户 ${USERNAME} 已启用"
     fi
 
-    validate_xray_config || {
-        rebuild_config
-        _inject_all_users
-        return 1
-    }
-
-    systemctl restart xray
+    validate_sbox_config || { rebuild_config; _inject_all_users; return 1; }
+    systemctl restart "$SERVICE_NAME"
 }
 
 # ============================================================
-# 到期检查（按上海时间，到期日当天 12:00 断开）
+# 重置到期时间
 # ============================================================
-check_expire() {
-    title "检查到期用户..."
+renew_user() {
+    title "重置到期时间"
     normalize_user_db
-    local NOW_TS
-    NOW_TS=$(now_shanghai_ts)
-    local CHANGED=0
-    local EXPIRED_NAMES=""
-    local EXPIRED_UUIDS=""
+    list_users_brief
 
-    [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
+    read -rp "输入用户名: " USERNAME
+    [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
 
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
-        [[ "$STATUS" != "active" ]] && continue
+    if ! user_exists "$USERNAME"; then
+        error "用户不存在"; return
+    fi
 
-        local EXPIRE_TS
-        EXPIRE_TS=$(expire_to_ts "$EXPIRE")
-        [[ -z "$EXPIRE_TS" ]] && continue
+    read -rp "续期天数 [默认 999 天]: " DAYS
+    DAYS=${DAYS:-999}
+    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+        error "天数必须是纯数字"; return
+    fi
 
-        if (( NOW_TS >= EXPIRE_TS )); then
-            warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），自动禁用"
-            EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
-            EXPIRED_NAMES="${EXPIRED_NAMES} ${NAME}"
-            CHANGED=1
-        fi
-    done < "$USER_DB"
+    NEW_EXPIRE=$(expire_noon_str "$DAYS")
+    [[ -z "$NEW_EXPIRE" ]] && { error "到期时间计算失败"; return; }
 
-    if [[ $CHANGED -eq 1 ]]; then
-        # 批量更新 db：一次 python 调用完成所有到期用户状态变更
-        BATCH_UUIDS="$EXPIRED_UUIDS" DB_PATH="$USER_DB" python3 - <<'PYEOF'
-import os
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
+    local STATUS NODE
+    STATUS=$(get_user_field "$USERNAME" 4)
+    NODE=$(get_user_field "$USERNAME" 5)
+    NODE=${NODE:-both}
+    STATUS=${STATUS:-active}
+
+    # 更新 db（续期后恢复为 active）
+    python3 - <<PYEOF
 from pathlib import Path
-uuids = set(os.environ["BATCH_UUIDS"].split())
-p = Path(os.environ["DB_PATH"])
+p = Path("$USER_DB")
 lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     parts = line.split(":")
-    if len(parts) >= 2 and parts[1] in uuids:
-        if len(parts) < 5:
-            parts += ["both"] * (5 - len(parts))
-        parts[3] = "disabled"
-        out.append(":".join(parts[:5]))
+    if len(parts) >= 2 and parts[0] == "$USERNAME" and parts[1] == "$UUID":
+        out.append("$USERNAME:$UUID:$NEW_EXPIRE:active:$NODE")
     else:
         out.append(line)
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
-        # 批量从 config.json 移除到期用户
-        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$XRAY_CONFIG" python3 - <<'PYEOF'
-import json, os
-expired = set(os.environ["BATCH_UUIDS"].split())
-cfg_path = os.environ["CFG_PATH"]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-for inbound in cfg["inbounds"]:
-    if "clients" not in inbound.get("settings", {}):
-        continue
-    inbound["settings"]["clients"] = [
-        c for c in inbound["settings"]["clients"] if c.get("id") not in expired
-    ]
-with open(cfg_path, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
-PYEOF
+    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
+    validate_sbox_config && systemctl restart "$SERVICE_NAME"
 
-        validate_xray_config && systemctl restart xray
-        info "已重启 Xray"
+    if [[ "$STATUS" == "disabled" ]]; then
+        info "用户 ${USERNAME} 到期已更新为 ${NEW_EXPIRE}，已自动恢复启用"
     else
-        info "没有到期用户"
+        info "用户 ${USERNAME} 到期已更新为 ${NEW_EXPIRE}"
     fi
 }
 
 # ============================================================
-# 列出用户
+# 列出用户（完整版）
 # ============================================================
 list_users() {
     title "用户列表"
@@ -1511,9 +1316,7 @@ list_users() {
     echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
     while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
         NODE=${NODE:-both}
-        local COLOR=$NC
-        local STATUS_ICON="○"
-        local EXPIRE_SHOW
+        local COLOR=$NC STATUS_ICON="○" EXPIRE_SHOW
         EXPIRE_SHOW=$(expire_display "$EXPIRE")
         if [[ "$STATUS" == "active" ]]; then
             COLOR=$GREEN; STATUS_ICON="●"
@@ -1526,6 +1329,9 @@ list_users() {
     echo ""
 }
 
+# ============================================================
+# 列出用户（简略版）
+# ============================================================
 list_users_brief() {
     normalize_user_db
     echo ""
@@ -1550,8 +1356,7 @@ show_user_link() {
     validate_username "$USERNAME" || return
 
     if ! user_exists "$USERNAME"; then
-        error "用户不存在"
-        return
+        error "用户不存在"; return
     fi
 
     local UUID EXPIRE NODE STATUS
@@ -1563,71 +1368,116 @@ show_user_link() {
     NODE=${NODE:-both}
 
     if [[ "$STATUS" == "disabled" ]]; then
-        warn "用户 ${USERNAME} 当前已禁用，链接仍可查看但节点不会响应"
+        warn "用户 ${USERNAME} 当前已禁用"
     fi
 
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
 
 # ============================================================
-# 主机信息
+# 到期检查（cron 调用）
 # ============================================================
-show_host_status() {
-    local PUBLIC_IP LOAD_INFO MEM_INFO
+check_expire() {
+    title "检查到期用户..."
+    normalize_user_db
+    local NOW_TS
+    NOW_TS=$(now_shanghai_ts)
+    local CHANGED=0
+    local EXPIRED_UUIDS=""
 
-    PUBLIC_IP=$(get_public_ip)
-    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
+    [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
-    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+        [[ "$STATUS" != "active" ]] && continue
+        local EXPIRE_TS
+        EXPIRE_TS=$(expire_to_ts "$EXPIRE")
+        [[ -z "$EXPIRE_TS" ]] && continue
+        if (( NOW_TS >= EXPIRE_TS )); then
+            warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），自动禁用"
+            EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
+            CHANGED=1
+        fi
+    done < "$USER_DB"
 
-    cat <<EOF
-║  IP   ${PUBLIC_IP}
-║  负载 ${LOAD_INFO}  内存 ${MEM_INFO}
-EOF
+    if [[ $CHANGED -eq 1 ]]; then
+        # 批量更新 db
+        BATCH_UUIDS="$EXPIRED_UUIDS" DB_PATH="$USER_DB" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+uuids = set(os.environ["BATCH_UUIDS"].split())
+p = Path(os.environ["DB_PATH"])
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = []
+for line in lines:
+    parts = line.split(":")
+    if len(parts) >= 2 and parts[1] in uuids:
+        if len(parts) < 5:
+            parts += ["both"] * (5 - len(parts))
+        parts[3] = "disabled"
+        out.append(":".join(parts[:5]))
+    else:
+        out.append(line)
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+
+        # 批量从 config.json 移除
+        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$SBOX_CONFIG" python3 - <<'PYEOF'
+import json, os
+expired = set(os.environ["BATCH_UUIDS"].split())
+with open(os.environ["CFG_PATH"], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for inbound in cfg.get("inbounds", []):
+    users = inbound.get("users")
+    if users is None:
+        continue
+    inbound["users"] = [u for u in users if u.get("uuid") not in expired]
+with open(os.environ["CFG_PATH"], "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+
+        validate_sbox_config && systemctl restart "$SERVICE_NAME"
+        info "已重启 sing-box"
+    else
+        info "没有到期用户"
+    fi
 }
 # ============================================================
-# ============================================================
-# 节点信息
+# 节点信息展示
 # ============================================================
 show_info() {
     title "节点信息"
     load_meta
     normalize_user_db
 
-    local XRAY_STATUS USER_COUNT ACTIVE_COUNT
+    local SBOX_STATUS USER_COUNT ACTIVE_COUNT
     local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
 
-    XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
+    SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
     USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
     ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
     PUBLIC_IP=$(get_public_ip)
     LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    [[ -z "$LOAD_INFO" ]] && LOAD_INFO="N/A"
-
     MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$MEM_INFO" ]] && MEM_INFO="N/A"
-
     SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
-    [[ -z "$SWAP_INFO" ]] && SWAP_INFO="N/A"
-
     UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
-    [[ -z "$UPTIME_INFO" ]] && UPTIME_INFO="N/A"
 
-    echo -e "状态   : $( [[ "$XRAY_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+    echo -e "状态   : $( [[ "$SBOX_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
     echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
     echo -e "公网IP : ${PUBLIC_IP}"
-    echo -e "负载   : ${LOAD_INFO}"
-    echo -e "内存   : ${MEM_INFO}"
-    echo -e "交换   : ${SWAP_INFO}"
-    echo -e "在线   : ${UPTIME_INFO}"
+    echo -e "负载   : ${LOAD_INFO:-N/A}  内存 ${MEM_INFO:-N/A}  交换 ${SWAP_INFO:-N/A}"
+    echo -e "在线   : ${UPTIME_INFO:-N/A}"
     echo ""
 
     if has_reality; then
         local SHORTID
-        SHORTID=$(python3 -c "import json; d=json.load(open('$XRAY_CONFIG', encoding='utf-8')); [print(i['streamSettings']['realitySettings']['shortIds'][0]) for i in d['inbounds'] if i.get('tag')=='inbound-reality']" 2>/dev/null)
+        SHORTID=$(python3 -c "
+import json
+d=json.load(open('$SBOX_CONFIG', encoding='utf-8'))
+for i in d.get('inbounds',[]):
+    if i.get('tag')=='inbound-reality':
+        print(i['tls']['reality']['short_id'][0]); break
+" 2>/dev/null)
         echo -e "${CYAN}── Reality 节点 ──${NC}"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${REALITY_PORT}"
@@ -1637,13 +1487,12 @@ show_info() {
         echo -e "协议   : VLESS+Reality+TCP"
         if [[ -f "$USER_DB" ]]; then
             echo -e "${CYAN}分享链接:${NC}"
-            local RNAME RUUID REXP RSTATUS RNODE RLINK
+            local RNAME RUUID REXP RSTATUS RNODE
             while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE; do
                 [[ "$RSTATUS" != "active" ]] && continue
                 RNODE=${RNODE:-both}
                 [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
-                RLINK="vless://${RUUID}@${PUBLIC_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${RNAME}-reality"
-                echo "[${RNAME}] ${RLINK}"
+                echo "[${RNAME}] vless://${RUUID}@${PUBLIC_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${RNAME}-reality"
             done < "$USER_DB"
         fi
         echo ""
@@ -1658,7 +1507,6 @@ show_info() {
         echo -e "端口   : ${SS_PORT}"
         echo -e "加密   : ${SS_METHOD}"
         echo -e "密码   : ${SS_PASSWORD}"
-        echo -e "协议   : Shadowsocks"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$SS_LINK_SHOW"
         echo ""
@@ -1674,182 +1522,141 @@ show_info() {
     fi
 
     if has_hy2; then
-        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_VER_SHOW HY2_LINK_SHOW
-        HY2_STATUS=$(systemctl is-active "$HY2_SERVICE" 2>/dev/null)
-        HY2_PORT_SHOW=$(read_kv "$HY2_META" "HY2_PORT")
-        HY2_PASSWORD_SHOW=$(read_kv "$HY2_META" "HY2_PASSWORD")
-        HY2_SNI_SHOW=$(read_kv "$HY2_META" "HY2_SNI")
-        HY2_VER_SHOW=$("$HY2_BIN" version 2>/dev/null | head -1)
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_LINK_SHOW
+        HY2_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
+        HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
+        HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
         HY2_LINK_SHOW="hy2://${HY2_PASSWORD_SHOW}@${PUBLIC_IP}:${HY2_PORT_SHOW}/?sni=${HY2_SNI_SHOW}&insecure=1#Hysteria2-${HY2_PORT_SHOW}"
-        echo -e "${CYAN}── Hysteria2 节点（独立进程）──${NC}"
+        echo -e "${CYAN}── Hysteria2 节点 ──${NC}"
         echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${HY2_PORT_SHOW} (UDP)"
         echo -e "密码   : ${HY2_PASSWORD_SHOW}"
         echo -e "SNI    : ${HY2_SNI_SHOW}"
-        echo -e "内核   : ${HY2_VER_SHOW:-未知}（菜单18可一键更新）"
-        echo -e "协议   : Hysteria2（自签名证书，客户端需 insecure）"
+        echo -e "协议   : Hysteria2（自签名，客户端需 insecure）"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$HY2_LINK_SHOW"
         echo ""
     fi
 
     if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2; then
-        warn "尚未配置任何节点，请选择菜单 2 初始化"
+        warn "尚未配置任何节点"
     fi
 }
-# ============================================================
-# 设置 cron
-# ============================================================
-setup_cron() {
-    SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    EXPIRE_CMD="*/5 * * * * /usr/local/bin/vless_script.sh --check-expire >> /var/log/xray-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
-    info "已设置每 5 分钟自动检查到期用户（上海时间）"
 
-    mkdir -p /var/log/xray
+# ============================================================
+# 更新 sing-box
+# ============================================================
+update_sbox() {
+    title "更新 sing-box..."
+    local CURRENT_VER
+    CURRENT_VER=$("$SBOX_BIN" version 2>/dev/null | awk '{print $NF}')
+    info "当前版本: ${CURRENT_VER:-未知}"
+    info "正在更新..."
 
-    cat > /etc/logrotate.d/xray-expire <<EOF
-/var/log/xray-expire.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 root root
-}
-EOF
-    cat > /etc/logrotate.d/xray <<EOF
-/var/log/xray/*.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 nobody root
-    postrotate
-        systemctl kill -s USR1 xray 2>/dev/null || true
-    endscript
-}
-EOF
-    info "已配置日志自动轮转（每周轮转，保留4周）"
+    bash <(curl -fsSL https://sing-box.app/deb-install.sh) 2>/dev/null
+    local NEW_VER
+    NEW_VER=$("$SBOX_BIN" version 2>/dev/null | awk '{print $NF}')
+    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
+        info "已是最新版本: ${NEW_VER:-未知}"
+    else
+        info "更新完成: ${CURRENT_VER:-未知} → ${NEW_VER:-未知}"
+    fi
+    systemctl restart "$SERVICE_NAME"
+    info "sing-box 已重启"
 }
 
 # ============================================================
-# Telegram 机器人与流量统计
+# 更新脚本
+# ============================================================
+update_script() {
+    title "更新管理脚本..."
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/singbox-manager.sh"
+    info "正在从 GitHub 拉取最新版本..."
+    local TMP_SCRIPT="/tmp/singbox_new.sh"
+    curl -sL "$SCRIPT_URL" -o "$TMP_SCRIPT"
+    if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
+        error "下载失败，请检查网络"; return
+    fi
+    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
+        error "脚本语法错误，取消更新"; rm -f "$TMP_SCRIPT"; return
+    fi
+    cp "$TMP_SCRIPT" /usr/local/bin/singbox_manager.sh
+    chmod +x /usr/local/bin/singbox_manager.sh
+    rm -f "$TMP_SCRIPT"
+    info "脚本已更新"
+    info "正在重新启动新版本..."
+    sleep 1
+    exec bash /usr/local/bin/singbox_manager.sh
+}
+
+# ============================================================
+# Telegram 机器人内嵌脚本提取
 # ============================================================
 extract_telegram_runtime() {
-    mkdir -p "$TG_DIR" /etc/vless-manager /usr/local/etc/xray
+    mkdir -p "$SBOX_DIR" /etc/vless-manager
     awk '
-        /^###__VLESS_TG_BOT_PY__###$/ {inside=1; next}
-        /^###__END_VLESS_TG_BOT_PY__###$/ {inside=0; exit}
+        /^###__SBOX_TG_BOT_PY__###$/ {inside=1; next}
+        /^###__END_SBOX_TG_BOT_PY__###$/ {inside=0; exit}
         inside {sub(/^#TG\|/, ""); print}
-    ' "$0" > "$TG_SCRIPT"
-    [[ -s "$TG_SCRIPT" ]] || { error "机器人程序提取失败"; return 1; }
-    chmod 700 "$TG_SCRIPT"
+    ' "$0" > /etc/vless-manager/sbox_tg_bot.py
+    [[ -s /etc/vless-manager/sbox_tg_bot.py ]] || { error "机器人程序提取失败"; return 1; }
+    chmod 700 /etc/vless-manager/sbox_tg_bot.py
 }
 
-enable_xray_stats() {
-    [[ -f "$XRAY_CONFIG" ]] || { error "Xray 配置不存在"; return 1; }
-    local TMP_CONFIG BACKUP_CONFIG
-    TMP_CONFIG=$(mktemp /tmp/xray-stats.XXXXXX.json) || return 1
-    BACKUP_CONFIG="${XRAY_CONFIG}.pre-telegram.$(date +%s).bak"
-    cp "$XRAY_CONFIG" "$BACKUP_CONFIG" || { rm -f "$TMP_CONFIG"; return 1; }
-
-    XRAY_STATS_SOURCE="$XRAY_CONFIG" XRAY_STATS_TARGET="$TMP_CONFIG" python3 - <<'PYEOF'
-import json, os
-src = os.environ["XRAY_STATS_SOURCE"]
-dst = os.environ["XRAY_STATS_TARGET"]
-with open(src, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-cfg["stats"] = {}
-levels = cfg.setdefault("policy", {}).setdefault("levels", {})
-level0 = levels.setdefault("0", {})
-level0["statsUserUplink"] = True
-level0["statsUserDownlink"] = True
-api = cfg.setdefault("api", {})
-api.setdefault("tag", "api")
-api.setdefault("listen", "127.0.0.1:10085")
-services = set(api.get("services", []))
-services.add("StatsService")
-api["services"] = sorted(services)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-PYEOF
-    if [[ $? -ne 0 ]] || ! "$XRAY_BIN" run -test -config "$TMP_CONFIG" >/dev/null 2>&1; then
-        rm -f "$TMP_CONFIG"
-        error "开启流量统计失败，原配置未修改"
-        return 1
-    fi
-    cp "$TMP_CONFIG" "$XRAY_CONFIG"
-    rm -f "$TMP_CONFIG"
-    systemctl restart xray
-    systemctl is-active --quiet xray || {
-        cp "$BACKUP_CONFIG" "$XRAY_CONFIG"
-        systemctl restart xray
-        error "Xray 启动失败，已恢复原配置"
-        return 1
-    }
-    info "已在现有配置上开启 Xray 用户流量统计"
-}
-
+# ============================================================
+# 安装 Telegram 机器人（精简版：仅管理+延迟，无流量统计）
+# ============================================================
 install_telegram_bot() {
-    title "安装 Telegram 智能管家"
-    command -v python3 >/dev/null 2>&1 || { error "缺少 python3，请先安装依赖"; return 1; }
-    [[ -x "$XRAY_BIN" ]] || { error "请先安装 Xray"; return 1; }
+    title "安装 Telegram 管理机器人"
+    command -v python3 >/dev/null 2>&1 || { error "缺少 python3"; return 1; }
+    [[ -x "$SBOX_BIN" ]] || { error "请先安装 sing-box"; return 1; }
 
     local BOT_TOKEN BOT_INFO BOT_USERNAME BIND_TOKEN BIND_URL
-    read -rsp "输入 Bot Token（输入内容不会显示）: " BOT_TOKEN
+    read -rsp "输入 Bot Token（不显示）: " BOT_TOKEN
     echo ""
-    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { error "Bot Token 格式不正确"; return 1; }
+    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { error "Token 格式不正确"; return 1; }
 
     BOT_INFO=$(curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null) || {
-        error "无法验证 Bot Token，请检查 Token 和服务器网络"
-        return 1
+        error "无法验证 Token，请检查网络"; return 1
     }
-    BOT_USERNAME=$(BOT_INFO="$BOT_INFO" python3 - <<'PYEOF'
+    BOT_USERNAME=$(BOT_INFO="$BOT_INFO" python3 -c "
 import json, os
-try:
-    data = json.loads(os.environ["BOT_INFO"])
-    print(data["result"]["username"] if data.get("ok") else "")
-except (KeyError, TypeError, json.JSONDecodeError):
-    print("")
-PYEOF
-)
-    [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,}$ ]] || { error "Token 验证失败，未取得机器人用户名"; return 1; }
+data = json.loads(os.environ['BOT_INFO'])
+print(data['result']['username'] if data.get('ok') else '')
+" 2>/dev/null)
+    [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,}$ ]] || { error "Token 验证失败"; return 1; }
 
-    # 注册 Telegram 命令快捷键（/ 弹出的命令菜单）
+    # 注册命令菜单
     curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
-        -d '{"commands":[{"command":"start","description":"帮助 / 命令列表"},{"command":"users","description":"用户与到期概览"},{"command":"user","description":"用户详情与流量：/user 用户名"},{"command":"today","description":"今日全部流量"},{"command":"month","description":"本月全部流量"},{"command":"report","description":"全部用户流量报告"},{"command":"ping","description":"延迟测试（含三网 TCP）"},{"command":"expiring","description":"7天内到期用户"},{"command":"status","description":"机器人状态"}]}' \
-        >/dev/null 2>&1 && info "已注册 Telegram 命令快捷键" || warn "命令快捷键注册失败（不影响使用）"
+        -d '{"commands":[{"command":"start","description":"帮助"},{"command":"users","description":"用户列表"},{"command":"user","description":"用户详情：/user 用户名"},{"command":"expiring","description":"7天内到期用户"},{"command":"ping","description":"延迟测试"},{"command":"status","description":"机器人状态"}]}' \
+        >/dev/null 2>&1 && info "已注册命令快捷键" || warn "命令快捷键注册失败"
 
     BIND_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
     BIND_URL="https://t.me/${BOT_USERNAME}?start=${BIND_TOKEN}"
 
     extract_telegram_runtime || return 1
-    cat > "$TG_CONFIG" <<EOF
+
+    cat > /etc/vless-manager/bot.conf <<EOF
 BOT_TOKEN=${BOT_TOKEN}
 ADMIN_CHAT_IDS=
 BIND_TOKEN=${BIND_TOKEN}
 USER_DB=${USER_DB}
-TRAFFIC_DB=${TRAFFIC_DB}
-XRAY_BIN=${XRAY_BIN}
-COLLECT_INTERVAL=60
-REPORT_INTERVAL=3600
 PING_INTERVAL=600
 PING_HOST=1.1.1.1
 EOF
-    chmod 600 "$TG_CONFIG"
+    chmod 600 /etc/vless-manager/bot.conf
 
-    cat > /etc/systemd/system/vless-traffic.service <<EOF
+    cat > /etc/systemd/system/sbox-tgbot.service <<EOF
 [Unit]
-Description=VLESS per-user traffic collector
-After=network-online.target xray.service
+Description=sing-box VLESS Telegram bot
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${TG_SCRIPT} --config ${TG_CONFIG} --collector
+ExecStart=/usr/bin/python3 /etc/vless-manager/sbox_tg_bot.py --config /etc/vless-manager/bot.conf
 Restart=always
 RestartSec=5
 User=root
@@ -1858,7 +1665,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/usr/local/etc/xray
+ReadWritePaths=/etc/sing-box /etc/vless-manager
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -1869,93 +1676,66 @@ LockPersonality=true
 WantedBy=multi-user.target
 EOF
 
-    cat > /etc/systemd/system/vless-tgbot.service <<EOF
-[Unit]
-Description=VLESS Telegram management bot
-After=network-online.target vless-traffic.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ${TG_SCRIPT} --config ${TG_CONFIG}
-Restart=always
-RestartSec=5
-User=root
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/usr/local/etc/xray /etc/vless-manager
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    enable_xray_stats || return 1
-    chmod 600 "$USER_DB" 2>/dev/null || true
-    touch "$TRAFFIC_DB"
-    chmod 600 "$TRAFFIC_DB"
     systemctl daemon-reload
-    systemctl enable vless-traffic.service vless-tgbot.service >/dev/null 2>&1
-    systemctl restart vless-traffic.service vless-tgbot.service
+    systemctl enable sbox-tgbot.service >/dev/null 2>&1
+    systemctl restart sbox-tgbot.service
     sleep 2
-    if systemctl is-active --quiet vless-traffic.service && systemctl is-active --quiet vless-tgbot.service; then
-        info "Telegram 机器人和流量采集器已启动"
+
+    if systemctl is-active --quiet sbox-tgbot.service; then
+        info "Telegram 机器人已启动"
         echo ""
         title "扫码绑定 Telegram"
-        if ! command -v qrencode >/dev/null 2>&1; then
-            info "正在安装二维码工具..."
-            apt-get update -qq && apt-get install -y -qq qrencode >/dev/null 2>&1 || true
-        fi
-        if command -v qrencode >/dev/null 2>&1; then
+        if command -v qrencode >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq qrencode >/dev/null 2>&1); then
             qrencode -t ANSIUTF8 "$BIND_URL"
         else
-            warn "二维码工具安装失败，请直接打开下方链接"
+            warn "请直接打开下方链接"
         fi
         echo -e "  ${CYAN}${BIND_URL}${NC}"
         echo ""
-        info "用 Telegram 扫码或打开链接，再点击“开始”即可完成绑定"
-        warn "绑定链接仅可使用一次；重新配置机器人会生成新链接"
-        warn "首次启用统计后，从现在开始记录流量；无法补算以前的流量"
+        info "用 Telegram 扫码或打开链接，点击"开始"完成绑定"
+        warn "绑定链接仅可使用一次"
     else
-        error "服务启动失败，请选择“查看机器人日志”排查"
+        error "服务启动失败，运行 journalctl -u sbox-tgbot -n 20 查看"
         return 1
     fi
 }
 
+# ============================================================
+# Telegram 服务状态 / 日志
+# ============================================================
 telegram_bot_status() {
     title "Telegram 服务状态"
-    systemctl --no-pager --full status vless-tgbot.service vless-traffic.service 2>/dev/null || true
+    systemctl --no-pager --full status sbox-tgbot.service 2>/dev/null || true
 }
 
 telegram_bot_logs() {
     title "Telegram 最近日志"
-    journalctl -u vless-tgbot.service -u vless-traffic.service -n 60 --no-pager
+    journalctl -u sbox-tgbot.service -n 40 --no-pager
 }
 
+# ============================================================
+# 卸载 Telegram 机器人
+# ============================================================
 uninstall_telegram_bot() {
-    read -rp "确认卸载机器人？流量历史默认保留 [y/N]: " C
+    read -rp "确认卸载机器人？[y/N]: " C
     [[ "$C" != "y" && "$C" != "Y" ]] && return
-    systemctl disable --now vless-tgbot.service vless-traffic.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/vless-tgbot.service /etc/systemd/system/vless-traffic.service
-    rm -rf "$TG_DIR" /etc/vless-manager
+    systemctl disable --now sbox-tgbot.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sbox-tgbot.service
+    rm -rf /etc/vless-manager
     systemctl daemon-reload
-    info "机器人已卸载，流量数据库仍保留在 ${TRAFFIC_DB}"
+    info "机器人已卸载"
 }
 
+# ============================================================
+# Telegram 机器人子菜单
+# ============================================================
 telegram_bot_menu() {
     while true; do
         clear
-        title "Telegram 机器人与流量统计"
-        echo -e "  ${GREEN}1.${NC} 安装 / 重新配置机器人"
+        title "Telegram 机器人"
+        echo -e "  ${GREEN}1.${NC} 安装 / 重新配置"
         echo -e "  ${GREEN}2.${NC} 查看运行状态"
-        echo -e "  ${GREEN}3.${NC} 重启机器人与采集器"
+        echo -e "  ${GREEN}3.${NC} 重启机器人"
         echo -e "  ${GREEN}4.${NC} 查看最近日志"
         echo -e "  ${RED}5.${NC} 卸载机器人"
         echo -e "  ${GREEN}0.${NC} 返回主菜单"
@@ -1964,7 +1744,7 @@ telegram_bot_menu() {
         case "$TG_OPT" in
             1) install_telegram_bot ;;
             2) telegram_bot_status ;;
-            3) systemctl restart vless-traffic.service vless-tgbot.service && info "服务已重启" ;;
+            3) systemctl restart sbox-tgbot.service && info "已重启" ;;
             4) telegram_bot_logs ;;
             5) uninstall_telegram_bot ;;
             0) return ;;
@@ -1973,240 +1753,43 @@ telegram_bot_menu() {
         echo ""; read -rp "按 Enter 继续..." _
     done
 }
-
-# ============================================================
-# IP 优先级设置 — 通过 Xray freedom domainStrategy 控制
-# gai.conf 对 Xray 无效，必须在 config.json 中设置
-# ============================================================
-
-# ------------------------------------------------------------
-# IP_PRIORITY 统一保存在 $META（meta.conf）中，不与 $META_REALITY
-# 混存 —— 因为 init_reality() 重新配置节点时会用 `cat >` 整体覆盖
-# $META_REALITY，混存会导致每次重建 Reality 节点后 IP 优先级设置
-# 被静默清空、悄悄回退成 AsIs。这里同时保留对旧版本残留数据
-# （曾经错误地存在 $META_REALITY 里）的读取兼容，避免升级脚本后
-# 已有用户的设置丢失。
-# ------------------------------------------------------------
-_read_ip_priority() {
-    local ds=""
-    [[ -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
-    [[ -z "$ds" && -f "$META_REALITY" ]] && ds=$(read_kv "$META_REALITY" "IP_PRIORITY")
-    echo "$ds"
-}
-
-get_ip_priority_mode() {
-    local ds
-    ds=$(_read_ip_priority)
-    case "$ds" in
-        UseIPv4v6) echo "IPv4 优先（v4失败自动切v6）" ;;
-        UseIPv6v4) echo "IPv6 优先（v6失败自动切v4）" ;;
-        UseIPv4)   echo "仅 IPv4" ;;
-        UseIPv6)   echo "仅 IPv6" ;;
-        *)         echo "系统默认（AsIs）" ;;
-    esac
-}
-
-_save_ip_priority() {
-    local ds="$1"
-    mkdir -p "$(dirname "$META")"
-    touch "$META"
-    if grep -q "^IP_PRIORITY=" "$META" 2>/dev/null; then
-        sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$META"
-    else
-        echo "IP_PRIORITY=${ds}" >> "$META"
-    fi
-    # 清掉旧版本可能残留在 META_REALITY 里的设置，避免两处数据不一致
-    [[ -f "$META_REALITY" ]] && sed -i '/^IP_PRIORITY=/d' "$META_REALITY"
-}
-
-# Xray domainStrategy -> Hysteria2 outbounds.direct.mode 的映射
-# 两者语义一一对应，用同一份 IP_PRIORITY 驱动两个协议
-_ip_priority_to_hy2_mode() {
-    case "$1" in
-        UseIPv4v6) echo "46" ;;   # IPv4 优先，失败切 v6
-        UseIPv6v4) echo "64" ;;   # IPv6 优先，失败切 v4
-        UseIPv4)   echo "4" ;;    # 仅 IPv4
-        UseIPv6)   echo "6" ;;    # 仅 IPv6
-        *)         echo "auto" ;; # 系统默认，双栈 happy-eyeballs
-    esac
-}
-
-ip_priority_menu() {
-    title "网络优先级（IPv4/IPv6）"
-    load_meta
-
-    local CURRENT_MODE
-    CURRENT_MODE=$(get_ip_priority_mode)
-
-    echo ""
-    echo -e "当前模式：${CYAN}${CURRENT_MODE}${NC}"
-    echo -e "${YELLOW}（该设置对 Reality / Shadowsocks / Hysteria2 统一生效）${NC}"
-    echo ""
-    echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
-    echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
-    echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4，v6 完全不用"
-    echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6，v4 完全不用"
-    echo -e "  ${GREEN}5.${NC} 系统默认   — 由各协议自动决定（AsIs / auto）"
-    echo -e "  ${GREEN}0.${NC} 返回"
-    echo ""
-    read -rp "选择: " OPT
-
-    local DS=""
-    local DESC=""
-    case "$OPT" in
-        1) DS="UseIPv4v6"; DESC="IPv4 优先" ;;
-        2) DS="UseIPv6v4"; DESC="IPv6 优先" ;;
-        3) DS="UseIPv4";   DESC="仅 IPv4" ;;
-        4) DS="UseIPv6";   DESC="仅 IPv6" ;;
-        5) DS="AsIs";      DESC="系统默认" ;;
-        0) return ;;
-        *) warn "无效选项"; return ;;
-    esac
-
-    _save_ip_priority "$DS"
-
-    if has_reality || has_shadowsocks || has_ws; then
-        rebuild_config
-        _inject_all_users
-        _start_xray
-    fi
-
-    if has_hy2; then
-        _rebuild_hy2_config
-    fi
-
-    echo ""
-    info "已生效：${DESC}"
-}
-
-# ============================================================
-# 一键更新 Xray
-# ============================================================
-update_xray() {
-    title "更新 Xray..."
-    local CURRENT_VER
-    CURRENT_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
-    info "当前版本: ${CURRENT_VER}"
-    info "正在下载最新版本..."
-
-    [[ -f "$XRAY_CONFIG" ]] && cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
-    curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh
-    bash /tmp/xray-install.sh install
-
-    [[ -f "${XRAY_CONFIG}.bak" ]] && mv "${XRAY_CONFIG}.bak" "$XRAY_CONFIG" && info "已恢复原配置"
-
-    validate_xray_config || {
-        error "恢复后的配置校验失败，已取消重启"
-        return 1
-    }
-
-    local NEW_VER
-    NEW_VER=$($XRAY_BIN -version 2>/dev/null | awk 'NR==1{print $2}')
-    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
-        info "已是最新版本: ${NEW_VER}"
-    else
-        info "更新完成: ${CURRENT_VER} → ${NEW_VER}"
-    fi
-    systemctl restart xray
-    info "Xray 已重启"
-}
-
-# ============================================================
-# 一键更新 Hysteria2 内核到官方最新版
-# 只更新二进制，不改动 config.yaml / 证书 / 密码，更新后自动重启
-# ============================================================
-update_hy2() {
-    title "更新 Hysteria2 内核..."
-
-    if [[ ! -x "$HY2_BIN" ]]; then
-        error "尚未安装 Hysteria2，请先在菜单 2 中配置"
-        return 1
-    fi
-    if ! command -v curl >/dev/null 2>&1; then
-        error "缺少 curl，请先执行: apt update && apt install -y curl"
-        return 1
-    fi
-
-    local CURRENT_VER NEW_VER
-    CURRENT_VER=$("$HY2_BIN" version 2>/dev/null | head -1)
-    info "当前版本: ${CURRENT_VER:-未知}"
-    info "正在从官方渠道 (get.hy2.sh) 下载最新版本..."
-
-    bash <(curl -fsSL https://get.hy2.sh/)
-
-    if [[ ! -x "$HY2_BIN" ]]; then
-        error "更新失败，Hysteria2 二进制丢失，请检查网络连接后重试"
-        return 1
-    fi
-
-    NEW_VER=$("$HY2_BIN" version 2>/dev/null | head -1)
-    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
-        info "已是最新版本: ${NEW_VER:-未知}"
-    else
-        info "更新完成: ${CURRENT_VER:-未知} → ${NEW_VER:-未知}"
-    fi
-
-    if has_hy2; then
-        systemctl restart "$HY2_SERVICE"
-        sleep 1
-        if systemctl is-active --quiet "$HY2_SERVICE"; then
-            info "Hysteria2 服务已重启，配置/证书/密码均未改动"
-        else
-            error "Hysteria2 重启失败，运行 journalctl -u ${HY2_SERVICE} -n 20 查看日志"
-            return 1
-        fi
-    else
-        info "当前未配置 Hysteria2 节点，内核已更新，暂无运行中的服务"
-    fi
-}
-
-# ============================================================
-# 更新脚本到最新版本
-# ============================================================
-update_script() {
-    title "更新管理脚本..."
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-    info "正在从 GitHub 拉取最新版本..."
-    local TMP_SCRIPT="/tmp/vless_new.sh"
-    curl -sL "$SCRIPT_URL" -o "$TMP_SCRIPT"
-    if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
-        error "下载失败，请检查网络"
-        return
-    fi
-    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
-        error "脚本语法错误，取消更新"
-        rm -f "$TMP_SCRIPT"
-        return
-    fi
-    cp "$TMP_SCRIPT" /usr/local/bin/vless_script.sh
-    chmod +x /usr/local/bin/vless_script.sh
-    rm -f "$TMP_SCRIPT"
-    info "脚本已更新，用户数据完整保留"
-    info "正在重新启动新版本..."
-    sleep 1
-    exec bash /usr/local/bin/vless_script.sh
-}
-
 # ============================================================
 # 安装快捷命令 c
 # ============================================================
 install_shortcut() {
     local SELF_PATH
     SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [[ "$SELF_PATH" != "/usr/local/bin/vless_script.sh" ]]; then
-        local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
-        curl -sL "$SCRIPT_URL" -o /usr/local/bin/vless_script.sh
-        if [[ $? -ne 0 || ! -s /usr/local/bin/vless_script.sh ]]; then
-            error "脚本下载失败，请检查网络后重试"
-            exit 1
-        fi
-        chmod +x /usr/local/bin/vless_script.sh
+    if [[ "$SELF_PATH" != "/usr/local/bin/singbox_manager.sh" ]]; then
+        cp "$SELF_PATH" /usr/local/bin/singbox_manager.sh
+        chmod +x /usr/local/bin/singbox_manager.sh
     fi
-    cat > /usr/local/bin/c <<EOF
+    cat > /usr/local/bin/c <<'EOF'
 #!/bin/bash
-bash /usr/local/bin/vless_script.sh
+bash /usr/local/bin/singbox_manager.sh
 EOF
     chmod +x /usr/local/bin/c
+}
+
+# ============================================================
+# 设置 cron 到期检查
+# ============================================================
+setup_cron() {
+    local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
+    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
+    info "已设置每 5 分钟自动检查到期用户"
+
+    mkdir -p /var/log
+    cat > /etc/logrotate.d/sbox-expire <<'EOF'
+/var/log/sbox-expire.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 0640 root root
+}
+EOF
+    info "已配置日志轮转"
 }
 
 # ============================================================
@@ -2219,7 +1802,6 @@ if [[ "$1" == "--check-expire" ]]; then
 fi
 
 # ============================================================
-# ============================================================
 # 主菜单
 # ============================================================
 main_menu() {
@@ -2228,34 +1810,32 @@ main_menu() {
         normalize_user_db
         load_meta
 
-        local XRAY_STATUS USER_COUNT
-        XRAY_STATUS=$(systemctl is-active xray 2>/dev/null)
+        local SBOX_STATUS USER_COUNT ACTIVE_COUNT
+        SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
         USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-        local ACTIVE_COUNT=0
-        [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+        ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
         local MODE_STR=""
-        has_reality && MODE_STR="Reality"
+        has_reality     && MODE_STR="Reality"
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
-        has_ws && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
-        has_hy2 && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
+        has_ws          && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
+        has_hy2         && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
 
-        local STATUS_COLOR=$RED
-        local STATUS_TEXT="● 已停止"
-        [[ "$XRAY_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
+        local STATUS_COLOR=$RED STATUS_TEXT="● 已停止"
+        [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         local TG_STATUS="未安装"
-        systemctl is-active --quiet vless-tgbot.service 2>/dev/null && TG_STATUS="运行中"
+        systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}       ${CYAN}VLESS 智能节点控制台  v6.6${NC}          ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.0${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  Xray ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
+        echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 节点中心${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 Xray 并配置节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 sing-box 并配置节点"
         echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加 / 移除协议节点"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 用户中心${NC}"
@@ -2264,21 +1844,20 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  用户续期          ${GREEN}8.${NC}  用户列表"
         echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}▣ 监控与机器人${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} 检查到期用户     ${GREEN}11.${NC} 节点运行信息"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} Telegram 机器人与流量统计"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ Telegram${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} Telegram 机器人管理"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 节点运行信息"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Xray        ${GREEN}14.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}15.${NC} IPv4 / IPv6 优先级"
-        echo -e "${BLUE}║${NC}   ${GREEN}17.${NC} 更新 Hysteria2 内核"
-        echo -e "${BLUE}║${NC}   ${RED}16.${NC} 卸载 Xray         ${RED}0.${NC}  退出"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 sing-box     ${GREEN}13.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} IPv4/IPv6 优先级  ${RED}15.${NC} 卸载 sing-box"
+        echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
         read -r OPT
 
         case $OPT in
-            1)  check_system; set_shanghai_timezone; install_xray; init_config; setup_cron ;;
+            1)  check_system; set_shanghai_timezone; install_sbox; init_config; setup_cron ;;
             2)  init_config ;;
             3)  add_user ;;
             4)  delete_user ;;
@@ -2287,16 +1866,14 @@ main_menu() {
             7)  renew_user ;;
             8)  list_users ;;
             9)  show_user_link ;;
-            10) check_expire ;;
+            10) telegram_bot_menu ;;
             11) show_info ;;
-            12) telegram_bot_menu ;;
-            13) update_xray ;;
-            14) update_script ;;
-            15) ip_priority_menu ;;
-            16) uninstall_xray ;;
-            17) update_hy2 ;;
+            12) update_sbox ;;
+            13) update_script ;;
+            14) ip_priority_menu ;;
+            15) uninstall_sbox ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
-            *)  warn "无效选项，请重新选择" ;;
+            *)  warn "无效选项" ;;
         esac
 
         echo ""
@@ -2305,26 +1882,27 @@ main_menu() {
     done
 }
 
+# ============================================================
+# 脚本入口
+# ============================================================
 check_system
 normalize_user_db
 install_shortcut
 main_menu
 
 
-###__VLESS_TG_BOT_PY__###
+###__SBOX_TG_BOT_PY__###
 #TG|#!/usr/bin/env python3
-#TG|"""VLESS Manager Telegram bot and Xray traffic collector (stdlib only)."""
+#TG|"""Sing-box VLESS Telegram management bot (no traffic stats)."""
 #TG|from __future__ import annotations
 #TG|
 #TG|import argparse
-#TG|import concurrent.futures
 #TG|import html
 #TG|import json
 #TG|import os
 #TG|import re
 #TG|import secrets
 #TG|import socket
-#TG|import sqlite3
 #TG|import subprocess
 #TG|import threading
 #TG|import time
@@ -2333,12 +1911,10 @@ main_menu
 #TG|import urllib.request
 #TG|from datetime import datetime
 #TG|from pathlib import Path
-#TG|from typing import Dict, Iterable, Optional, Tuple
+#TG|from typing import Optional
 #TG|
 #TG|DEFAULT_CONFIG = Path("/etc/vless-manager/bot.conf")
-#TG|DEFAULT_USERS = Path("/usr/local/etc/xray/users.db")
-#TG|DEFAULT_DB = Path("/usr/local/etc/xray/traffic.db")
-#TG|DEFAULT_XRAY = Path("/usr/local/bin/xray")
+#TG|DEFAULT_USERS = Path("/etc/sing-box/users.db")
 #TG|BIND_LOCK = threading.Lock()
 #TG|
 #TG|
@@ -2374,10 +1950,10 @@ main_menu
 #TG|    if not config.get("BOT_TOKEN"):
 #TG|        raise ValueError("请先配置 BOT_TOKEN")
 #TG|    if not config.get("ADMIN_CHAT_IDS") and not config.get("BIND_TOKEN"):
-#TG|        raise ValueError("机器人尚未绑定，请重新配置并扫描绑定二维码")
+#TG|        raise ValueError("机器人尚未绑定")
 #TG|
 #TG|
-#TG|def update_config_values(path: Path, values: dict[str, str]) -> None:
+#TG|def update_config_values(path: Path, values: dict) -> None:
 #TG|    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
 #TG|    pending = dict(values)
 #TG|    output = []
@@ -2387,7 +1963,7 @@ main_menu
 #TG|            output.append(f"{key}={pending.pop(key)}")
 #TG|        else:
 #TG|            output.append(line)
-#TG|    output.extend(f"{key}={value}" for key, value in pending.items())
+#TG|    output.extend(f"{k}={v}" for k, v in pending.items())
 #TG|    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
 #TG|    try:
 #TG|        tmp.write_text("\n".join(output) + "\n", encoding="utf-8")
@@ -2452,143 +2028,15 @@ main_menu
 #TG|        return None
 #TG|    now = now or datetime.now()
 #TG|    seconds = (dt - now).total_seconds()
-#TG|    if seconds <= 0:
-#TG|        return 0
-#TG|    return int((seconds + 86399) // 86400)
-#TG|
-#TG|
-#TG|def init_db(path: Path = DEFAULT_DB) -> None:
-#TG|    path.parent.mkdir(parents=True, exist_ok=True)
-#TG|    with sqlite3.connect(path, timeout=30) as db:
-#TG|        db.execute("PRAGMA busy_timeout=30000")
-#TG|        db.executescript("""
-#TG|        CREATE TABLE IF NOT EXISTS counters (
-#TG|            username TEXT PRIMARY KEY,
-#TG|            uplink INTEGER NOT NULL,
-#TG|            downlink INTEGER NOT NULL,
-#TG|            updated_at TEXT NOT NULL
-#TG|        );
-#TG|        CREATE TABLE IF NOT EXISTS traffic_daily (
-#TG|            day TEXT NOT NULL,
-#TG|            username TEXT NOT NULL,
-#TG|            uplink INTEGER NOT NULL DEFAULT 0,
-#TG|            downlink INTEGER NOT NULL DEFAULT 0,
-#TG|            PRIMARY KEY(day, username)
-#TG|        );
-#TG|        CREATE TABLE IF NOT EXISTS bot_state (
-#TG|            key TEXT PRIMARY KEY,
-#TG|            value TEXT NOT NULL
-#TG|        );
-#TG|        """)
-#TG|    try:
-#TG|        path.chmod(0o600)
-#TG|    except OSError:
-#TG|        pass
-#TG|
-#TG|
-#TG|def record_snapshot(path: Path, counters: Dict[str, Tuple[int, int]], now: Optional[datetime] = None) -> None:
-#TG|    """Persist positive deltas. A lower counter means Xray restarted; count from zero."""
-#TG|    init_db(path)
-#TG|    now = now or datetime.now()
-#TG|    stamp = now.isoformat(timespec="seconds")
-#TG|    day = now.strftime("%Y-%m-%d")
-#TG|    with sqlite3.connect(path, timeout=30) as db:
-#TG|        db.execute("PRAGMA busy_timeout=30000")
-#TG|        for username, values in counters.items():
-#TG|            current_up, current_down = max(0, int(values[0])), max(0, int(values[1]))
-#TG|            row = db.execute(
-#TG|                "SELECT uplink, downlink, updated_at FROM counters WHERE username=?", (username,)
-#TG|            ).fetchone()
-#TG|            if row is None:
-#TG|                delta_up = delta_down = 0
-#TG|            else:
-#TG|                try:
-#TG|                    gap = (now - datetime.fromisoformat(row[2])).total_seconds()
-#TG|                except (TypeError, ValueError):
-#TG|                    gap = 999999
-#TG|                if gap > 300:
-#TG|                    # A long collector outage cannot be split accurately by day.
-#TG|                    delta_up = delta_down = 0
-#TG|                else:
-#TG|                    delta_up = current_up - row[0] if current_up >= row[0] else current_up
-#TG|                    delta_down = current_down - row[1] if current_down >= row[1] else current_down
-#TG|            db.execute(
-#TG|                "INSERT INTO counters(username,uplink,downlink,updated_at) VALUES(?,?,?,?) "
-#TG|                "ON CONFLICT(username) DO UPDATE SET uplink=excluded.uplink, "
-#TG|                "downlink=excluded.downlink, updated_at=excluded.updated_at",
-#TG|                (username, current_up, current_down, stamp),
-#TG|            )
-#TG|            if delta_up or delta_down:
-#TG|                db.execute(
-#TG|                    "INSERT INTO traffic_daily(day,username,uplink,downlink) VALUES(?,?,?,?) "
-#TG|                    "ON CONFLICT(day,username) DO UPDATE SET "
-#TG|                    "uplink=uplink+excluded.uplink, downlink=downlink+excluded.downlink",
-#TG|                    (day, username, delta_up, delta_down),
-#TG|                )
-#TG|
-#TG|
-#TG|def _usage(path: Path, username: Optional[str], where: str, value: str) -> Tuple[int, int]:
-#TG|    init_db(path)
-#TG|    sql = f"SELECT COALESCE(SUM(uplink),0), COALESCE(SUM(downlink),0) FROM traffic_daily WHERE {where}"
-#TG|    args: list[object] = [value]
-#TG|    if username:
-#TG|        sql += " AND username=?"
-#TG|        args.append(username)
-#TG|    with sqlite3.connect(path, timeout=30) as db:
-#TG|        row = db.execute(sql, args).fetchone()
-#TG|    return int(row[0]), int(row[1])
-#TG|
-#TG|
-#TG|def usage_for_day(path: Path, username: Optional[str], day: str) -> Tuple[int, int]:
-#TG|    return _usage(path, username, "day=?", day)
-#TG|
-#TG|
-#TG|def usage_for_month(path: Path, username: Optional[str], month: str) -> Tuple[int, int]:
-#TG|    return _usage(path, username, "substr(day,1,7)=?", month)
-#TG|
-#TG|
-#TG|def format_bytes(value: int) -> str:
-#TG|    amount = float(max(0, value))
-#TG|    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-#TG|    for unit in units:
-#TG|        if amount < 1024 or unit == units[-1]:
-#TG|            return f"{int(amount)} B" if unit == "B" else f"{amount:.2f} {unit}"
-#TG|        amount /= 1024
-#TG|    return "0 B"
-#TG|
-#TG|
-#TG|def parse_xray_stats(output: str) -> Dict[str, Tuple[int, int]]:
-#TG|    payload = json.loads(output)
-#TG|    found: dict[str, dict[str, int]] = {}
-#TG|    for stat in payload.get("stat", []):
-#TG|        match = re.fullmatch(r"user>>>(.+?)>>>traffic>>>(uplink|downlink)", str(stat.get("name", "")))
-#TG|        if not match:
-#TG|            continue
-#TG|        username, direction = match.groups()
-#TG|        found.setdefault(username, {})[direction] = max(0, int(stat.get("value", 0)))
-#TG|    return {
-#TG|        username: (values["uplink"], values["downlink"])
-#TG|        for username, values in found.items()
-#TG|        if "uplink" in values and "downlink" in values
-#TG|    }
-#TG|
-#TG|
-#TG|def query_xray_counters(xray_bin: Path = DEFAULT_XRAY, server: str = "127.0.0.1:10085") -> Dict[str, Tuple[int, int]]:
-#TG|    proc = subprocess.run(
-#TG|        [str(xray_bin), "api", "statsquery", f"--server={server}", "-pattern", "user>>>", "-reset=false"],
-#TG|        text=True, capture_output=True, timeout=20, check=False,
-#TG|    )
-#TG|    if proc.returncode != 0:
-#TG|        raise RuntimeError((proc.stderr or proc.stdout or "Xray Stats API 查询失败").strip())
-#TG|    return parse_xray_stats(proc.stdout)
+#TG|    return 0 if seconds <= 0 else int((seconds + 86399) // 86400)
 #TG|
 #TG|
 #TG|def tg_request(token: str, method: str, data: Optional[dict] = None) -> dict:
 #TG|    url = f"https://api.telegram.org/bot{token}/{method}"
 #TG|    encoded = urllib.parse.urlencode(data or {}).encode()
 #TG|    req = urllib.request.Request(url, data=encoded)
-#TG|    with urllib.request.urlopen(req, timeout=65) as response:
-#TG|        result = json.loads(response.read().decode("utf-8"))
+#TG|    with urllib.request.urlopen(req, timeout=65) as resp:
+#TG|        result = json.loads(resp.read().decode("utf-8"))
 #TG|    if not result.get("ok"):
 #TG|        raise RuntimeError(result.get("description", "Telegram API 错误"))
 #TG|    return result
@@ -2599,138 +2047,6 @@ main_menu
 #TG|        "chat_id": str(chat_id), "text": text, "parse_mode": "HTML",
 #TG|        "disable_web_page_preview": "true",
 #TG|    })
-#TG|
-#TG|
-#TG|def usage_text(db_path: Path, username: Optional[str] = None) -> str:
-#TG|    now = datetime.now()
-#TG|    today = usage_for_day(db_path, username, now.strftime("%Y-%m-%d"))
-#TG|    month = usage_for_month(db_path, username, now.strftime("%Y-%m"))
-#TG|    who = f"用户 <b>{html.escape(username)}</b>" if username else "全部用户"
-#TG|    return (
-#TG|        f"📊 <b>{who}流量统计</b>\n\n"
-#TG|        f"📅 今日\n  ↑ {format_bytes(today[0])}  ↓ {format_bytes(today[1])}\n"
-#TG|        f"  合计：<b>{format_bytes(sum(today))}</b>\n\n"
-#TG|        f"🗓 本月\n  ↑ {format_bytes(month[0])}  ↓ {format_bytes(month[1])}\n"
-#TG|        f"  合计：<b>{format_bytes(sum(month))}</b>"
-#TG|    )
-#TG|
-#TG|
-#TG|def user_text(user: dict, db_path: Path) -> str:
-#TG|    days = remaining_days(user["expire"])
-#TG|    day_text = "未知" if days is None else ("已到期" if days == 0 else f"{days} 天")
-#TG|    expire = parse_expire(user["expire"])
-#TG|    expire_text = expire.strftime("%Y-%m-%d %H:%M") if expire else user["expire"]
-#TG|    state = "🟢 正常" if user["status"] == "active" else "🔴 已禁用"
-#TG|    return (
-#TG|        f"👤 <b>{html.escape(user['name'])}</b>\n"
-#TG|        f"状态：{state}\n节点：{html.escape(user['node'])}\n"
-#TG|        f"到期：{html.escape(expire_text)}\n剩余：<b>{day_text}</b>\n\n"
-#TG|        + usage_text(db_path, user["name"])
-#TG|    )
-#TG|
-#TG|
-#TG|def users_text(users: Iterable[dict]) -> str:
-#TG|    rows = ["👥 <b>用户列表</b>", ""]
-#TG|    for user in users:
-#TG|        days = remaining_days(user["expire"])
-#TG|        left = "未知" if days is None else ("已到期" if days == 0 else f"{days}天")
-#TG|        icon = "🟢" if user["status"] == "active" else "🔴"
-#TG|        rows.append(f"{icon} <code>{html.escape(user['name'])}</code> · {left} · {html.escape(user['node'])}")
-#TG|    return "\n".join(rows) if len(rows) > 2 else "暂无用户"
-#TG|
-#TG|
-#TG|def command_reply(text: str, users_path: Path, db_path: Path) -> str:
-#TG|    parts = text.strip().split(maxsplit=1)
-#TG|    command = parts[0].split("@", 1)[0].lower() if parts else "/start"
-#TG|    users = read_users(users_path)
-#TG|    if command in ("/start", "/help"):
-#TG|        return (
-#TG|            "🤖 <b>VLESS 智能管家</b>\n\n"
-#TG|            "/users — 用户与到期概览\n"
-#TG|            "/user 用户名 — 用户详情与流量\n"
-#TG|            "/today — 今日全部流量\n"
-#TG|            "/month — 本月全部流量\n"
-#TG|            "/expiring — 7天内到期用户\n"
-#TG|            "/report — 立即查看全部用户流量报告\n"
-#TG|            "/ping — 立即测试节点延迟\n"
-#TG|            "/status — 机器人状态"
-#TG|        )
-#TG|    if command == "/users":
-#TG|        return users_text(users)
-#TG|    if command in ("/today", "/month"):
-#TG|        return usage_text(db_path)
-#TG|    if command == "/report":
-#TG|        return report_all_users_text(users_path, db_path)
-#TG|    if command == "/ping":
-#TG|        return ping_text()
-#TG|    if command == "/user":
-#TG|        if len(parts) < 2:
-#TG|            return "用法：<code>/user 用户名</code>"
-#TG|        name = parts[1].strip()
-#TG|        user = next((u for u in users if u["name"] == name), None)
-#TG|        return user_text(user, db_path) if user else "未找到该用户"
-#TG|    if command == "/expiring":
-#TG|        selected = [u for u in users if (days := remaining_days(u["expire"])) is not None and days <= 7]
-#TG|        return "⏰ <b>7天内到期</b>\n\n" + (users_text(selected) if selected else "暂无")
-#TG|    if command == "/status":
-#TG|        return "✅ 机器人在线\n✅ 流量数据库可读取\n🕐 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#TG|    return "未知命令，请发送 /help"
-#TG|
-#TG|
-#TG|def handle_message(token: str, config_path: Path, cfg: dict, message: dict, users_path: Path, db_path: Path) -> None:
-#TG|    started = time.monotonic()
-#TG|    chat_id = (message.get("chat") or {}).get("id")
-#TG|    text = message.get("text", "")
-#TG|    if chat_id is None or not text:
-#TG|        return
-#TG|    if claim_binding(config_path, cfg, message):
-#TG|        send_message(token, int(chat_id), "✅ <b>绑定成功</b>\n\n你已成为此服务器的 Telegram 管理员。\n发送 /start 查看可用命令。")
-#TG|        print(f"binding=success admin={chat_id}", flush=True)
-#TG|        return
-#TG|    if not is_authorized_message(cfg, message):
-#TG|        send_message(token, int(chat_id), "⛔ 未授权或绑定链接已失效。\n请在服务器上重新配置机器人并扫描新的二维码。")
-#TG|        return
-#TG|    send_message(token, int(chat_id), command_reply(text, users_path, db_path))
-#TG|    print(f"command={text.split(maxsplit=1)[0]} elapsed={time.monotonic() - started:.3f}s", flush=True)
-#TG|
-#TG|
-#TG|def run_collector(config_path: Path, once: bool = False) -> None:
-#TG|    cfg = parse_config(config_path)
-#TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
-#TG|    xray_bin = Path(cfg.get("XRAY_BIN", str(DEFAULT_XRAY)))
-#TG|    interval = max(30, int(cfg.get("COLLECT_INTERVAL", "60")))
-#TG|    while True:
-#TG|        try:
-#TG|            record_snapshot(db_path, query_xray_counters(xray_bin))
-#TG|        except Exception as exc:
-#TG|            print(f"collector: {exc}", flush=True)
-#TG|        if once:
-#TG|            return
-#TG|        time.sleep(interval)
-#TG|
-#TG|
-#TG|def report_all_users_text(users_path: Path, db_path: Path) -> str:
-#TG|    """每小时报告：列出每个活跃 VLESS 用户的今日/本月流量。"""
-#TG|    users = read_users(users_path)
-#TG|    now = datetime.now()
-#TG|    today = now.strftime("%Y-%m-%d")
-#TG|    month = now.strftime("%Y-%m")
-#TG|    lines = ["📊 <b>每小时流量报告</b>", "", f"🕐 {now.strftime('%Y-%m-%d %H:%M')}", ""]
-#TG|    active = [u for u in users if u["status"] == "active"]
-#TG|    if not active:
-#TG|        lines.append("暂无活跃用户")
-#TG|    for u in active:
-#TG|        t = usage_for_day(db_path, u["name"], today)
-#TG|        m = usage_for_month(db_path, u["name"], month)
-#TG|        tot = format_bytes(sum(t))
-#TG|        mtot = format_bytes(sum(m))
-#TG|        lines.append(
-#TG|            f"👤 <code>{html.escape(u['name'])}</code>\n"
-#TG|            f"   今日 {tot} (↑{format_bytes(t[0])} ↓{format_bytes(t[1])}) · 本月 {mtot}"
-#TG|        )
-#TG|    lines.append("")
-#TG|    lines.append("<i>VLESS 用户级统计；Shadowsocks 为共享单密码节点，暂无用户级统计。</i>")
-#TG|    return "\n".join(lines)
 #TG|
 #TG|
 #TG|def measure_ping_latency(host: str = "1.1.1.1") -> Optional[float]:
@@ -2748,9 +2064,7 @@ main_menu
 #TG|
 #TG|
 #TG|def measure_tcp_latency(host: str, port: int = 80, timeout: float = 4.0) -> Optional[float]:
-#TG|    """TCP Ping：先解析 IP（不计时），再测纯 TCP 握手耗时（毫秒）。"""
 #TG|    try:
-#TG|        # 先解析域名拿到 IP，DNS 时间不计入延迟
 #TG|        ip = socket.gethostbyname(host)
 #TG|        t0 = time.monotonic()
 #TG|        with socket.create_connection((ip, port), timeout=timeout):
@@ -2768,7 +2082,6 @@ main_menu
 #TG|
 #TG|def ping_text(host: str = "1.1.1.1") -> str:
 #TG|    lines = ["📡 <b>延迟测试</b>", ""]
-#TG|    # ICMP Ping 目标主机（默认 1.1.1.1）
 #TG|    lat = measure_ping_latency(host)
 #TG|    if lat is None:
 #TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> <b>无响应</b>")
@@ -2776,7 +2089,6 @@ main_menu
 #TG|        level = "🟢" if lat < 100 else ("🟡" if lat < 250 else "🔴")
 #TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> → {level} <b>{lat:.1f} ms</b>")
 #TG|    lines.append("")
-#TG|    # 三大运营商 TCP Ping
 #TG|    for name, c_host, c_port in CARRIER_TARGETS:
 #TG|        c_lat = measure_tcp_latency(c_host, c_port)
 #TG|        label = f"{name} TCP"
@@ -2788,32 +2100,75 @@ main_menu
 #TG|    return "\n".join(lines)
 #TG|
 #TG|
-#TG|def run_scheduler(token: str, users_path: Path, db_path: Path, config_path: Path, stop: threading.Event) -> None:
-#TG|    """后台定时任务：每小时推流量报告、每10分钟推 ping 延迟。"""
-#TG|    last_hour = time.time()
-#TG|    last_ping = time.time()
-#TG|    while not stop.is_set():
-#TG|        cfg = parse_config(config_path)
-#TG|        admins = sorted(cfg.get("ADMIN_CHAT_IDS", set()))
-#TG|        now = time.time()
-#TG|        report_interval = max(300, int(cfg.get("REPORT_INTERVAL", "3600")))
-#TG|        ping_interval = max(60, int(cfg.get("PING_INTERVAL", "600")))
-#TG|        ping_host = cfg.get("PING_HOST", "1.1.1.1")
-#TG|        if admins and now - last_hour >= report_interval:
-#TG|            try:
-#TG|                for a in admins:
-#TG|                    send_message(token, a, report_all_users_text(users_path, db_path))
-#TG|                last_hour = now
-#TG|            except Exception as exc:
-#TG|                print(f"sched:hour {exc}", flush=True)
-#TG|        if admins and now - last_ping >= ping_interval:
-#TG|            try:
-#TG|                for a in admins:
-#TG|                    send_message(token, a, ping_text(ping_host))
-#TG|                last_ping = now
-#TG|            except Exception as exc:
-#TG|                print(f"sched:ping {exc}", flush=True)
-#TG|        stop.wait(30)
+#TG|def users_text(users: list[dict]) -> str:
+#TG|    rows = ["👥 <b>用户列表</b>", ""]
+#TG|    for user in users:
+#TG|        days = remaining_days(user["expire"])
+#TG|        left = "未知" if days is None else ("已到期" if days == 0 else f"{days}天")
+#TG|        icon = "🟢" if user["status"] == "active" else "🔴"
+#TG|        rows.append(f"{icon} <code>{html.escape(user['name'])}</code> · {left} · {html.escape(user['node'])}")
+#TG|    return "\n".join(rows) if len(rows) > 2 else "暂无用户"
+#TG|
+#TG|
+#TG|def user_text(user: dict) -> str:
+#TG|    days = remaining_days(user["expire"])
+#TG|    day_text = "未知" if days is None else ("已到期" if days == 0 else f"{days} 天")
+#TG|    expire = parse_expire(user["expire"])
+#TG|    expire_text = expire.strftime("%Y-%m-%d %H:%M") if expire else user["expire"]
+#TG|    state = "🟢 正常" if user["status"] == "active" else "🔴 已禁用"
+#TG|    return (
+#TG|        f"👤 <b>{html.escape(user['name'])}</b>\n"
+#TG|        f"状态：{state}\n节点：{html.escape(user['node'])}\n"
+#TG|        f"到期：{html.escape(expire_text)}\n剩余：<b>{day_text}</b>"
+#TG|    )
+#TG|
+#TG|
+#TG|def command_reply(text: str, users_path: Path) -> str:
+#TG|    parts = text.strip().split(maxsplit=1)
+#TG|    command = parts[0].split("@", 1)[0].lower() if parts else "/start"
+#TG|    users = read_users(users_path)
+#TG|    if command in ("/start", "/help"):
+#TG|        return (
+#TG|            "🤖 <b>VLESS 管理机器人</b>\n\n"
+#TG|            "/users — 用户列表\n"
+#TG|            "/user 用户名 — 用户详情\n"
+#TG|            "/expiring — 7天内到期用户\n"
+#TG|            "/ping — 延迟测试（三网 TCP）\n"
+#TG|            "/status — 机器人状态"
+#TG|        )
+#TG|    if command == "/users":
+#TG|        return users_text(users)
+#TG|    if command == "/user":
+#TG|        if len(parts) < 2:
+#TG|            return "用法：<code>/user 用户名</code>"
+#TG|        name = parts[1].strip()
+#TG|        user = next((u for u in users if u["name"] == name), None)
+#TG|        return user_text(user) if user else "未找到该用户"
+#TG|    if command == "/expiring":
+#TG|        selected = [u for u in users if (d := remaining_days(u["expire"])) is not None and d <= 7]
+#TG|        return "⏰ <b>7天内到期</b>\n\n" + (users_text(selected) if selected else "暂无")
+#TG|    if command == "/ping":
+#TG|        return ping_text()
+#TG|    if command == "/status":
+#TG|        return "✅ 机器人在线\n🕐 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#TG|    return "未知命令，请发送 /help"
+#TG|
+#TG|
+#TG|def handle_message(token: str, config_path: Path, cfg: dict, message: dict, users_path: Path) -> None:
+#TG|    started = time.monotonic()
+#TG|    chat_id = (message.get("chat") or {}).get("id")
+#TG|    text = message.get("text", "")
+#TG|    if chat_id is None or not text:
+#TG|        return
+#TG|    if claim_binding(config_path, cfg, message):
+#TG|        send_message(token, int(chat_id), "✅ <b>绑定成功</b>\n\n发送 /start 查看可用命令。")
+#TG|        print(f"binding=success admin={chat_id}", flush=True)
+#TG|        return
+#TG|    if not is_authorized_message(cfg, message):
+#TG|        send_message(token, int(chat_id), "⛔ 未授权。请重新配置并扫描绑定二维码。")
+#TG|        return
+#TG|    send_message(token, int(chat_id), command_reply(text, users_path))
+#TG|    print(f"command={text.split(maxsplit=1)[0]} elapsed={time.monotonic() - started:.3f}s", flush=True)
 #TG|
 #TG|
 #TG|def run_bot(config_path: Path) -> None:
@@ -2824,15 +2179,8 @@ main_menu
 #TG|    except ValueError as exc:
 #TG|        raise SystemExit(str(exc)) from exc
 #TG|    users_path = Path(cfg.get("USER_DB", str(DEFAULT_USERS)))
-#TG|    db_path = Path(cfg.get("TRAFFIC_DB", str(DEFAULT_DB)))
-#TG|    stop_event = threading.Event()
-#TG|    threading.Thread(
-#TG|        target=run_scheduler,
-#TG|        args=(token, users_path, db_path, config_path, stop_event),
-#TG|        daemon=True,
-#TG|        name="scheduler",
-#TG|    ).start()
 #TG|    offset = 0
+#TG|    import concurrent.futures
 #TG|    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
 #TG|        while True:
 #TG|            try:
@@ -2840,10 +2188,9 @@ main_menu
 #TG|                updates = result.get("result", [])
 #TG|                if updates:
 #TG|                    offset = max(int(item["update_id"]) for item in updates) + 1
-#TG|                    # Acknowledge the batch immediately; process replies concurrently.
 #TG|                    tg_request(token, "getUpdates", {"timeout": "0", "offset": str(offset), "limit": "1"})
 #TG|                    for update in updates:
-#TG|                        pool.submit(handle_message, token, config_path, cfg, update.get("message") or {}, users_path, db_path)
+#TG|                        pool.submit(handle_message, token, config_path, cfg, update.get("message") or {}, users_path)
 #TG|            except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
 #TG|                print(f"bot: {exc}", flush=True)
 #TG|                time.sleep(2)
@@ -2852,15 +2199,10 @@ main_menu
 #TG|def main() -> None:
 #TG|    parser = argparse.ArgumentParser()
 #TG|    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-#TG|    parser.add_argument("--collector", action="store_true")
-#TG|    parser.add_argument("--collect-once", action="store_true")
 #TG|    args = parser.parse_args()
-#TG|    if args.collector or args.collect_once:
-#TG|        run_collector(args.config, once=args.collect_once)
-#TG|    else:
-#TG|        run_bot(args.config)
+#TG|    run_bot(args.config)
 #TG|
 #TG|
 #TG|if __name__ == "__main__":
 #TG|    main()
-###__END_VLESS_TG_BOT_PY__###
+###__END_SBOX_TG_BOT_PY__###
