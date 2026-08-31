@@ -515,6 +515,12 @@ rebuild_config() {
     HAS_WS=0; has_ws && HAS_WS=1
     HAS_HY2=0; has_hy2 && HAS_HY2=1
 
+    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 IP_PRIO
+    export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
+    export SS_PORT SS_METHOD SS_PASSWORD
+    export WS_PORT WS_PATH CERT_DIR
+    export HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY
+
     python3 - <<PYEOF
 import json, os
 
