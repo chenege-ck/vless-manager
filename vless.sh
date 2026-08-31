@@ -535,7 +535,7 @@ if os.environ.get("HAS_REALITY") == "1":
     cfg["inbounds"].append({
         "type": "vless", "tag": "inbound-reality",
         "listen": "::", "listen_port": int(os.environ["REALITY_PORT"]),
-        "sniff": True, "sniff_override_destination": True, "users": [],
+        "users": [],
         "tls": {
             "enabled": True, "server_name": os.environ["REALITY_SNI"],
             "reality": {
@@ -558,7 +558,7 @@ if os.environ.get("HAS_WS") == "1":
     cfg["inbounds"].append({
         "type": "vless", "tag": "inbound-ws",
         "listen": "::", "listen_port": int(os.environ["WS_PORT"]),
-        "sniff": True, "sniff_override_destination": True, "users": [],
+        "users": [],
         "tls": {
             "enabled": True,
             "certificate_path": os.environ["CERT_DIR"] + "/ws.crt",
@@ -589,6 +589,14 @@ if ds and ds != "AsIs":
     outbound["domain_strategy"] = ds
 
 cfg["outbounds"] = [outbound, {"type": "block", "tag": "block"}]
+
+cfg["route"] = {
+    "rules": [
+        {"protocol": "dns", "action": "hijack-dns"},
+        {"action": "sniff"}
+    ],
+    "final": "direct"
+}
 
 with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
@@ -1586,9 +1594,14 @@ update_script() {
     local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/singbox-manager.sh"
     info "正在从 GitHub 拉取最新版本..."
     local TMP_SCRIPT="/tmp/singbox_new.sh"
-    curl -sL "$SCRIPT_URL" -o "$TMP_SCRIPT"
+    curl -fsSL "$SCRIPT_URL" -o "$TMP_SCRIPT"
     if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
         error "下载失败，请检查网络"; return
+    fi
+    # 检查是否是合法脚本（防止 404 页面覆盖）
+    if ! head -1 "$TMP_SCRIPT" | grep -q "^#!/bin/bash"; then
+        error "下载内容不是合法脚本（可能未发布到 GitHub），取消更新"
+        rm -f "$TMP_SCRIPT"; return
     fi
     if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
         error "脚本语法错误，取消更新"; rm -f "$TMP_SCRIPT"; return
@@ -1770,15 +1783,18 @@ telegram_bot_menu() {
 install_shortcut() {
     local SELF_PATH
     SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [[ "$SELF_PATH" != "/usr/local/bin/singbox_manager.sh" ]]; then
-        cp "$SELF_PATH" /usr/local/bin/singbox_manager.sh
-        chmod +x /usr/local/bin/singbox_manager.sh
+    local TARGET="/usr/local/bin/singbox_manager.sh"
+    # 复制当前脚本到目标路径
+    if [[ "$SELF_PATH" != "$TARGET" ]]; then
+        cp "$SELF_PATH" "$TARGET"
+        chmod +x "$TARGET"
     fi
     cat > /usr/local/bin/c <<'EOF'
 #!/bin/bash
-bash /usr/local/bin/singbox_manager.sh
+exec bash /usr/local/bin/singbox_manager.sh "$@"
 EOF
     chmod +x /usr/local/bin/c
+    info "快捷命令已安装: c"
 }
 
 # ============================================================
