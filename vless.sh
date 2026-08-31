@@ -644,10 +644,16 @@ cfg_path = os.environ["INJECT_CONFIG"]
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
+# VLESS inbound tags 允许注入用户
+VLESS_TAGS = {"inbound-reality", "inbound-ws"}
+
 for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
     users = inbound.get("users")
     if users is None:
+        continue
+    # 仅对 VLESS 节点操作用户列表，跳过 Hysteria2 / AnyTLS 等
+    if tag not in VLESS_TAGS:
         continue
     # 移除已存在的同 UUID 用户
     inbound["users"] = [u for u in users if u.get("uuid") != uuid]
@@ -1736,7 +1742,7 @@ update_sbox() {
 # ============================================================
 update_script() {
     title "更新管理脚本..."
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/singbox-manager.sh"
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
     info "正在从 GitHub 拉取最新版本..."
     local TMP_SCRIPT="/tmp/singbox_new.sh"
     curl -fsSL "$SCRIPT_URL" -o "$TMP_SCRIPT"
