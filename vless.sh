@@ -259,9 +259,14 @@ validate_sbox_config() {
     if [[ $? -ne 0 ]]; then
         error "config.json 不是合法 JSON"; return 1
     fi
-    "$SBOX_BIN" check -c "$SBOX_CONFIG" >/dev/null 2>&1
+    local VALIDATE_OUTPUT
+    VALIDATE_OUTPUT=$("$SBOX_BIN" check -c "$SBOX_CONFIG" 2>&1)
     if [[ $? -ne 0 ]]; then
-        error "sing-box 配置校验失败"; return 1
+        error "sing-box 配置校验失败:"
+        echo "$VALIDATE_OUTPUT" | while IFS= read -r line; do
+            echo -e "  ${RED}${line}${NC}"
+        done
+        return 1
     fi
     return 0
 }
