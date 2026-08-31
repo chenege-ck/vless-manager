@@ -18,12 +18,14 @@ META_REALITY="${SBOX_DIR}/meta-reality.conf"
 META_SS="${SBOX_DIR}/meta-ss.conf"
 META_WS="${SBOX_DIR}/meta-ws.conf"
 META_HY2="${SBOX_DIR}/meta-hy2.conf"
+META_ANYTLS="${SBOX_DIR}/meta-anytls.conf"
 META="${SBOX_DIR}/meta.conf"
 SERVICE_NAME="sing-box"
 
 # ============== 默认端口 ==============
 SS_PORT_DEFAULT=8668
 HY2_PORT_DEFAULT=8999
+ANYTLS_PORT_DEFAULT=8585
 
 # ============== 工具函数 ==============
 info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
@@ -217,6 +219,7 @@ load_meta() {
     SS_PORT=""  SS_METHOD=""  SS_PASSWORD=""
     WS_PORT=""  WS_PATH=""  WS_DOMAIN=""  WS_CF_PORT=""  WS_TLS=""  CERT_DIR=""
     HY2_PORT=""  HY2_PASSWORD=""  HY2_SNI=""
+    ANYTLS_PORT=""  ANYTLS_PASSWORD=""
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -244,6 +247,10 @@ load_meta() {
         HY2_PASSWORD=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI=$(read_kv "$META_HY2" "HY2_SNI")
     fi
+    if [[ -f "$META_ANYTLS" ]]; then
+        ANYTLS_PORT=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
+        ANYTLS_PASSWORD=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
+    fi
 }
 
 # ============== 节点存在检查 ==============
@@ -251,6 +258,7 @@ has_reality()     { [[ -f "$META_REALITY" ]]; }
 has_shadowsocks() { [[ -f "$META_SS" ]]; }
 has_ws()          { [[ -f "$META_WS" ]]; }
 has_hy2()         { [[ -f "$META_HY2" ]]; }
+has_anytls()      { [[ -f "$META_ANYTLS" ]]; }
 
 # ============== sing-box 配置校验 ==============
 validate_sbox_config() {
@@ -499,7 +507,7 @@ ip_priority_menu() {
         *) warn "无效选项"; return ;;
     esac
     _save_ip_priority "$DS"
-    if has_reality || has_shadowsocks || has_ws || has_hy2; then
+    if has_reality || has_shadowsocks || has_ws || has_hy2 || has_anytls; then
         rebuild_config
         _inject_all_users
         _start_sbox
@@ -519,12 +527,14 @@ rebuild_config() {
     HAS_SS=0; has_shadowsocks && HAS_SS=1
     HAS_WS=0; has_ws && HAS_WS=1
     HAS_HY2=0; has_hy2 && HAS_HY2=1
+    HAS_ANYTLS=0; has_anytls && HAS_ANYTLS=1
 
-    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 IP_PRIO
+    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO
     export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
     export HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY
+    export ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_CERT ANYTLS_KEY
 
     python3 - <<PYEOF
 import json, os
@@ -580,6 +590,20 @@ if os.environ.get("HAS_HY2") == "1":
             "enabled": True,
             "certificate_path": os.environ["HY2_CERT"],
             "key_path": os.environ["HY2_KEY"]
+        }
+    })
+
+if os.environ.get("HAS_ANYTLS") == "1":
+    anytls_cert = os.environ.get("ANYTLS_CERT", "")
+    anytls_key = os.environ.get("ANYTLS_KEY", "")
+    cfg["inbounds"].append({
+        "type": "anytls", "tag": "inbound-anytls",
+        "listen": "::", "listen_port": int(os.environ["ANYTLS_PORT"]),
+        "users": [{"name": "shared", "password": os.environ["ANYTLS_PASSWORD"]}],
+        "tls": {
+            "enabled": True,
+            "certificate_path": anytls_cert,
+            "key_path": anytls_key
         }
     })
 
@@ -882,6 +906,95 @@ show_hy2_link() {
 }
 
 # ============================================================
+# AnyTLS（sing-box 内置，自签名证书）
+# ============================================================
+ANYTLS_CERT="${SBOX_DIR}/anytls-cert.pem"
+ANYTLS_KEY="${SBOX_DIR}/anytls-key.pem"
+
+init_anytls() {
+    title "配置 AnyTLS"
+
+    if has_anytls; then
+        warn "AnyTLS 已存在，重新配置将生成新密码/证书"
+        read -rp "确认继续？[y/N]: " C
+        [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    fi
+
+    local PORT SNI
+    read -rp "监听端口 [默认 ${ANYTLS_PORT_DEFAULT}]: " PORT
+    PORT=${PORT:-$ANYTLS_PORT_DEFAULT}
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+        error "端口必须是 1-65535"; return 1
+    fi
+    check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
+
+    read -rp "伪装域名（证书 CN）[默认 www.bing.com]: " SNI
+    SNI=${SNI:-www.bing.com}
+
+    ANYTLS_PORT=$PORT
+    ANYTLS_PASSWORD=$(openssl rand -hex 16)
+    [[ -n "$ANYTLS_PASSWORD" ]] || { error "密码生成失败"; return 1; }
+
+    # 自签名证书
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$ANYTLS_KEY" -out "$ANYTLS_CERT" \
+        -days 3650 -subj "/CN=${SNI}" \
+        -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
+    [[ -s "$ANYTLS_CERT" && -s "$ANYTLS_KEY" ]] || { error "证书生成失败"; return 1; }
+    chmod 644 "$ANYTLS_CERT" && chmod 640 "$ANYTLS_KEY"
+
+    cat > "$META_ANYTLS" <<EOF
+ANYTLS_PORT=${ANYTLS_PORT}
+ANYTLS_PASSWORD=${ANYTLS_PASSWORD}
+ANYTLS_SNI=${SNI}
+ANYTLS_CERT=${ANYTLS_CERT}
+ANYTLS_KEY=${ANYTLS_KEY}
+EOF
+    chmod 600 "$META_ANYTLS"
+
+    rebuild_config || return 1
+    _start_sbox || return 1
+    info "AnyTLS 配置完成（端口 ${ANYTLS_PORT}，自签名证书）"
+    _print_anytls_link
+}
+
+remove_anytls() {
+    has_anytls || { error "AnyTLS 未启用"; return 1; }
+    read -rp "确认移除 AnyTLS？[y/N]: " C
+    [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
+    rm -f "$META_ANYTLS" "$ANYTLS_CERT" "$ANYTLS_KEY"
+    rebuild_config
+    _inject_all_users
+    _start_sbox
+    info "AnyTLS 已移除"
+}
+
+_print_anytls_link() {
+    has_anytls || return 1
+    local AT_PORT AT_PASSWORD AT_SNI SERVER_IP
+    AT_PORT=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
+    AT_PASSWORD=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
+    AT_SNI=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+    SERVER_IP=$(get_public_ip)
+    echo ""
+    echo -e "${GREEN}===== AnyTLS 信息 =====${NC}"
+    echo -e "地址   : ${SERVER_IP}"
+    echo -e "端口   : ${AT_PORT}"
+    echo -e "密码   : ${AT_PASSWORD}"
+    echo -e "SNI    : ${AT_SNI}"
+    echo -e "证书   : 自签名，客户端需 insecure"
+    echo ""
+    echo -e "${CYAN}客户端配置示例:${NC}"
+    echo "anytls://${AT_PASSWORD}@${SERVER_IP}:${AT_PORT}/?sni=${AT_SNI}&insecure=1#AnyTLS-${AT_PORT}"
+    echo ""
+}
+
+show_anytls_link() {
+    has_anytls || { error "AnyTLS 尚未配置"; return 1; }
+    _print_anytls_link
+}
+
+# ============================================================
 # 节点配置选择菜单
 # ============================================================
 init_config() {
@@ -897,15 +1010,18 @@ init_config() {
     has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
     has_ws          && echo -e "  ${GREEN}✓${NC} WS+CF 已启用"      || echo -e "  ${RED}✗${NC} WS+CF 未启用"
     has_hy2         && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用"  || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
+    has_anytls      && echo -e "  ${GREEN}✓${NC} AnyTLS 已启用"    || echo -e "  ${RED}✗${NC} AnyTLS 未启用"
     echo ""
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
     echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks"
     echo -e "  ${GREEN}3.${NC} 配置 VLESS + WS + TLS"
     echo -e "  ${GREEN}4.${NC} 配置 Hysteria2"
-    has_reality     && echo -e "  ${RED}5.${NC} 移除 Reality"
-    has_shadowsocks && echo -e "  ${RED}6.${NC} 移除 Shadowsocks"
-    has_ws          && echo -e "  ${RED}7.${NC} 移除 WS+CF"
-    has_hy2         && echo -e "  ${RED}8.${NC} 移除 Hysteria2"
+    echo -e "  ${GREEN}5.${NC} 配置 AnyTLS"
+    has_reality     && echo -e "  ${RED}10.${NC} 移除 Reality"
+    has_shadowsocks && echo -e "  ${RED}11.${NC} 移除 Shadowsocks"
+    has_ws          && echo -e "  ${RED}12.${NC} 移除 WS+CF"
+    has_hy2         && echo -e "  ${RED}13.${NC} 移除 Hysteria2"
+    has_anytls      && echo -e "  ${RED}14.${NC} 移除 AnyTLS"
     echo ""
     read -rp "选择: " MODE_SEL
     case $MODE_SEL in
@@ -919,28 +1035,30 @@ init_config() {
         2) init_shadowsocks ;;
         3) init_ws_cf ;;
         4) init_hy2 ;;
-        5)
+        5) init_anytls ;;
+        10)
             has_reality || { error "Reality 未启用"; return; }
             read -rp "确认移除 Reality？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && return
             rm -f "$META_REALITY"
             rebuild_config; _inject_all_users; _start_sbox
             info "Reality 已移除" ;;
-        6)
+        11)
             has_shadowsocks || { error "SS 未启用"; return; }
             read -rp "确认移除 Shadowsocks？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && return
             rm -f "$META_SS"
             rebuild_config; _inject_all_users; _start_sbox
             info "Shadowsocks 已移除" ;;
-        7)
+        12)
             has_ws || { error "WS 未启用"; return; }
             read -rp "确认移除 WS+CF？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && return
             rm -f "$META_WS"
             rebuild_config; _inject_all_users; _start_sbox
             info "WS+CF 已移除" ;;
-        8) remove_hy2 ;;
+        13) remove_hy2 ;;
+        14) remove_anytls ;;
         *) error "无效选择" ;;
     esac
 }
@@ -1019,7 +1137,22 @@ add_user() {
     fi
 
     local NODE="both"
-    if has_reality && has_ws; then
+    local AVAIL_NODES=()
+    has_reality && AVAIL_NODES+=("reality")
+    has_ws && AVAIL_NODES+=("ws")
+
+    if [[ ${#AVAIL_NODES[@]} -eq 0 ]]; then
+        error "尚未配置 Reality 或 WS 节点，请先初始化"
+        return
+    fi
+
+    if [[ ${#AVAIL_NODES[@]} -eq 1 ]]; then
+        NODE="${AVAIL_NODES[0]}"
+        local NODE_DESC="Reality"
+        [[ "$NODE" == "ws" ]] && NODE_DESC="WS+CF"
+        echo ""
+        info "当前仅有 ${NODE_DESC} 节点，用户将加入该节点"
+    else
         echo ""
         echo "请选择加入的节点："
         echo -e "  ${GREEN}1.${NC} Reality + WS"
@@ -1031,13 +1164,6 @@ add_user() {
             3) NODE="ws" ;;
             *) NODE="both" ;;
         esac
-    elif has_reality; then
-        NODE="reality"
-    elif has_ws; then
-        NODE="ws"
-    else
-        error "尚未配置 Reality 或 WS 节点，请先初始化"
-        return
     fi
 
     read -rp "到期天数 [默认 999 天]: " DAYS
@@ -1559,7 +1685,26 @@ for i in d.get('inbounds',[]):
         echo ""
     fi
 
-    if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2; then
+    if has_anytls; then
+        local AT_PORT_SHOW AT_PASSWORD_SHOW AT_SNI_SHOW AT_STATUS_SHOW AT_LINK_SHOW
+        AT_PORT_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
+        AT_PASSWORD_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
+        AT_SNI_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+        AT_STATUS_SHOW=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&insecure=1#AnyTLS-${AT_PORT_SHOW}"
+        echo -e "${CYAN}── AnyTLS 节点 ──${NC}"
+        echo -e "状态   : $( [[ "$AT_STATUS_SHOW" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${AT_PORT_SHOW}"
+        echo -e "密码   : ${AT_PASSWORD_SHOW}"
+        echo -e "SNI    : ${AT_SNI_SHOW}"
+        echo -e "协议   : AnyTLS（自签名，客户端需 insecure）"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$AT_LINK_SHOW"
+        echo ""
+    fi
+
+    if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2 && ! has_anytls; then
         warn "尚未配置任何节点"
     fi
 }
@@ -1847,6 +1992,7 @@ main_menu() {
         has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
         has_ws          && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
         has_hy2         && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
+        has_anytls      && MODE_STR="${MODE_STR:+$MODE_STR+}AT"
         [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
 
         local STATUS_COLOR=$RED STATUS_TEXT="● 已停止"
