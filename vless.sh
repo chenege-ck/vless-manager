@@ -219,7 +219,8 @@ load_meta() {
     SS_PORT=""  SS_METHOD=""  SS_PASSWORD=""
     WS_PORT=""  WS_PATH=""  WS_DOMAIN=""  WS_CF_PORT=""  WS_TLS=""  CERT_DIR=""
     HY2_PORT=""  HY2_PASSWORD=""  HY2_SNI=""
-    ANYTLS_PORT=""  ANYTLS_PASSWORD=""
+    ANYTLS_PORT=""  ANYTLS_PASSWORD=""  ANYTLS_SNI=""
+    ANYTLS_PRIVATE_KEY=""  ANYTLS_PUBLIC_KEY=""  ANYTLS_SHORTID=""
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -250,6 +251,10 @@ load_meta() {
     if [[ -f "$META_ANYTLS" ]]; then
         ANYTLS_PORT=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
         ANYTLS_PASSWORD=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
+        ANYTLS_SNI=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+        ANYTLS_PRIVATE_KEY=$(read_kv "$META_ANYTLS" "ANYTLS_PRIVATE_KEY")
+        ANYTLS_PUBLIC_KEY=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
+        ANYTLS_SHORTID=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
     fi
 }
 
@@ -534,7 +539,7 @@ rebuild_config() {
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
     export HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY
-    export ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_CERT ANYTLS_KEY
+    export ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_SNI ANYTLS_PRIVATE_KEY ANYTLS_SHORTID
 
     python3 - <<PYEOF
 import json, os
@@ -594,16 +599,19 @@ if os.environ.get("HAS_HY2") == "1":
     })
 
 if os.environ.get("HAS_ANYTLS") == "1":
-    anytls_cert = os.environ.get("ANYTLS_CERT", "")
-    anytls_key = os.environ.get("ANYTLS_KEY", "")
     cfg["inbounds"].append({
         "type": "anytls", "tag": "inbound-anytls",
         "listen": "::", "listen_port": int(os.environ["ANYTLS_PORT"]),
         "users": [{"name": "shared", "password": os.environ["ANYTLS_PASSWORD"]}],
         "tls": {
             "enabled": True,
-            "certificate_path": anytls_cert,
-            "key_path": anytls_key
+            "server_name": os.environ["ANYTLS_SNI"],
+            "reality": {
+                "enabled": True,
+                "handshake": {"server": os.environ["ANYTLS_SNI"], "server_port": 443},
+                "private_key": os.environ["ANYTLS_PRIVATE_KEY"],
+                "short_id": [os.environ["ANYTLS_SHORTID"]]
+            }
         }
     })
 
@@ -705,8 +713,8 @@ init_reality() {
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用"
     done
 
-    read -rp "伪装域名 [默认 www.apple.com]: " REALITY_SNI
-    REALITY_SNI=${REALITY_SNI:-www.apple.com}
+    read -rp "伪装域名 [默认 www.microsoft.com]: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-www.microsoft.com}
     local REALITY_SHORTID
     REALITY_SHORTID=$(openssl rand -hex 8)
 
@@ -912,16 +920,13 @@ show_hy2_link() {
 }
 
 # ============================================================
-# AnyTLS（sing-box 内置，自签名证书）
+# AnyTLS（Reality 伪装，独立密钥对，不再用自签证书）
 # ============================================================
-ANYTLS_CERT="${SBOX_DIR}/anytls-cert.pem"
-ANYTLS_KEY="${SBOX_DIR}/anytls-key.pem"
-
 init_anytls() {
-    title "配置 AnyTLS"
+    title "配置 AnyTLS + Reality"
 
     if has_anytls; then
-        warn "AnyTLS 已存在，重新配置将生成新密码/证书"
+        warn "AnyTLS 已存在，重新配置将生成新密码/密钥"
         read -rp "确认继续？[y/N]: " C
         [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
     fi
@@ -934,33 +939,33 @@ init_anytls() {
     fi
     check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
 
-    read -rp "伪装域名（证书 CN）[默认 www.bing.com]: " SNI
-    SNI=${SNI:-www.bing.com}
+    read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
+    SNI=${SNI:-www.microsoft.com}
+
+    gen_keypair
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        error "密钥生成失败"; return 1
+    fi
 
     ANYTLS_PORT=$PORT
     ANYTLS_PASSWORD=$(openssl rand -hex 16)
     [[ -n "$ANYTLS_PASSWORD" ]] || { error "密码生成失败"; return 1; }
-
-    # 自签名证书
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$ANYTLS_KEY" -out "$ANYTLS_CERT" \
-        -days 3650 -subj "/CN=${SNI}" \
-        -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-    [[ -s "$ANYTLS_CERT" && -s "$ANYTLS_KEY" ]] || { error "证书生成失败"; return 1; }
-    chmod 644 "$ANYTLS_CERT" && chmod 640 "$ANYTLS_KEY"
+    local ANYTLS_SHORTID
+    ANYTLS_SHORTID=$(openssl rand -hex 8)
 
     cat > "$META_ANYTLS" <<EOF
 ANYTLS_PORT=${ANYTLS_PORT}
 ANYTLS_PASSWORD=${ANYTLS_PASSWORD}
 ANYTLS_SNI=${SNI}
-ANYTLS_CERT=${ANYTLS_CERT}
-ANYTLS_KEY=${ANYTLS_KEY}
+ANYTLS_PRIVATE_KEY=${PRIVATE_KEY}
+ANYTLS_PUBLIC_KEY=${PUBLIC_KEY}
+ANYTLS_SHORTID=${ANYTLS_SHORTID}
 EOF
     chmod 600 "$META_ANYTLS"
 
     rebuild_config || return 1
     _start_sbox || return 1
-    info "AnyTLS 配置完成（端口 ${ANYTLS_PORT}，自签名证书）"
+    info "AnyTLS 配置完成（端口 ${ANYTLS_PORT}，Reality 伪装）"
     _print_anytls_link
 }
 
@@ -968,7 +973,7 @@ remove_anytls() {
     has_anytls || { error "AnyTLS 未启用"; return 1; }
     read -rp "确认移除 AnyTLS？[y/N]: " C
     [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    rm -f "$META_ANYTLS" "$ANYTLS_CERT" "$ANYTLS_KEY"
+    rm -f "$META_ANYTLS"
     rebuild_config
     _inject_all_users
     _start_sbox
@@ -977,10 +982,12 @@ remove_anytls() {
 
 _print_anytls_link() {
     has_anytls || return 1
-    local AT_PORT AT_PASSWORD AT_SNI SERVER_IP
+    local AT_PORT AT_PASSWORD AT_SNI AT_PUBKEY AT_SHORTID SERVER_IP
     AT_PORT=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
     AT_PASSWORD=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
     AT_SNI=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+    AT_PUBKEY=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
+    AT_SHORTID=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
     SERVER_IP=$(get_public_ip)
     echo ""
     echo -e "${GREEN}===== AnyTLS 信息 =====${NC}"
@@ -988,10 +995,12 @@ _print_anytls_link() {
     echo -e "端口   : ${AT_PORT}"
     echo -e "密码   : ${AT_PASSWORD}"
     echo -e "SNI    : ${AT_SNI}"
-    echo -e "证书   : 自签名，客户端需 insecure"
+    echo -e "公钥   : ${AT_PUBKEY}"
+    echo -e "ShortID: ${AT_SHORTID}"
+    echo -e "伪装   : Reality"
     echo ""
     echo -e "${CYAN}客户端配置示例:${NC}"
-    echo "anytls://${AT_PASSWORD}@${SERVER_IP}:${AT_PORT}/?sni=${AT_SNI}&insecure=1#AnyTLS-${AT_PORT}"
+    echo "anytls://${AT_PASSWORD}@${SERVER_IP}:${AT_PORT}/?sni=${AT_SNI}&pbk=${AT_PUBKEY}&sid=${AT_SHORTID}&fp=chrome&security=reality#AnyTLS-${AT_PORT}"
     echo ""
 }
 
@@ -1692,19 +1701,23 @@ for i in d.get('inbounds',[]):
     fi
 
     if has_anytls; then
-        local AT_PORT_SHOW AT_PASSWORD_SHOW AT_SNI_SHOW AT_STATUS_SHOW AT_LINK_SHOW
+        local AT_PORT_SHOW AT_PASSWORD_SHOW AT_SNI_SHOW AT_PUBKEY_SHOW AT_SHORTID_SHOW AT_STATUS_SHOW AT_LINK_SHOW
         AT_PORT_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
         AT_PASSWORD_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
         AT_SNI_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+        AT_PUBKEY_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
+        AT_SHORTID_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
         AT_STATUS_SHOW=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
-        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&insecure=1#AnyTLS-${AT_PORT_SHOW}"
+        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&pbk=${AT_PUBKEY_SHOW}&sid=${AT_SHORTID_SHOW}&fp=chrome&security=reality#AnyTLS-${AT_PORT_SHOW}"
         echo -e "${CYAN}── AnyTLS 节点 ──${NC}"
         echo -e "状态   : $( [[ "$AT_STATUS_SHOW" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${AT_PORT_SHOW}"
         echo -e "密码   : ${AT_PASSWORD_SHOW}"
         echo -e "SNI    : ${AT_SNI_SHOW}"
-        echo -e "协议   : AnyTLS（自签名，客户端需 insecure）"
+        echo -e "公钥   : ${AT_PUBKEY_SHOW}"
+        echo -e "ShortID: ${AT_SHORTID_SHOW}"
+        echo -e "协议   : AnyTLS + Reality"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$AT_LINK_SHOW"
         echo ""
