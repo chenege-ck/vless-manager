@@ -1953,10 +1953,10 @@ install_shortcut() {
         cp "$SELF_PATH" "$TARGET"
         chmod +x "$TARGET"
     fi
-    cat > /usr/local/bin/c <<'EOF'
-#!/bin/bash
-exec bash /usr/local/bin/singbox_manager.sh "$@"
-EOF
+    # c 直接装成管理脚本的完整副本（自包含），不再依赖外部文件。
+    # 即使 singbox_manager.sh 丢失，运行 c 也能正常工作；
+    # 且每次运行 c 都会把目标文件从自身恢复回去。
+    cp "$TARGET" /usr/local/bin/c
     chmod +x /usr/local/bin/c
     info "快捷命令已安装: c"
 }
