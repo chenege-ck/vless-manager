@@ -586,18 +586,6 @@ if os.environ.get("HAS_WS") == "1":
         }
     })
 
-if os.environ.get("HAS_HY2") == "1":
-    cfg["inbounds"].append({
-        "type": "hysteria2", "tag": "inbound-hy2",
-        "listen": "::", "listen_port": int(os.environ["HY2_PORT"]),
-        "users": [{"name": "shared", "password": os.environ["HY2_PASSWORD"]}],
-        "tls": {
-            "enabled": True,
-            "certificate_path": os.environ["HY2_CERT"],
-            "key_path": os.environ["HY2_KEY"]
-        }
-    })
-
 if os.environ.get("HAS_ANYTLS") == "1":
     cfg["inbounds"].append({
         "type": "anytls", "tag": "inbound-anytls",
@@ -831,86 +819,237 @@ EOF
 }
 
 # ============================================================
-# Hysteria2（合并进 sing-box）
 # ============================================================
+# Hysteria2（独立官方 hysteria server v2.12.x，二次重构成独立服务体系，不走 sing-box）
+# ============================================================
+HY_BIN="/usr/local/bin/hysteria"
+HY_SERVICE="hysteria-server.service"
+HY_CONF="/etc/hysteria/config.yaml"
+HY_DIR="/etc/hysteria"
+HY_CERT_F="/etc/hysteria/server.crt"
+HY_KEY_F="/etc/hysteria/server.key"
+
+detect_hyst_arch(){
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "hysteria-linux-amd64" ;;
+        aarch64|arm64) echo "hysteria-linux-arm64" ;;
+        armv7l|armv6l) echo "hysteria-linux-arm" ;;
+        riscv64)       echo "hysteria-linux-riscv64" ;;
+        s390x)         echo "hysteria-linux-s390x" ;;
+        i386|i686)     echo "hysteria-linux-386" ;;
+        *) return 1 ;;
+    esac
+}
+
+hy_installed_ver(){
+    [[ -x "$HY_BIN" ]] || return 1
+    "$HY_BIN" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
+}
+hy_latest_ver(){
+    curl -fsSL --max-time 15 https://api.github.com/repos/HyNetworks/hysteria/releases/latest 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name","").lstrip("app/v"))' 2>/dev/null
+}
+
+install_hysteria(){
+    title "安装官方 Hysteria"
+    command -v curl >/dev/null 2>&1 || apt-get install -y -qq curl >/dev/null 2>&1
+    if [[ -x "$HY_BIN" ]]; then
+        info "已安装 Hysteria: $(hy_installed_ver || echo 未知)"
+        return 0
+    fi
+    local FN DOWNLOAD
+    FN=$(detect_hyst_arch) || { error "不支持的架构: $(uname -m)"; return 1; }
+    DOWNLOAD="https://download.hysteria.network/app/latest/${FN}"
+    info "下载: ${DOWNLOAD}"
+    curl -fsSL --max-time 120 "$DOWNLOAD" -o "$HY_BIN" || { error "下载失败"; return 1; }
+    chmod +x "$HY_BIN"
+    [[ -x "$HY_BIN" ]] || { error "安装失败"; return 1; }
+    info "hysteria 安装成功: $("$HY_BIN" version | head -1)"
+}
+
+update_hysteria_binary(){
+    title "更新 Hysteria 官方二进制"
+    [[ -x "$HY_BIN" ]] || { error "hysteria 未安装，请先安装"; return 1; }
+    local FN NEW BAK OLD_VER NEW_VER
+    FN=$(detect_hyst_arch) || { error "不支持的架构"; return 1; }
+    NEW="${HY_BIN}.new"; BAK="${HY_BIN}.bak"
+    curl -fsSL --max-time 120 "https://download.hysteria.network/app/latest/${FN}" -o "$NEW" \
+      || { error "下载新版本失败"; return 1; }
+    chmod +x "$NEW"
+    "$NEW" version >/dev/null 2>&1 || { error "下载的不是有效二进制"; rm -f "$NEW"; return 1; }
+    OLD_VER=$(hy_installed_ver)
+    NEW_VER=$("$NEW" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+    if [[ "$OLD_VER" == "$NEW_VER" ]]; then
+        info "已是最新版本: ${NEW_VER}"; rm -f "$NEW"; return 0
+    fi
+    mv "$HY_BIN" "$BAK"; mv "$NEW" "$HY_BIN"; chmod +x "$HY_BIN"; rm -f "$BAK"
+    info "更新完成: ${OLD_VER:-旧} → ${NEW_VER:-新}"
+    systemctl restart "$HY_SERVICE" 2>/dev/null && info "hysteria 服务已重启"
+}
+
+_gen_hy2_cert(){
+    local SNI="$1"
+    mkdir -p "$HY_DIR"
+    if [[ -s "$HY_CERT_F" && -s "$HY_KEY_F" ]]; then
+        warn "证书已存在，保留现有证书"
+        return 0
+    fi
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$HY_KEY_F" -out "$HY_CERT_F" \
+        -days 3650 -subj "/CN=${SNI}" \
+        -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
+    [[ -s "$HY_CERT_F" && -s "$HY_KEY_F" ]] || { error "证书生成失败"; return 1; }
+    chmod 644 "$HY_CERT_F"; chmod 600 "$HY_KEY_F"
+    return 0
+}
+
+_setup_hy2_service(){
+    cat > /etc/systemd/system/hysteria-server.service <<EOF
+[Unit]
+Description=Hysteria2 server (official)
+After=network.target nss-lookup.target
+[Service]
+Type=simple
+ExecStart=${HY_BIN} server -c ${HY_CONF}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+_start_hy2_service(){
+    systemctl enable "$HY_SERVICE" >/dev/null 2>&1
+    systemctl restart "$HY_SERVICE"
+    sleep 2
+    if systemctl is-active --quiet "$HY_SERVICE"; then
+        info "hysteria 服务运行中"
+        return 0
+    else
+        error "hysteria 启动失败:"
+        journalctl -u "$HY_SERVICE" -n 15 --no-pager 2>&1 | tail -15
+        return 1
+    fi
+}
+
 init_hy2() {
-    title "配置 Hysteria2"
+    title "配置 Hysteria2（独立官方 hysteria）"
 
     if has_hy2; then
-        warn "Hysteria2 已存在，重新配置将生成新密码/证书"
+        warn "Hysteria2 已存在，重新配置将覆盖并重启服务"
         read -rp "确认继续？[y/N]: " C
         [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
     fi
 
-    local PORT SNI
-    read -rp "监听端口 [默认 ${HY2_PORT_DEFAULT}]: " PORT
-    PORT=${PORT:-$HY2_PORT_DEFAULT}
+    local PORT SNI UP DOWN PASS
+    read -rp "监听端口 [默认 443]: " PORT
+    PORT=${PORT:-443}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
         error "端口必须是 1-65535"; return 1
     fi
     check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
 
-    read -rp "伪装域名（证书 CN）[默认 www.bing.com]: " SNI
+    read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
     SNI=${SNI:-www.bing.com}
 
-    HY2_PORT=$PORT
-    HY2_SNI=$SNI
-    HY2_PASSWORD=$(openssl rand -hex 16)
-    [[ -n "$HY2_PASSWORD" ]] || { error "密码生成失败"; return 1; }
+    read -rp "服务器上行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " UP
+    read -rp "服务器下行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " DOWN
+    UP=${UP:-0}; DOWN=${DOWN:-0}
+    if (( UP <= 0 )) || (( DOWN <= 0 )); then
+        warn "带宽未填或为 0，将不启用 brutal（用默认 BBR，带宽不受限）"
+    fi
 
-    # 自签名证书
-    HY2_CERT="${SBOX_DIR}/hy2-cert.pem"
-    HY2_KEY="${SBOX_DIR}/hy2-key.pem"
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$HY2_KEY" -out "$HY2_CERT" \
-        -days 3650 -subj "/CN=${HY2_SNI}" \
-        -addext "subjectAltName=DNS:${HY2_SNI}" >/dev/null 2>&1
-    [[ -s "$HY2_CERT" && -s "$HY2_KEY" ]] || { error "证书生成失败"; return 1; }
-    chmod 644 "$HY2_CERT" && chmod 640 "$HY2_KEY"
+    PASS=$(openssl rand -hex 16)
+    [[ -n "$PASS" ]] || { error "密码生成失败"; return 1; }
 
-    cat > "$META_HY2" <<EOF
-HY2_PORT=${HY2_PORT}
-HY2_PASSWORD=${HY2_PASSWORD}
-HY2_SNI=${HY2_SNI}
-HY2_CERT=${HY2_CERT}
-HY2_KEY=${HY2_KEY}
+    command -v openssl >/dev/null 2>&1 || apt-get install -y -qq openssl >/dev/null 2>&1
+    _gen_hy2_cert "$SNI" || return 1
+
+    mkdir -p "$HY_DIR" /var/www/masq
+    cat > "$HY_CONF" <<'EOF'
+listen: :443
+obfs:
+  type: salamander
+  salamander:
+    password: OBFSPASS
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
+auth:
+  type: password
+  password: AUTH_PASSWORD
+masquerade:
+  type: proxy
+  proxy:
+    url: https://news.ycombinator.com/
+    rewriteHost: true
+bandwidth:
+  up: UP_SPEED mbps
+  down: DOWN_SPEED mbps
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
 EOF
-    chmod 600 "$META_HY2"
+    sed -i "s|OBFSPASS|${PASS}|g" "$HY_CONF"
+    sed -i "s|AUTH_PASSWORD|${PASS}|g" "$HY_CONF"
+    sed -i "s|UP_SPEED|${UP}|g" "$HY_CONF"
+    sed -i "s|DOWN_SPEED|${DOWN}|g" "$HY_CONF"
+    sed -i "s|listen: :443|listen: :${PORT}|g" "$HY_CONF"
 
-    rebuild_config || return 1
-    _start_sbox || return 1
-    info "Hysteria2 配置完成（端口 ${HY2_PORT}/UDP，自签名证书）"
+    cat > "$META_HY2" <<EOF2
+HY2_PORT=${PORT}
+HY2_SNI=${SNI}
+HY2_PASSWORD=${PASS}
+HY2_UP=${UP}
+HY2_DOWN=${DOWN}
+HY2_CERT=${HY_CERT_F}
+HY2_KEY=${HY_KEY_F}
+EOF2
+    chmod 600 "$META_HY2" "$HY_CONF"
+
+    install_hysteria || return 1
+    _setup_hy2_service || return 1
+    _start_hy2_service || return 1
+    info "Hysteria2 配置完成（端口 ${PORT}/UDP，独立官方服务，带宽 up=${UP} down=${DOWN} Mbps）"
     _print_hy2_link
 }
 
 remove_hy2() {
     has_hy2 || { error "Hysteria2 未启用"; return 1; }
-    read -rp "确认移除 Hysteria2？[y/N]: " C
+    read -rp "确认移除 Hysteria2（停止并删除服务/配置/证书）？[y/N]: " C
     [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    load_meta
-    rm -f "$META_HY2" "$HY2_CERT" "$HY2_KEY"
-    rebuild_config
-    _inject_all_users
-    _start_sbox
-    info "Hysteria2 已移除"
+    systemctl stop "$HY_SERVICE" 2>/dev/null
+    systemctl disable "$HY_SERVICE" 2>/dev/null
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -rf "$HY_DIR"
+    rm -f "$META_HY2"
+    systemctl daemon-reload
+    info "Hysteria2 已移除（二进制保留，可用菜单更新/重装）"
 }
 
 _print_hy2_link() {
     has_hy2 || return 1
-    local HY2_PORT HY2_PASSWORD HY2_SNI SERVER_IP
-    HY2_PORT=$(read_kv "$META_HY2" "HY2_PORT")
-    HY2_PASSWORD=$(read_kv "$META_HY2" "HY2_PASSWORD")
-    HY2_SNI=$(read_kv "$META_HY2" "HY2_SNI")
-    SERVER_IP=$(get_public_ip)
+    local PORT PASS SNI SERVER_IP UP DOWN
+    PORT=$(read_kv "$META_HY2" HY2_PORT); PASS=$(read_kv "$META_HY2" HY2_PASSWORD)
+    SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip)
+    UP=$(read_kv "$META_HY2" HY2_UP); DOWN=$(read_kv "$META_HY2" HY2_DOWN)
     echo ""
     echo -e "${GREEN}===== Hysteria2 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
-    echo -e "端口   : ${HY2_PORT} (UDP)"
-    echo -e "密码   : ${HY2_PASSWORD}"
-    echo -e "SNI    : ${HY2_SNI}"
-    echo -e "证书   : 自签名，客户端需 insecure"
+    echo -e "端口   : ${PORT} (UDP)"
+    echo -e "密码   : ${PASS}"
+    echo -e "SNI    : ${SNI}"
+    echo -e "证书   : 自签名，客户端需 insecure=1"
+    echo -e "混淆   : Salamander（密码同值）"
+    echo -e "带宽   : 上行 ${UP:-0} / 下行 ${DOWN:-0} Mbps (brutal)"
     echo -e "${CYAN}分享链接:${NC}"
-    echo "hy2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?sni=${HY2_SNI}&insecure=1#Hysteria2-${HY2_PORT}"
+    echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1#Hysteria2-${PORT}"
     echo ""
 }
 
@@ -1683,7 +1822,7 @@ for i in d.get('inbounds',[]):
 
     if has_hy2; then
         local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_LINK_SHOW
-        HY2_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        HY2_STATUS=$(systemctl is-active "$HY_SERVICE" 2>/dev/null)
         HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
@@ -1694,7 +1833,7 @@ for i in d.get('inbounds',[]):
         echo -e "端口   : ${HY2_PORT_SHOW} (UDP)"
         echo -e "密码   : ${HY2_PASSWORD_SHOW}"
         echo -e "SNI    : ${HY2_SNI_SHOW}"
-        echo -e "协议   : Hysteria2（自签名，客户端需 insecure）"
+        echo -e "协议   : Hysteria2（独立官方服务，自签名，客户端需 insecure=1）"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$HY2_LINK_SHOW"
         echo ""
@@ -2042,7 +2181,8 @@ main_menu() {
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 sing-box     ${GREEN}13.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}14.${NC} IPv4/IPv6 优先级  ${RED}15.${NC} 卸载 sing-box"
+        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box"
         echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -2062,6 +2202,7 @@ main_menu() {
             11) show_info ;;
             12) update_sbox ;;
             13) update_script ;;
+            16) update_hysteria_binary ;;
             14) ip_priority_menu ;;
             15) uninstall_sbox ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
