@@ -1049,7 +1049,7 @@ _print_hy2_link() {
     echo -e "混淆   : Salamander（密码同值）"
     echo -e "带宽   : 上行 ${UP:-0} / 下行 ${DOWN:-0} Mbps (brutal)"
     echo -e "${CYAN}分享链接:${NC}"
-    echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1#Hysteria2-${PORT}"
+    echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}#Hysteria2-${PORT}"
     echo ""
 }
 
@@ -1826,7 +1826,7 @@ for i in d.get('inbounds',[]):
         HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
-        HY2_LINK_SHOW="hy2://${HY2_PASSWORD_SHOW}@${PUBLIC_IP}:${HY2_PORT_SHOW}/?sni=${HY2_SNI_SHOW}&insecure=1#Hysteria2-${HY2_PORT_SHOW}"
+        HY2_LINK_SHOW="hy2://${HY2_PASSWORD_SHOW}@${PUBLIC_IP}:${HY2_PORT_SHOW}/?sni=${HY2_SNI_SHOW}&insecure=1&obfs=salamander&obfs-password=${HY2_PASSWORD_SHOW}#Hysteria2-${HY2_PORT_SHOW}"
         echo -e "${CYAN}── Hysteria2 节点 ──${NC}"
         echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
