@@ -1,5 +1,5 @@
 #!/bin/bash
-# 多协议节点管理脚本 (sing-box) - Alpine Linux 专用
+# 多协议节点管理脚本 (sing-box) - Alpine Linux 专用 v1.4
 # Reality + Shadowsocks + WS+TLS + Hysteria2 + AnyTLS + 用户管理（创建/到期/续期）
 
 RED='\033[0;31m'
@@ -74,6 +74,17 @@ user_exists() {
 get_user_field() {
     awk -F: -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$USER_DB" 2>/dev/null
 }
+
+# ============== 自下载修复（防止 bash <(curl) 管道运行 $0 是管道） ==============
+_SBOX_SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
+_SBOX_REAL="/usr/local/bin/singbox_manager.sh"
+if [[ ! -f "$0" || "$0" == /proc/* || "$0" == /dev/fd/* ]]; then
+    mkdir -p "$(dirname "$_SBOX_REAL")" 2>/dev/null
+    if curl -fsSL "$_SBOX_SCRIPT_URL" -o "$_SBOX_REAL" 2>/dev/null && [[ -s "$_SBOX_REAL" ]]; then
+        chmod +x "$_SBOX_REAL"
+        exec bash "$_SBOX_REAL" "$@"
+    fi
+fi
 
 # ============== 权限检查 ==============
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
@@ -465,6 +476,8 @@ cfg["route"] = {
 with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
+    # 重建配置后，自动把 DB 里所有 active 用户重新注入，避免 users 为空导致节点无法连接
+    _inject_all_users
 }
 
 # ============================================================
