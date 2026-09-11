@@ -2089,13 +2089,13 @@ install_shortcut() {
     local TARGET="/usr/local/bin/singbox_manager.sh"
     # 复制当前脚本到目标路径
     if [[ "$SELF_PATH" != "$TARGET" ]]; then
-        cp "$SELF_PATH" "$TARGET"
+        cp "$SELF_PATH" "$TARGET" || { error "复制脚本到 $TARGET 失败"; return 1; }
         chmod +x "$TARGET"
     fi
     # c 直接装成管理脚本的完整副本（自包含），不再依赖外部文件。
     # 即使 singbox_manager.sh 丢失，运行 c 也能正常工作；
     # 且每次运行 c 都会把目标文件从自身恢复回去。
-    cp "$TARGET" /usr/local/bin/c
+    cp "$TARGET" /usr/local/bin/c || { error "安装快捷命令 c 失败"; return 1; }
     chmod +x /usr/local/bin/c
     info "快捷命令已安装: c"
 }
@@ -2218,9 +2218,10 @@ main_menu() {
 # ============================================================
 # 脚本入口
 # ============================================================
-check_system
-normalize_user_db
+# 先把快捷命令 c 装上，保证无论后面发生什么，c 都可用。
+# c 装好后，即使系统检查/初始化出错，用户也能直接敲 c 重进菜单排查。
 install_shortcut
+normalize_user_db
 main_menu
 
 
