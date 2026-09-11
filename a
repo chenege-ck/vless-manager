@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.0
+# VLESS 智能节点控制台 (sing-box) v1.2
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -1894,12 +1894,24 @@ update_sbox() {
 # ============================================================
 update_script() {
     title "更新管理脚本..."
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/vless.sh"
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a"
     info "正在从 GitHub 拉取最新版本..."
     local TMP_SCRIPT="/tmp/singbox_new.sh"
-    curl -fsSL "$SCRIPT_URL" -o "$TMP_SCRIPT"
-    if [[ $? -ne 0 || ! -s "$TMP_SCRIPT" ]]; then
-        error "下载失败，请检查网络"; return
+    # 用 -f 让 curl 返回 HTTP 错误码（404 等），以便区分"仓库不存在"和"纯网络失败"
+    rm -f "$TMP_SCRIPT"
+    local HTTP_CODE
+    HTTP_CODE=$(curl -fsSL -w '%{http_code}' "$SCRIPT_URL" -o "$TMP_SCRIPT" 2>/dev/null)
+    local CURL_RC=$?
+    if [[ $CURL_RC -ne 0 || -z "$HTTP_CODE" ]]; then
+        error "下载失败（可能是网络不通或 GitHub 被墙），请检查网络或稍后重试"; return
+    fi
+    if [[ "$HTTP_CODE" == "404" || "$HTTP_CODE" == "403" ]]; then
+        error "GitHub 上的管理脚本仓库不存在（Http $HTTP_CODE），无法自动更新"
+        error "请手动从作者仓库获取较新版本，或忽略此选项"
+        return
+    fi
+    if [[ "$HTTP_CODE" != "200" || ! -s "$TMP_SCRIPT" ]]; then
+        error "下载失败（Http $HTTP_CODE），请稍后重试"; return
     fi
     # 检查是否是合法脚本（防止 404 页面覆盖）
     if ! head -1 "$TMP_SCRIPT" | grep -q "^#!/bin/bash"; then
@@ -2160,7 +2172,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.0${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.2${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
