@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.2
+# VLESS 智能节点控制台 (sing-box) v1.4
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -71,6 +71,17 @@ user_exists() {
 get_user_field() {
     awk -F: -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$USER_DB" 2>/dev/null
 }
+
+# ============== 自下载修复（防止 bash <(curl) 管道运行 $0 是管道） ==============
+_SBOX_SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a"
+_SBOX_REAL="/usr/local/bin/singbox_manager.sh"
+if [[ ! -f "$0" || "$0" == /proc/* || "$0" == /dev/fd/* ]]; then
+    mkdir -p "$(dirname "$_SBOX_REAL")" 2>/dev/null
+    if curl -fsSL "$_SBOX_SCRIPT_URL" -o "$_SBOX_REAL" 2>/dev/null && [[ -s "$_SBOX_REAL" ]]; then
+        chmod +x "$_SBOX_REAL"
+        exec bash "$_SBOX_REAL" "$@"
+    fi
+fi
 
 # ============== 权限检查 ==============
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
@@ -621,6 +632,8 @@ cfg["route"] = {
 with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
+    # 重建配置后，把 DB 里所有 active 用户重新注入，避免 users 为空导致节点无法连接
+    _inject_all_users
 }
 
 # ============================================================
@@ -2099,14 +2112,12 @@ install_shortcut() {
     local SELF_PATH
     SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
     local TARGET="/usr/local/bin/singbox_manager.sh"
-    # 复制当前脚本到目标路径
+    # 用 cat 而非 cp，兼容 bash <(curl) 管道运行方式（cp 会因 /proc/.../pipe 失败）
     if [[ "$SELF_PATH" != "$TARGET" ]]; then
-        cp "$SELF_PATH" "$TARGET" || { error "复制脚本到 $TARGET 失败"; return 1; }
+        cat "$0" > "$TARGET" 2>/dev/null
+        [[ $? -ne 0 || ! -s "$TARGET" ]] && { error "复制脚本到 $TARGET 失败"; return 1; }
         chmod +x "$TARGET"
     fi
-    # c 直接装成管理脚本的完整副本（自包含），不再依赖外部文件。
-    # 即使 singbox_manager.sh 丢失，运行 c 也能正常工作；
-    # 且每次运行 c 都会把目标文件从自身恢复回去。
     cp "$TARGET" /usr/local/bin/c || { error "安装快捷命令 c 失败"; return 1; }
     chmod +x /usr/local/bin/c
     info "快捷命令已安装: c"
@@ -2172,7 +2183,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.2${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.4${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
