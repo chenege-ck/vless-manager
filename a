@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.4
+# VLESS 智能节点控制台 (sing-box) v1.5
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -574,10 +574,13 @@ if os.environ.get("HAS_REALITY") == "1":
     })
 
 if os.environ.get("HAS_SS") == "1":
+    # SS 多用户（SS-2022 EIH）：顶层 password 是服务端主密钥（老单密码客户端继续能用），
+    # users[] 是各用户独立 EIH 密钥，由 _inject_all_users 按 users.db 注入
     cfg["inbounds"].append({
         "type": "shadowsocks", "tag": "inbound-shadowsocks",
         "listen": "::", "listen_port": int(os.environ["SS_PORT"]),
-        "method": os.environ["SS_METHOD"], "password": os.environ["SS_PASSWORD"]
+        "method": os.environ["SS_METHOD"], "password": os.environ["SS_PASSWORD"],
+        "users": []
     })
 
 if os.environ.get("HAS_WS") == "1":
@@ -637,17 +640,19 @@ PYEOF
 }
 
 # ============================================================
-# 注入用户到 config.json（Reality 和 WS）
+# 注入用户到 config.json（Reality/WS 用 UUID，SS 用独立密码）
+# 用法：_inject_user <UUID> <NAME> <EXPIRE> <NODE> [SSPASS]
 # ============================================================
 _inject_user() {
-    local UUID=$1 NAME=$2 EXPIRE=$3 NODE=$4
+    local UUID=$1 NAME=$2 EXPIRE=$3 NODE=$4 SSPASS=${5:-}
 
-    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" \
+    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" INJECT_SSPASS="$SSPASS" \
     INJECT_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
 import json, os
 uuid = os.environ["INJECT_UUID"]
 name = os.environ["INJECT_NAME"]
 node = os.environ["INJECT_NODE"]
+sspass = os.environ.get("INJECT_SSPASS", "")
 cfg_path = os.environ["INJECT_CONFIG"]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
@@ -661,6 +666,13 @@ for inbound in cfg.get("inbounds", []):
     users = inbound.get("users")
     if users is None:
         continue
+    # SS 入口：按用户名(name)管理独立 EIH 密码
+    if tag == "inbound-shadowsocks":
+        if node in ("ss", "both") or (node not in ("reality", "ws") and node != ""):
+            inbound["users"] = [u for u in users if u.get("name") != name]
+            if sspass:
+                inbound["users"].append({"name": name, "password": sspass})
+        continue
     # 仅对 VLESS 节点操作用户列表，跳过 Hysteria2 / AnyTLS 等
     if tag not in VLESS_TAGS:
         continue
@@ -668,7 +680,7 @@ for inbound in cfg.get("inbounds", []):
     inbound["users"] = [u for u in users if u.get("uuid") != uuid]
     # 按节点类型注入
     should_add = False
-    if node == "both":
+    if node in ("both", "ss"):
         should_add = True
     elif node == "reality" and tag == "inbound-reality":
         should_add = True
@@ -691,10 +703,10 @@ PYEOF
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
     normalize_user_db
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
         [[ "$STATUS" != "active" ]] && continue
         NODE=${NODE:-both}
-        _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE"
+        _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE" "$SSPASS"
     done < "$USER_DB"
 }
 
@@ -1233,7 +1245,7 @@ init_config() {
 # 打印用户分享链接
 # ============================================================
 _print_link() {
-    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both}
+    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both} SSPASS=${5:-}
     load_meta
 
     local EXPIRE_SHOW
@@ -1268,6 +1280,23 @@ for i in d.get('inbounds',[]):
         local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
+    fi
+
+    if [[ "$NODE" == "ss" || "$NODE" == "both" ]] && has_shadowsocks; then
+        # SS 个人密码（users.db 第6段）；老用户升级前可能为空，此时不打印个人链接
+        if [[ -n "$SSPASS" ]]; then
+            local SS_USERINFO SS_LINK
+            SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | base64 -w0)
+            SS_LINK="ss://${SS_USERINFO}@${SERVER_IP:-$(get_public_ip)}:${SS_PORT}#${USERNAME}-ss"
+            echo ""
+            echo -e "${CYAN}── Shadowsocks 个人节点 ──${NC}"
+            echo -e "地址   : ${SERVER_IP:-$(get_public_ip)}"
+            echo -e "端口   : ${SS_PORT}"
+            echo -e "加密   : ${SS_METHOD}"
+            echo -e "密码   : ${SSPASS}（个人独立密码）"
+            echo -e "${CYAN}分享链接:${NC}"
+            echo "$SS_LINK"
+        fi
     fi
 
     if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
@@ -1307,9 +1336,10 @@ add_user() {
     local AVAIL_NODES=()
     has_reality && AVAIL_NODES+=("reality")
     has_ws && AVAIL_NODES+=("ws")
+    has_shadowsocks && AVAIL_NODES+=("ss")
 
     if [[ ${#AVAIL_NODES[@]} -eq 0 ]]; then
-        error "尚未配置 Reality 或 WS 节点，请先初始化"
+        error "尚未配置 Reality、WS 或 SS 节点，请先初始化"
         return
     fi
 
@@ -1317,20 +1347,25 @@ add_user() {
         NODE="${AVAIL_NODES[0]}"
         local NODE_DESC="Reality"
         [[ "$NODE" == "ws" ]] && NODE_DESC="WS+CF"
+        [[ "$NODE" == "ss" ]] && NODE_DESC="Shadowsocks"
         echo ""
         info "当前仅有 ${NODE_DESC} 节点，用户将加入该节点"
     else
         echo ""
         echo "请选择加入的节点："
-        echo -e "  ${GREEN}1.${NC} Reality + WS"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS"
-        read -rp "选择 [1/2/3，默认1]: " NODE_SEL
-        case ${NODE_SEL:-1} in
-            2) NODE="reality" ;;
-            3) NODE="ws" ;;
-            *) NODE="both" ;;
-        esac
+        local IDX=1 OPT_ALL=0 OPT_R=0 OPT_W=0 OPT_S=0
+        if has_reality && has_ws; then
+            echo -e "  ${GREEN}${IDX}.${NC} Reality + WS"; OPT_ALL=$IDX; IDX=$((IDX+1))
+        fi
+        has_reality && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Reality"; OPT_R=$IDX; IDX=$((IDX+1)); }
+        has_ws && { echo -e "  ${GREEN}${IDX}.${NC} 仅 WS"; OPT_W=$IDX; IDX=$((IDX+1)); }
+        has_shadowsocks && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Shadowsocks（独立密码）"; OPT_S=$IDX; IDX=$((IDX+1)); }
+        read -rp "选择 [默认${OPT_ALL:-$OPT_R}]: " NODE_SEL
+        NODE_SEL=${NODE_SEL:-${OPT_ALL:-$OPT_R}}
+        if [[ "$NODE_SEL" == "$OPT_R" && "$OPT_R" != "0" ]]; then NODE="reality"
+        elif [[ "$NODE_SEL" == "$OPT_W" && "$OPT_W" != "0" ]]; then NODE="ws"
+        elif [[ "$NODE_SEL" == "$OPT_S" && "$OPT_S" != "0" ]]; then NODE="ss"
+        else NODE="both"; fi
     fi
 
     read -rp "到期天数 [默认 999 天]: " DAYS
@@ -1343,8 +1378,22 @@ add_user() {
     [[ -z "$EXPIRE" ]] && { error "到期时间计算失败"; return; }
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
-    _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE"
+    # SS-2022(16字节)/chacha20(32字节)按加密方法生成对应长度的独立密码；传统 AEAD 沿用服务端主密码
+    local SSPASS=""
+    if [[ "$NODE" == "ss" || "$NODE" == "both" ]]; then
+        case "${SS_METHOD:-2022-blake3-aes-128-gcm}" in
+            2022-blake3-aes-128-gcm) SSPASS=$("$SBOX_BIN" generate rand --base64 16 2>/dev/null || openssl rand -base64 16) ;;
+            2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) SSPASS=$("$SBOX_BIN" generate rand --base64 32 2>/dev/null || openssl rand -base64 32) ;;
+            *) SSPASS="$SS_PASSWORD" ;;
+        esac
+        [[ -z "$SSPASS" ]] && { error "SS 独立密码生成失败"; return 1; }
+    fi
+    if [[ -n "$SSPASS" ]]; then
+        echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}" >> "$USER_DB"
+    else
+        echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
+    fi
+    _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE" "$SSPASS"
 
     validate_sbox_config || {
         python3 - <<PYEOF
@@ -1370,7 +1419,7 @@ PYEOF
         error "启动失败，已回滚本次添加"; return 1
     }
 
-    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE" "$SSPASS"
 }
 
 # ============================================================
@@ -1391,9 +1440,10 @@ delete_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local USER_NODE DEL_NODE="both"
+    local USER_NODE DEL_NODE="both" USER_SSPASS=""
     USER_NODE=$(get_user_field "$USERNAME" 5)
     USER_NODE=${USER_NODE:-both}
+    USER_SSPASS=$(get_user_field "$USERNAME" 6)
 
     if [[ "$USER_NODE" == "both" ]] && has_reality && has_ws; then
         echo "删除哪个节点的权限？"
@@ -1406,10 +1456,12 @@ delete_user() {
         DEL_NODE="$USER_NODE"
     fi
 
-    # 从 config.json 移除
-    python3 - <<PYEOF
-import json
+    # 从 config.json 移除（SS 按用户名 name 删，VLESS 按 uuid 删）
+    USER_SSPASS="$USER_SSPASS" python3 - <<PYEOF
+import json, os
 del_node = "$DEL_NODE"
+ss_name = "$USERNAME"
+ss_nodes = {"ss", "both"}
 with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg.get("inbounds", []):
@@ -1417,7 +1469,10 @@ for inbound in cfg.get("inbounds", []):
     users = inbound.get("users")
     if users is None:
         continue
-    if del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
+    if tag == "inbound-shadowsocks":
+        if del_node in ss_nodes:
+            inbound["users"] = [u for u in users if u.get("name") != ss_name]
+    elif del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
         inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
 with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
@@ -1476,16 +1531,19 @@ toggle_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local USER_NODE OP_NODE
+    local USER_NODE OP_NODE USER_SSPASS=""
     USER_NODE=$(get_user_field "$USERNAME" 5)
     USER_NODE=${USER_NODE:-both}
     OP_NODE="$USER_NODE"
+    USER_SSPASS=$(get_user_field "$USERNAME" 6)
 
     if [[ "$ACTION" == "disable" ]]; then
-        # 从 config.json 移除
+        # 从 config.json 移除（SS 按名删，VLESS 按 uuid 删）
         python3 - <<PYEOF
 import json
 op_node = "$OP_NODE"
+ss_name = "$USERNAME"
+ss_nodes = {"ss", "both"}
 with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg.get("inbounds", []):
@@ -1493,13 +1551,16 @@ for inbound in cfg.get("inbounds", []):
     users = inbound.get("users")
     if users is None:
         continue
-    if op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
+    if tag == "inbound-shadowsocks":
+        if op_node in ss_nodes:
+            inbound["users"] = [u for u in users if u.get("name") != ss_name]
+    elif op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
         inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
 with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
-        # 更新 db 状态
+        # 更新 db 状态（保留第6段 SS 密码，启用时还能注回去）
         python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -1512,7 +1573,7 @@ for line in lines:
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
     parts[3] = "disabled"
-    out.append(":".join(parts[:5]))
+    out.append(":".join(parts))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已禁用"
@@ -1529,7 +1590,32 @@ PYEOF
             return
         fi
 
-        _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$OP_NODE"
+        # SS 密码丢失时（如老用户升级前没存）补一个，保证启用后 SS 可用
+        if [[ "$OP_NODE" == "ss" || "$OP_NODE" == "both" ]]; then
+            if [[ -z "$USER_SSPASS" ]]; then
+                load_meta
+                case "${SS_METHOD:-2022-blake3-aes-128-gcm}" in
+                    2022-blake3-aes-128-gcm) USER_SSPASS=$("$SBOX_BIN" generate rand --base64 16 2>/dev/null || openssl rand -base64 16) ;;
+                    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) USER_SSPASS=$("$SBOX_BIN" generate rand --base64 32 2>/dev/null || openssl rand -base64 32) ;;
+                    *) USER_SSPASS="$SS_PASSWORD" ;;
+                esac
+                DB_SSPASS="$USER_SSPASS" TARGET_USER="$USERNAME" python3 - <<'PYEOF2'
+import os
+from pathlib import Path
+p = Path("$USER_DB")
+out = []
+for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+    parts = line.split(":")
+    if parts and parts[0] == os.environ["TARGET_USER"]:
+        while len(parts) < 6:
+            parts.append("")
+        parts[5] = os.environ["DB_SSPASS"]
+    out.append(":".join(parts))
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF2
+            fi
+        fi
+        _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$OP_NODE" "$USER_SSPASS"
 
         python3 - <<PYEOF
 from pathlib import Path
@@ -1543,7 +1629,7 @@ for line in lines:
     if len(parts) < 5:
         parts += ["both"] * (5 - len(parts))
     parts[3] = "active"
-    out.append(":".join(parts[:5]))
+    out.append(":".join(parts))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已启用"
@@ -1580,28 +1666,33 @@ renew_user() {
 
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    local STATUS NODE
+    local STATUS NODE SSPASS=""
     STATUS=$(get_user_field "$USERNAME" 4)
     NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
     STATUS=${STATUS:-active}
+    SSPASS=$(get_user_field "$USERNAME" 6)
 
-    # 更新 db（续期后恢复为 active）
+    # 更新 db（续期后恢复为 active，保留第6段 SS 密码）
     python3 - <<PYEOF
 from pathlib import Path
+keep_ss = """$SSPASS"""
 p = Path("$USER_DB")
 lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
 for line in lines:
     parts = line.split(":")
     if len(parts) >= 2 and parts[0] == "$USERNAME" and parts[1] == "$UUID":
-        out.append("$USERNAME:$UUID:$NEW_EXPIRE:active:$NODE")
+        row = "$USERNAME:$UUID:$NEW_EXPIRE:active:$NODE"
+        if keep_ss:
+            row += ":" + keep_ss
+        out.append(row)
     else:
         out.append(line)
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
-    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE"
+    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE" "$SSPASS"
     validate_sbox_config && systemctl restart "$SERVICE_NAME"
 
     if [[ "$STATUS" == "disabled" ]]; then
@@ -1626,7 +1717,7 @@ list_users() {
     echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
     echo -e "  ${YELLOW}%-15s %-38s %-20s %-8s %-8s${NC}" "用户名" "UUID" "到期时间" "状态" "节点"
     echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
         NODE=${NODE:-both}
         local COLOR=$NC STATUS_ICON="○" EXPIRE_SHOW
         EXPIRE_SHOW=$(expire_display "$EXPIRE")
@@ -1648,7 +1739,7 @@ list_users_brief() {
     normalize_user_db
     echo ""
     [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
         NODE=${NODE:-both}
         printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
     done < "$USER_DB"
@@ -1699,7 +1790,7 @@ check_expire() {
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
         [[ "$STATUS" != "active" ]] && continue
         local EXPIRE_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
@@ -1726,23 +1817,34 @@ for line in lines:
         if len(parts) < 5:
             parts += ["both"] * (5 - len(parts))
         parts[3] = "disabled"
-        out.append(":".join(parts[:5]))
+        out.append(":".join(parts))
     else:
         out.append(line)
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
-        # 批量从 config.json 移除
-        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$SBOX_CONFIG" python3 - <<'PYEOF'
+        # 批量从 config.json 移除（VLESS 按 uuid，SS 按用户名 name）
+        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$SBOX_CONFIG" DB_PATH="$USER_DB" python3 - <<'PYEOF'
 import json, os
 expired = set(os.environ["BATCH_UUIDS"].split())
+names = set()
+try:
+    for line in open(os.environ["DB_PATH"], encoding="utf-8", errors="ignore").read().splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[1] in expired:
+            names.add(parts[0])
+except OSError:
+    pass
 with open(os.environ["CFG_PATH"], "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg.get("inbounds", []):
     users = inbound.get("users")
     if users is None:
         continue
-    inbound["users"] = [u for u in users if u.get("uuid") not in expired]
+    if inbound.get("tag") == "inbound-shadowsocks":
+        inbound["users"] = [u for u in users if u.get("name") not in names]
+    else:
+        inbound["users"] = [u for u in users if u.get("uuid") not in expired]
 with open(os.environ["CFG_PATH"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
@@ -1800,7 +1902,7 @@ for i in d.get('inbounds',[]):
         if [[ -f "$USER_DB" ]]; then
             echo -e "${CYAN}分享链接:${NC}"
             local RNAME RUUID REXP RSTATUS RNODE
-            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE; do
+            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS; do
                 [[ "$RSTATUS" != "active" ]] && continue
                 RNODE=${RNODE:-both}
                 [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
@@ -1818,9 +1920,22 @@ for i in d.get('inbounds',[]):
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${SS_PORT}"
         echo -e "加密   : ${SS_METHOD}"
-        echo -e "密码   : ${SS_PASSWORD}"
+        echo -e "密码   : ${SS_PASSWORD}（公共密码，老客户端继续可用）"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$SS_LINK_SHOW"
+        # 各用户的独立密码链接
+        if [[ -f "$USER_DB" ]]; then
+            local SNAME SUUID SEXP SSTATUS SNODE SSPW SS_UI SS_LK
+            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW; do
+                [[ "$SSTATUS" != "active" ]] && continue
+                SNODE=${SNODE:-both}
+                [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
+                [[ -z "$SSPW" ]] && continue
+                SS_UI=$(printf '%s' "${SS_METHOD}:${SSPW}" | base64 -w0)
+                SS_LK="ss://${SS_UI}@${PUBLIC_IP}:${SS_PORT}#${SNAME}-ss"
+                echo "[${SNAME}] ${SS_LK}"
+            done < "$USER_DB"
+        fi
         echo ""
     fi
 
@@ -2183,7 +2298,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.4${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.5${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
