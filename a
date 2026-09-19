@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.5
+# VLESS 智能节点控制台 (sing-box) v1.6
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -1762,19 +1762,20 @@ show_user_link() {
         error "用户不存在"; return
     fi
 
-    local UUID EXPIRE NODE STATUS
+    local UUID EXPIRE NODE STATUS SSPASS
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
     EXPIRE=$(get_user_field "$USERNAME" 3)
     STATUS=$(get_user_field "$USERNAME" 4)
     NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
+    SSPASS=$(get_user_field "$USERNAME" 6)
 
     if [[ "$STATUS" == "disabled" ]]; then
         warn "用户 ${USERNAME} 当前已禁用"
     fi
 
-    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE" "$SSPASS"
 }
 
 # ============================================================
@@ -2298,7 +2299,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.5${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.6${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
