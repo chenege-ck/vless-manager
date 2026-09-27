@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.8
+# VLESS 智能节点控制台 (sing-box) v1.8.1
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -1042,7 +1042,7 @@ init_hy2() {
     if [[ "$HOP_ASK" == "y" || "$HOP_ASK" == "Y" ]]; then
         HOP_START=$((RANDOM % 40000 + 10000))
         HOP_END=$((HOP_START + 999))
-        HOP_RANGE=":${HOP_START}-${HOP_END}"
+        HOP_RANGE=", :${HOP_START}-${HOP_END}"
         info "Port-hop range ${HOP_START}-${HOP_END}"
     fi
 
@@ -1083,7 +1083,7 @@ EOF
 HY2_PORT=${PORT}
 HY2_SNI=${SNI}
 HY2_PASSWORD=${PASS}
-HY2_PORT_RANGE=${HOP_RANGE#:}
+HY2_PORT_RANGE=${HOP_RANGE#, :}
 HY2_CERT=${HY_CERT_F}
 HY2_KEY=${HY_KEY_F}
 EOF2
@@ -1959,6 +1959,20 @@ quota_show() {
     done < "$USER_DB"
 }
 
+quota_menu() {
+    while true; do
+        quota_show
+        read -rp "pick 1-set 2-collect 3-enforce 4-reset 0-back: " Q
+        case $Q in
+            1) quota_set ;;
+            2) quota_collect; quota_show ;;
+            3) quota_enforce ;;
+            4) quota_reset_monthly ;;
+            0) return ;;
+        esac
+    done
+}
+
 # ============================================================
 # 到期检查（cron 调用）
 # ============================================================
@@ -2496,7 +2510,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.1${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
