@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.6
+# VLESS 智能节点控制台 (sing-box) v1.7
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -206,17 +206,28 @@ for line in lines:
     elif len(parts) >= 5:
         name = parts[0]
         uuid = parts[1]
-        status = parts[-2]
-        node = parts[-1] or "both"
-        expire = ":".join(parts[2:-2])
-        if len(parts) != 5:
+        sspass = ""
+        if len(parts) == 5:
+            expire, status, node = parts[2], parts[3], (parts[4] or "both")
+        elif len(parts) == 6:
+            # 6-segment line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS (base64 has no colon, fixed positions)
+            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
+        else:
+            # corrupted line (>6 fields): best-effort, mark changed
+            status = parts[-2]
+            node = parts[-1] or "both"
+            sspass = parts[-1] if len(parts) > 6 else ""
+            expire = parts[2]
             changed = True
     else:
         continue
     expire2 = normalize_expire(expire)
     if expire2 != expire:
         changed = True
-    out.append(":".join([name, uuid, expire2, status, node]))
+    row = [name, uuid, expire2, status, node]
+    if sspass:
+        row.append(sspass)
+    out.append(":".join(row))
 
 if changed:
     p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
@@ -441,14 +452,42 @@ uninstall_sbox() {
     read -rp "确认卸载？将删除所有配置和用户数据 [y/N]: " CONFIRM
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
 
-    systemctl stop "$SERVICE_NAME" 2>/dev/null
-    systemctl disable "$SERVICE_NAME" 2>/dev/null
-    rm -f "$SBOX_BIN"
+    # 1. 停全部相关服务（含独立服务与机器人）
+    for u in "$SERVICE_NAME" "hysteria-server" "sbox-tgbot"; do
+        systemctl stop "$u" 2>/dev/null
+        systemctl disable "$u" 2>/dev/null
+    done
+    # 2. 删 systemd 单元
     rm -f /etc/systemd/system/sing-box.service
-    rm -rf "$SBOX_DIR"
-    crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /etc/systemd/system/sbox-tgbot.service
     systemctl daemon-reload
-    info "sing-box 已完全卸载"
+    systemctl reset-failed 2>/dev/null
+    # 3. 删二进制与快捷命令
+    rm -f "$SBOX_BIN"
+    rm -f /usr/local/bin/hysteria
+    rm -f /usr/local/bin/singbox_manager.sh
+    rm -f /usr/local/bin/c
+    # 4. 删全部配置与元数据（含 sing-box / hysteria / 机器人 / SSL）
+    rm -rf "$SBOX_DIR"
+    rm -rf /etc/hysteria
+    rm -rf /etc/vless-manager
+    rm -rf /etc/sing-box
+    rm -f /etc/sing-box/ssl/ws.crt /etc/sing-box/ssl/ws.key
+    # 5. 清 cron 与 logrotate（含过期检查与日志）
+    crontab -l 2>/dev/null | grep -v "check-expire" | crontab - 2>/dev/null
+    rm -f /etc/logrotate.d/sbox-expire
+    rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
+    # 6. 打印残留自检
+    echo ""
+    echo "残留自检："
+    local leftover=0
+    for f in /usr/local/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/vless-manager /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/systemd/system/sbox-tgbot.service; do
+        if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
+    done
+    if crontab -l 2>/dev/null | grep -q "check-expire"; then echo "  残留: cron check-expire"; leftover=1; fi
+    if systemctl list-unit-files 2>/dev/null | grep -qE "sing-box|hysteria-server|sbox-tgbot"; then echo "  残留: systemd unit-file"; leftover=1; fi
+    [[ "$leftover" -eq 0 ]] && info "无残留，sing-box 已完全卸载" || warn "存在残留，请按上面路径手动处理"
     exit 0
 }
 
@@ -668,10 +707,8 @@ for inbound in cfg.get("inbounds", []):
         continue
     # SS 入口：按用户名(name)管理独立 EIH 密码
     if tag == "inbound-shadowsocks":
-        if node in ("ss", "both") or (node not in ("reality", "ws") and node != ""):
-            inbound["users"] = [u for u in users if u.get("name") != name]
-            if sspass:
-                inbound["users"].append({"name": name, "password": sspass})
+        # single-password mode: only master password works, drop per-user entries
+        inbound["users"] = [u for u in users if u.get("name") != name]
         continue
     # 仅对 VLESS 节点操作用户列表，跳过 Hysteria2 / AnyTLS 等
     if tag not in VLESS_TAGS:
@@ -680,7 +717,7 @@ for inbound in cfg.get("inbounds", []):
     inbound["users"] = [u for u in users if u.get("uuid") != uuid]
     # 按节点类型注入
     should_add = False
-    if node in ("both", "ss"):
+    if node == "both":
         should_add = True
     elif node == "reality" and tag == "inbound-reality":
         should_add = True
@@ -1282,8 +1319,7 @@ for i in d.get('inbounds',[]):
         echo "$LINK"
     fi
 
-    if [[ "$NODE" == "ss" || "$NODE" == "both" ]] && has_shadowsocks; then
-        # SS 个人密码（users.db 第6段）；老用户升级前可能为空，此时不打印个人链接
+    if false; then # 单密码模式：不再展示 SS 个人节点，只用主密码
         if [[ -n "$SSPASS" ]]; then
             local SS_USERINFO SS_LINK
             SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | base64 -w0)
@@ -1378,21 +1414,9 @@ add_user() {
     [[ -z "$EXPIRE" ]] && { error "到期时间计算失败"; return; }
 
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    # SS-2022(16字节)/chacha20(32字节)按加密方法生成对应长度的独立密码；传统 AEAD 沿用服务端主密码
+    # 单密码模式：SS 只用初始化时的主密码，不再给每个用户生成独立密码
     local SSPASS=""
-    if [[ "$NODE" == "ss" || "$NODE" == "both" ]]; then
-        case "${SS_METHOD:-2022-blake3-aes-128-gcm}" in
-            2022-blake3-aes-128-gcm) SSPASS=$("$SBOX_BIN" generate rand --base64 16 2>/dev/null || openssl rand -base64 16) ;;
-            2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) SSPASS=$("$SBOX_BIN" generate rand --base64 32 2>/dev/null || openssl rand -base64 32) ;;
-            *) SSPASS="$SS_PASSWORD" ;;
-        esac
-        [[ -z "$SSPASS" ]] && { error "SS 独立密码生成失败"; return 1; }
-    fi
-    if [[ -n "$SSPASS" ]]; then
-        echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}" >> "$USER_DB"
-    else
-        echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
-    fi
+    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE" "$SSPASS"
 
     validate_sbox_config || {
@@ -1500,7 +1524,7 @@ out = []
 for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
     parts = line.split(":")
     if parts and parts[0] == os.environ["TARGET_USER"]:
-        parts = (parts + ["both"] * 5)[:5]
+        parts = (parts + ["both"] * 6)[:6]
         parts[4] = os.environ["NEW_NODE"]
     out.append(":".join(parts))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
@@ -1590,8 +1614,8 @@ PYEOF
             return
         fi
 
-        # SS 密码丢失时（如老用户升级前没存）补一个，保证启用后 SS 可用
-        if [[ "$OP_NODE" == "ss" || "$OP_NODE" == "both" ]]; then
+        # 单密码模式：不再补 SS 独立密码，只用主密码
+        if false; then
             if [[ -z "$USER_SSPASS" ]]; then
                 load_meta
                 case "${SS_METHOD:-2022-blake3-aes-128-gcm}" in
@@ -1924,8 +1948,8 @@ for i in d.get('inbounds',[]):
         echo -e "密码   : ${SS_PASSWORD}（公共密码，老客户端继续可用）"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$SS_LINK_SHOW"
-        # 各用户的独立密码链接
-        if [[ -f "$USER_DB" ]]; then
+        # 单密码模式：不再展示各用户独立密码链接，只保留主密码
+        if false; then
             local SNAME SUUID SEXP SSTATUS SNODE SSPW SS_UI SS_LK
             while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW; do
                 [[ "$SSTATUS" != "active" ]] && continue
