@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.7
+# VLESS 智能节点控制台 (sing-box) v1.8
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -206,17 +206,25 @@ for line in lines:
     elif len(parts) >= 5:
         name = parts[0]
         uuid = parts[1]
-        sspass = ""
-        if len(parts) == 5:
+        sspass, quota, used = "", "0", "0"
+        if len(parts) == 4:
+            expire, status, node = parts[2], parts[3], "both"
+            changed = True
+        elif len(parts) == 5:
             expire, status, node = parts[2], parts[3], (parts[4] or "both")
         elif len(parts) == 6:
-            # 6-segment line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS (base64 has no colon, fixed positions)
+            # 6-segment legacy line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS
             expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
+            changed = True
+        elif len(parts) == 8:
+            # 8-segment v1.8 line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS:QUOTA_GB:USED_GB
+            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
+            quota = parts[6] if parts[6] else "0"
+            used = parts[7] if len(parts) > 7 and parts[7] else "0"
         else:
-            # corrupted line (>6 fields): best-effort, mark changed
+            # corrupted line: best-effort, mark changed
             status = parts[-2]
             node = parts[-1] or "both"
-            sspass = parts[-1] if len(parts) > 6 else ""
             expire = parts[2]
             changed = True
     else:
@@ -224,9 +232,7 @@ for line in lines:
     expire2 = normalize_expire(expire)
     if expire2 != expire:
         changed = True
-    row = [name, uuid, expire2, status, node]
-    if sspass:
-        row.append(sspass)
+    row = [name, uuid, expire2, status, node, sspass, quota, used]
     out.append(":".join(row))
 
 if changed:
@@ -475,9 +481,10 @@ uninstall_sbox() {
     rm -rf /etc/sing-box
     rm -f /etc/sing-box/ssl/ws.crt /etc/sing-box/ssl/ws.key
     # 5. 清 cron 与 logrotate（含过期检查与日志）
-    crontab -l 2>/dev/null | grep -v "check-expire" | crontab - 2>/dev/null
+    crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset" | crontab - 2>/dev/null
     rm -f /etc/logrotate.d/sbox-expire
     rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
+    rm -rf /var/lib/sbox
     # 6. 打印残留自检
     echo ""
     echo "残留自检："
@@ -584,7 +591,18 @@ rebuild_config() {
     HAS_HY2=0; has_hy2 && HAS_HY2=1
     HAS_ANYTLS=0; has_anytls && HAS_ANYTLS=1
 
-    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO
+    local CLASH_SECRET=""
+    [[ -f "$META" ]] && CLASH_SECRET=$(read_kv "$META" "CLASH_SECRET")
+    if [[ -z "$CLASH_SECRET" ]]; then
+        CLASH_SECRET=$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-')
+        mkdir -p "$(dirname "$META")"; touch "$META"
+        if grep -q "^CLASH_SECRET=" "$META" 2>/dev/null; then
+            sed -i "s|^CLASH_SECRET=.*|CLASH_SECRET=${CLASH_SECRET}|" "$META"
+        else
+            echo "CLASH_SECRET=${CLASH_SECRET}" >> "$META"
+        fi
+    fi
+    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO CLASH_SECRET
     export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
@@ -595,6 +613,8 @@ rebuild_config() {
 import json, os
 
 cfg = {"log": {"level": "warn", "timestamp": True}, "inbounds": [], "outbounds": []}
+
+cfg["experimental"] = {"clash_api": {"external_controller": "127.0.0.1:19090", "secret": os.environ.get("CLASH_SECRET", "")}}
 
 if os.environ.get("HAS_REALITY") == "1":
     cfg["inbounds"].append({
@@ -740,7 +760,7 @@ PYEOF
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
     normalize_user_db
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         [[ "$STATUS" != "active" ]] && continue
         NODE=${NODE:-both}
         _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE" "$SSPASS"
@@ -997,7 +1017,7 @@ _start_hy2_service(){
 }
 
 init_hy2() {
-    title "配置 Hysteria2（独立官方 hysteria）"
+    title "配置 Hysteria2（独立官方 hysteria,BBR不限速）"
 
     if has_hy2; then
         warn "Hysteria2 已存在，重新配置将覆盖并重启服务"
@@ -1005,7 +1025,7 @@ init_hy2() {
         [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
     fi
 
-    local PORT SNI UP DOWN PASS
+    local PORT SNI PASS HOP_ASK HOP_RANGE HOP_START HOP_END
     read -rp "监听端口 [默认 443]: " PORT
     PORT=${PORT:-443}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
@@ -1016,11 +1036,14 @@ init_hy2() {
     read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
     SNI=${SNI:-www.bing.com}
 
-    read -rp "服务器上行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " UP
-    read -rp "服务器下行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " DOWN
-    UP=${UP:-0}; DOWN=${DOWN:-0}
-    if (( UP <= 0 )) || (( DOWN <= 0 )); then
-        warn "带宽未填或为 0，将不启用 brutal（用默认 BBR，带宽不受限）"
+
+    HOP_RANGE=""
+    read -rp "Enable UDP port hopping [y/N]: " HOP_ASK
+    if [[ "$HOP_ASK" == "y" || "$HOP_ASK" == "Y" ]]; then
+        HOP_START=$((RANDOM % 40000 + 10000))
+        HOP_END=$((HOP_START + 999))
+        HOP_RANGE=":${HOP_START}-${HOP_END}"
+        info "Port-hop range ${HOP_START}-${HOP_END}"
     fi
 
     PASS=$(openssl rand -hex 16)
@@ -1036,13 +1059,9 @@ obfs:
   type: salamander
   salamander:
     password: OBFSPASS
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
+ignoreClientBandwidth: false
+congestion:
+  type: bbr
 auth:
   type: password
   password: AUTH_PASSWORD
@@ -1051,25 +1070,20 @@ masquerade:
   proxy:
     url: https://news.ycombinator.com/
     rewriteHost: true
-bandwidth:
-  up: UP_SPEED mbps
-  down: DOWN_SPEED mbps
+
 tls:
   cert: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
 EOF
     sed -i "s|OBFSPASS|${PASS}|g" "$HY_CONF"
     sed -i "s|AUTH_PASSWORD|${PASS}|g" "$HY_CONF"
-    sed -i "s|UP_SPEED|${UP}|g" "$HY_CONF"
-    sed -i "s|DOWN_SPEED|${DOWN}|g" "$HY_CONF"
-    sed -i "s|listen: :443|listen: :${PORT}|g" "$HY_CONF"
+    sed -i "s|listen: :443|listen: :${PORT}${HOP_RANGE}|g" "$HY_CONF"
 
     cat > "$META_HY2" <<EOF2
 HY2_PORT=${PORT}
 HY2_SNI=${SNI}
 HY2_PASSWORD=${PASS}
-HY2_UP=${UP}
-HY2_DOWN=${DOWN}
+HY2_PORT_RANGE=${HOP_RANGE#:}
 HY2_CERT=${HY_CERT_F}
 HY2_KEY=${HY_KEY_F}
 EOF2
@@ -1078,7 +1092,7 @@ EOF2
     install_hysteria || return 1
     _setup_hy2_service || return 1
     _start_hy2_service || return 1
-    info "Hysteria2 配置完成（端口 ${PORT}/UDP，独立官方服务，带宽 up=${UP} down=${DOWN} Mbps）"
+    info "HY2 BBR不限速 ${PORT} ${HOP_RANGE}"
     _print_hy2_link
 }
 
@@ -1097,10 +1111,9 @@ remove_hy2() {
 
 _print_hy2_link() {
     has_hy2 || return 1
-    local PORT PASS SNI SERVER_IP UP DOWN
+    local PORT PASS SNI SERVER_IP RANGE
     PORT=$(read_kv "$META_HY2" HY2_PORT); PASS=$(read_kv "$META_HY2" HY2_PASSWORD)
-    SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip)
-    UP=$(read_kv "$META_HY2" HY2_UP); DOWN=$(read_kv "$META_HY2" HY2_DOWN)
+    SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip); RANGE=$(read_kv "$META_HY2" HY2_PORT_RANGE)
     echo ""
     echo -e "${GREEN}===== Hysteria2 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
@@ -1109,7 +1122,7 @@ _print_hy2_link() {
     echo -e "SNI    : ${SNI}"
     echo -e "证书   : 自签名，客户端需 insecure=1"
     echo -e "混淆   : Salamander（密码同值）"
-    echo -e "带宽   : 上行 ${UP:-0} / 下行 ${DOWN:-0} Mbps (brutal)"
+    echo -e "è·³è·   : ${RANGE:-无跳踃} (Clash填ports填写)"
     echo -e "${CYAN}分享链接:${NC}"
     echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}#Hysteria2-${PORT}"
     echo ""
@@ -1416,7 +1429,11 @@ add_user() {
     UUID=$(cat /proc/sys/kernel/random/uuid)
     # 单密码模式：SS 只用初始化时的主密码，不再给每个用户生成独立密码
     local SSPASS=""
-    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
+    local QUOTA="0"
+    read -rp "月流量限额 GB [0=不限，默认 0]: " QUOTA
+    QUOTA=${QUOTA:-0}
+    [[ "$QUOTA" =~ ^[0-9]+$ ]] || { error "限额必须是纯数字 GB"; return 1; }
+    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}:${QUOTA}:0" >> "$USER_DB"
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE" "$SSPASS"
 
     validate_sbox_config || {
@@ -1602,6 +1619,16 @@ p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已禁用"
     else
+        # v1.8 流量超额的用户启用前提示：需先加限额或重置用量
+        {
+            local _Q _U
+            _Q=$(get_user_field "$USERNAME" 7); _U=$(get_user_field "$USERNAME" 8)
+            if [[ "$_Q" =~ ^[0-9]+$ ]] && (( _Q > 0 )) && [[ "$_U" =~ ^[0-9]+$ ]] && (( _U >= _Q )); then
+                warn "用户 $USERNAME 本月流量已用完 ($_U/$_Q GB)，启用后将继续超额计费/限速，建议先加限额或重置用量"
+                read -rp "仍要启用？[y/N]: " _C
+                [[ "$_C" != "y" && "$_C" != "Y" ]] && return
+            fi
+        }
         # 启用
         local EXPIRE
         EXPIRE=$(get_user_field "$USERNAME" 3)
@@ -1739,9 +1766,9 @@ list_users() {
     ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
     DISABLED=$((TOTAL - ACTIVE))
     echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
-    echo -e "  ${YELLOW}%-15s %-38s %-20s %-8s %-8s${NC}" "用户名" "UUID" "到期时间" "状态" "节点"
+    echo -e "  ${YELLOW}USER EXPIRE STATUS NODE QUOTA/USED(GB)${NC}"
     echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         NODE=${NODE:-both}
         local COLOR=$NC STATUS_ICON="○" EXPIRE_SHOW
         EXPIRE_SHOW=$(expire_display "$EXPIRE")
@@ -1750,8 +1777,8 @@ list_users() {
         elif [[ "$STATUS" == "disabled" ]]; then
             COLOR=$RED; STATUS_ICON="○"
         fi
-        printf "  ${COLOR}%-15s %-38s %-20s %-8s %-8s${NC}\n" \
-            "$NAME" "$UUID" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE"
+        printf "  ${COLOR}%-15s %-20s %-14s %-8s %s/%s GB${NC}\n" \
+            "$NAME" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE" "${QUOTA:-0}" "${USED:-0}"
     done < "$USER_DB"
     echo ""
 }
@@ -1763,7 +1790,7 @@ list_users_brief() {
     normalize_user_db
     echo ""
     [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         NODE=${NODE:-both}
         printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
     done < "$USER_DB"
@@ -1802,6 +1829,136 @@ show_user_link() {
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE" "$SSPASS"
 }
 
+
+# ============================================================
+# 月流量统计 / 限额 (v1.8, Clash API)
+# ============================================================
+quota_collect() {
+    normalize_user_db
+    [[ -f "$META" ]] && CLASH_SECRET=$(read_kv "$META" "CLASH_SECRET") || CLASH_SECRET=""
+    [[ -z "$CLASH_SECRET" ]] && return 0
+    local PREV=/var/lib/sbox/quota_prev.json
+    mkdir -p "$(dirname "$PREV")"
+    [[ -f "$PREV" ]] || echo '{}' > "$PREV"
+    CLASH_SECRET="$CLASH_SECRET" DB_PATH="$USER_DB" PREV_PATH="$PREV" python3 - <<'PYEOF'
+import json, os, urllib.request
+secret = os.environ.get("CLASH_SECRET", "")
+db = os.environ["DB_PATH"]; prevf = os.environ["PREV_PATH"]
+def load(p):
+    try:
+        with open(p, encoding="utf-8") as f: return json.load(f)
+    except Exception: return {}
+prev = load(prevf)
+cur = {}
+try:
+    req = urllib.request.Request("http://127.0.0.1:19090/connections", headers={"Authorization": "Bearer " + secret})
+    data = json.load(urllib.request.urlopen(req, timeout=5))
+    for c in data.get("connections", []):
+        # metadata.user = uuid
+        md = c.get("metadata", {}) or {}
+        u = md.get("user") or c.get("user") or ""
+        up = int(c.get("uploadTotal", 0) or 0); down = int(c.get("downloadTotal", 0) or 0)
+        if u: cur[u] = cur.get(u, 0) + up + down
+except Exception as e:
+    print("quota_collect: clash api fail: %s" % e)
+    return
+# 累加增量
+try: lines = open(db, encoding="utf-8", errors="ignore").read().splitlines()
+except OSError: lines = []
+out = []
+for line in lines:
+    parts = line.split(":")
+    while len(parts) < 8: parts.append("" if len(parts) == 5 else "0")
+    name, uuid = parts[0], parts[1]
+    try: used_gb = float(parts[7] or 0)
+    except ValueError: used_gb = 0.0
+    c_now = cur.get(uuid, cur.get(name, 0))
+    p_old = int(prev.get(uuid, prev.get(name, 0)) or 0)
+    delta = c_now - p_old
+    if delta < 0: delta = c_now  # sing-box 重启计数清零
+    if delta > 0: used_gb += delta / 1073741824.0
+    parts[7] = "%.3f" % used_gb
+    out.append(":".join(parts[:8]))
+open(db, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
+json.dump({k: int(v) for k, v in cur.items()}, open(prevf, "w", encoding="utf-8"))
+PYEOF
+    quota_enforce
+}
+quota_enforce() {
+    normalize_user_db
+    local HIT=""
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+        [[ "$STATUS" != "active" ]] && continue
+        [[ "$QUOTA" =~ ^[0-9]+$ ]] || continue
+        (( QUOTA > 0 )) || continue
+        over=$(awk -v u="$USED" -v q="$QUOTA" 'BEGIN{print (u+0>=q+0)?1:0}')
+        if [[ "$over" == "1" ]]; then HIT="${HIT} ${UUID}"; warn "用户 ${NAME} 流量超额 (${USED}/${QUOTA} GB)，自动禁用"; fi
+    done < "$USER_DB"
+    [[ -z "$HIT" ]] && return 0
+    BATCH_UUIDS="$HIT" DB_PATH="$USER_DB" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+uuids = set(os.environ["BATCH_UUIDS"].split())
+p = Path(os.environ["DB_PATH"])
+lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+out = []
+for line in lines:
+    parts = line.split(":")
+    if len(parts) >= 2 and parts[1] in uuids:
+        while len(parts) < 8: parts.append("0")
+        parts[3] = "disabled"
+        out.append(":".join(parts[:8]))
+    else: out.append(line)
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+    _inject_all_users && validate_sbox_config && systemctl restart "$SERVICE_NAME"
+}
+quota_reset_monthly() {
+    # 每月1日清零；只重开时间未到期且之前因超额被禁的用户需手动启用(保持disabled，由主页启用)
+    normalize_user_db
+    DB_PATH="$USER_DB" python3 - <<'PYEOF'
+import os
+p = os.environ["DB_PATH"]
+lines = open(p, encoding="utf-8", errors="ignore").read().splitlines()
+out = []
+for line in lines:
+    parts = line.split(":")
+    while len(parts) < 8: parts.append("0")
+    parts[7] = "0"
+    out.append(":".join(parts[:8]))
+open(p, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
+PYEOF
+    echo '{}' > /var/lib/sbox/quota_prev.json 2>/dev/null
+    info "已重置全部用户本月已用流量"
+}
+quota_set() {
+    title "设置用户月流量限额"
+    list_users_brief
+    read -rp "输入用户名: " U; read -rp "限额 GB [0=不限]: " Q
+    [[ "$Q" =~ ^[0-9]+$ ]] || { error "限额必须是纯数字"; return 1; }
+    DB_PATH="$USER_DB" U="$U" Q="$Q" python3 - <<'PYEOF'
+import os
+db, u, q = os.environ["DB_PATH"], os.environ["U"], os.environ["Q"]
+lines = open(db, encoding="utf-8", errors="ignore").read().splitlines()
+out, hit = [], False
+for line in lines:
+    parts = line.split(":")
+    while len(parts) < 8: parts.append("0")
+    if parts[0] == u: parts[6] = q; hit = True
+    out.append(":".join(parts[:8]))
+open(db, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
+print("OK" if hit else "NOTFOUND")
+PYEOF
+}
+quota_show() {
+    title "流量使用"
+    printf "  %-15s %-10s %-10s %s\n" 用户名 限额 已用 状态
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+        q="${QUOTA:-0}"; [[ "$q" == "0" ]] && q="不限"
+        echo "  $NAME 限额${q}GB 已用${USED:-0}GB [$STATUS]"
+    done < "$USER_DB"
+}
+
 # ============================================================
 # 到期检查（cron 调用）
 # ============================================================
@@ -1815,7 +1972,7 @@ check_expire() {
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         [[ "$STATUS" != "active" ]] && continue
         local EXPIRE_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
@@ -1927,7 +2084,7 @@ for i in d.get('inbounds',[]):
         if [[ -f "$USER_DB" ]]; then
             echo -e "${CYAN}分享链接:${NC}"
             local RNAME RUUID REXP RSTATUS RNODE
-            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS; do
+            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS RQUOTA RUSED; do
                 [[ "$RSTATUS" != "active" ]] && continue
                 RNODE=${RNODE:-both}
                 [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
@@ -1951,7 +2108,7 @@ for i in d.get('inbounds',[]):
         # 单密码模式：不再展示各用户独立密码链接，只保留主密码
         if false; then
             local SNAME SUUID SEXP SSTATUS SNODE SSPW SS_UI SS_LK
-            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW; do
+            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW SQUOTA SUSED; do
                 [[ "$SSTATUS" != "active" ]] && continue
                 SNODE=${SNODE:-both}
                 [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
@@ -2268,7 +2425,9 @@ install_shortcut() {
 # ============================================================
 setup_cron() {
     local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$EXPIRE_CMD") | crontab -
+    local QUOTA_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --quota-collect >> /var/log/sbox-expire.log 2>&1"
+    local RESET_CMD="0 0 1 * * /usr/local/bin/singbox_manager.sh --quota-reset >> /var/log/sbox-expire.log 2>&1"
+    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD"; echo "$QUOTA_CMD"; echo "$RESET_CMD") | crontab -
     info "已设置每 5 分钟自动检查到期用户"
 
     mkdir -p /var/log
@@ -2293,6 +2452,20 @@ if [[ "$1" == "--check-expire" ]]; then
     check_expire
     exit 0
 fi
+if [[ "$1" == "--quota-collect" ]]; then
+    normalize_user_db
+    quota_collect
+    exit 0
+fi
+if [[ "$1" == "--quota-reset" ]]; then
+    quota_reset_monthly
+    exit 0
+fi
+if [[ "$1" == "--quota-enforce" ]]; then
+    quota_enforce
+    exit 0
+fi
+
 
 # ============================================================
 # 主菜单
@@ -2323,7 +2496,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.7${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
@@ -2336,7 +2509,7 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  新建用户          ${GREEN}4.${NC}  删除用户"
         echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户          ${GREEN}6.${NC}  启用用户"
         echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  用户续期          ${GREEN}8.${NC}  用户列表"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.  查看分享链接      17. 流量管理"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ Telegram${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} Telegram 机器人管理"
@@ -2361,6 +2534,7 @@ main_menu() {
             7)  renew_user ;;
             8)  list_users ;;
             9)  show_user_link ;;
+            17) quota_menu ;;
             10) telegram_bot_menu ;;
             11) show_info ;;
             12) update_sbox ;;
