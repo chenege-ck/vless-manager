@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.8.2
+# VLESS 智能节点控制台 (sing-box) v1.8.3
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -390,19 +390,34 @@ EOF
 }
 
 # ============================================================
+# 查找 sing-box（官方 deb 通常安装到 /usr/bin）
+# ============================================================
+detect_sbox_bin() {
+    local candidate
+    for candidate in /usr/local/bin/sing-box /usr/bin/sing-box "$(command -v sing-box 2>/dev/null)"; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if "$candidate" version >/dev/null 2>&1; then
+            SBOX_BIN="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ============================================================
 # 安装 sing-box
 # ============================================================
 install_sbox() {
     title "安装 sing-box..."
-    if [[ -f "$SBOX_BIN" ]]; then
+    if detect_sbox_bin; then
         warn "sing-box 已安装，跳过安装步骤"
         return 0
     fi
     install_deps || return 1
 
     info "正在下载 sing-box..."
-    bash <(curl -fsSL https://sing-box.app/deb-install.sh) 2>/dev/null
-    if [[ ! -f "$SBOX_BIN" ]]; then
+    bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+    if ! detect_sbox_bin; then
         # 备用：从 GitHub releases 手动安装
         info "官方脚本安装失败，尝试从 GitHub releases 安装..."
         local ARCH
@@ -421,6 +436,7 @@ install_sbox() {
         curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败"; return 1; }
         tar -xzf /tmp/sing-box.tar.gz -C /tmp/
         local DIR_NAME="sing-box-${VER}-linux-${ARCH}"
+        mkdir -p "$(dirname "$SBOX_BIN")"
         cp "/tmp/${DIR_NAME}/sing-box" "$SBOX_BIN"
         chmod +x "$SBOX_BIN"
         rm -rf /tmp/sing-box.tar.gz "/tmp/${DIR_NAME}"
@@ -445,7 +461,7 @@ install_sbox() {
         systemctl daemon-reload
     fi
 
-    [[ -x "$SBOX_BIN" ]] || { error "sing-box 安装失败"; return 1; }
+    detect_sbox_bin || { error "sing-box 安装失败"; return 1; }
     mkdir -p "$SBOX_DIR"
     info "sing-box 安装成功: $($SBOX_BIN version 2>/dev/null | head -1)"
 }
@@ -502,10 +518,27 @@ uninstall_sbox() {
 # 生成 Reality 密钥对
 # ============================================================
 gen_keypair() {
-    local OUTPUT
-    OUTPUT=$("$SBOX_BIN" generate reality-keypair 2>/dev/null)
-    PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey" | awk '{print $NF}')
+    PRIVATE_KEY=""
+    PUBLIC_KEY=""
+    if ! detect_sbox_bin; then
+        error "找不到可用的 sing-box，请先运行「一键安装」"
+        return 1
+    fi
+
+    local OUTPUT STATUS
+    OUTPUT=$("$SBOX_BIN" generate reality-keypair 2>&1)
+    STATUS=$?
+    if [[ $STATUS -ne 0 ]]; then
+        error "sing-box 密钥生成失败: ${OUTPUT:-未知错误}"
+        return 1
+    fi
+
+    PRIVATE_KEY=$(printf '%s\n' "$OUTPUT" | sed -n 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' | head -n 1)
+    PUBLIC_KEY=$(printf '%s\n' "$OUTPUT" | sed -n 's/^[[:space:]]*PublicKey:[[:space:]]*//p' | head -n 1)
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        error "无法解析 Reality 密钥输出: ${OUTPUT}"
+        return 1
+    fi
 }
 
 # ============================================================
@@ -772,10 +805,7 @@ _inject_all_users() {
 # ============================================================
 init_reality() {
     title "配置 VLESS + Reality"
-    gen_keypair
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败"; return 1
-    fi
+    gen_keypair || return 1
 
     while true; do
         read -rp "监听端口 [默认 8443]: " REALITY_PORT
@@ -1109,6 +1139,13 @@ remove_hy2() {
     info "Hysteria2 已移除（二进制保留，可用菜单更新/重装）"
 }
 
+hy2_share_link() {
+    local SERVER=$1 PORT=$2 PASS=$3 SNI=$4 RANGE=${5:-}
+    local QUERY="sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}"
+    [[ -n "$RANGE" ]] && QUERY="${QUERY}&mport=${RANGE}&hop_interval=30"
+    printf 'hysteria2://%s@%s:%s?%s#Hysteria2-%s\n' "$PASS" "$SERVER" "$PORT" "$QUERY" "$PORT"
+}
+
 _print_hy2_link() {
     has_hy2 || return 1
     local PORT PASS SNI SERVER_IP RANGE
@@ -1124,7 +1161,7 @@ _print_hy2_link() {
     echo -e "混淆   : Salamander（密码同值）"
     echo -e "Hop: ${RANGE:-none} (Clash ports)"
     echo -e "${CYAN}分享链接:${NC}"
-    echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}#Hysteria2-${PORT}"
+    hy2_share_link "$SERVER_IP" "$PORT" "$PASS" "$SNI" "$RANGE"
     echo ""
 }
 
@@ -1156,10 +1193,7 @@ init_anytls() {
     read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
     SNI=${SNI:-www.microsoft.com}
 
-    gen_keypair
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败"; return 1
-    fi
+    gen_keypair || return 1
 
     ANYTLS_PORT=$PORT
     ANYTLS_PASSWORD=$(openssl rand -hex 16)
@@ -2145,12 +2179,13 @@ for i in d.get('inbounds',[]):
     fi
 
     if has_hy2; then
-        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_LINK_SHOW
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_PORT_RANGE_SHOW HY2_LINK_SHOW
         HY2_STATUS=$(systemctl is-active "$HY_SERVICE" 2>/dev/null)
         HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
-        HY2_LINK_SHOW="hy2://${HY2_PASSWORD_SHOW}@${PUBLIC_IP}:${HY2_PORT_SHOW}/?sni=${HY2_SNI_SHOW}&insecure=1&obfs=salamander&obfs-password=${HY2_PASSWORD_SHOW}#Hysteria2-${HY2_PORT_SHOW}"
+        HY2_PORT_RANGE_SHOW=$(read_kv "$META_HY2" "HY2_PORT_RANGE")
+        HY2_LINK_SHOW=$(hy2_share_link "$PUBLIC_IP" "$HY2_PORT_SHOW" "$HY2_PASSWORD_SHOW" "$HY2_SNI_SHOW" "$HY2_PORT_RANGE_SHOW")
         echo -e "${CYAN}── Hysteria2 节点 ──${NC}"
         echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
@@ -2510,7 +2545,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.2${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.3${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
