@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.8.3
+# VLESS 智能节点控制台 (sing-box) v1.8.4
 # Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
 
 RED='\033[0;31m'
@@ -533,10 +533,34 @@ gen_keypair() {
         return 1
     fi
 
-    PRIVATE_KEY=$(printf '%s\n' "$OUTPUT" | sed -n 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' | head -n 1)
-    PUBLIC_KEY=$(printf '%s\n' "$OUTPUT" | sed -n 's/^[[:space:]]*PublicKey:[[:space:]]*//p' | head -n 1)
+    PRIVATE_KEY=$(printf '%s\n' "$OUTPUT" | awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            lowered = tolower(line)
+            if (index(lowered, "privatekey:") > 0) {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                print line
+                exit
+            }
+        }')
+    PUBLIC_KEY=$(printf '%s\n' "$OUTPUT" | awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            lowered = tolower(line)
+            if (index(lowered, "publickey:") > 0) {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                print line
+                exit
+            }
+        }')
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         error "无法解析 Reality 密钥输出: ${OUTPUT}"
+        return 1
+    fi
+    if [[ "$PRIVATE_KEY" == "$PUBLIC_KEY" ]]; then
+        error "Reality 私钥与公钥不应相同，请重新生成"
         return 1
     fi
 }
@@ -1083,6 +1107,8 @@ init_hy2() {
     _gen_hy2_cert "$SNI" || return 1
 
     mkdir -p "$HY_DIR" /var/www/masq
+    local LISTEN_VALUE=":${PORT}"
+    [[ -n "$HOP_RANGE" ]] && LISTEN_VALUE=":${PORT},${HOP_RANGE}"
     cat > "$HY_CONF" <<'EOF'
 listen: :443
 obfs:
@@ -1107,7 +1133,7 @@ tls:
 EOF
     sed -i "s|OBFSPASS|${PASS}|g" "$HY_CONF"
     sed -i "s|AUTH_PASSWORD|${PASS}|g" "$HY_CONF"
-    sed -i "s|listen: :443|listen: :${PORT}|g" "$HY_CONF"
+    sed -i "s|listen: :443|listen: ${LISTEN_VALUE}|g" "$HY_CONF"
 
     cat > "$META_HY2" <<EOF2
 HY2_PORT=${PORT}
@@ -1141,9 +1167,11 @@ remove_hy2() {
 
 hy2_share_link() {
     local SERVER=$1 PORT=$2 PASS=$3 SNI=$4 RANGE=${5:-}
+    local HOST="$SERVER"
+    [[ "$HOST" == *:* && "$HOST" != \[*\] ]] && HOST="[${HOST}]"
     local QUERY="sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}"
-    [[ -n "$RANGE" ]] && QUERY="${QUERY}&mport=${RANGE}&hop_interval=30"
-    printf 'hysteria2://%s@%s:%s?%s#Hysteria2-%s\n' "$PASS" "$SERVER" "$PORT" "$QUERY" "$PORT"
+    [[ -n "$RANGE" ]] && QUERY="${QUERY}&mport=${RANGE}"
+    printf 'hy2://%s@%s:%s/?%s#Hysteria2-%s\n' "$PASS" "$HOST" "$PORT" "$QUERY" "$PORT"
 }
 
 _print_hy2_link() {
@@ -2545,7 +2573,7 @@ main_menu() {
         systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.3${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.4${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
