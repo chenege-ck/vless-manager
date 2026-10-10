@@ -1,6 +1,6 @@
 #!/bin/bash
-# 多协议节点管理脚本 (sing-box) - Alpine Linux 专用 v1.4
-# Reality + Shadowsocks + WS+TLS + Hysteria2 + AnyTLS + 用户管理（创建/到期/续期）
+# VLESS 智能节点控制台 (sing-box) v1.8.6 - Alpine Linux (OpenRC) 专用版
+# Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（轻量版，无 Telegram）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -11,25 +11,19 @@ NC='\033[0m'
 
 # ============== 路径 ==============
 SBOX_BIN="/usr/local/bin/sing-box"
+SBOX_CONFIG="/etc/sing-box/config.json"
 SBOX_DIR="/etc/sing-box"
-SBOX_CONFIG="${SBOX_DIR}/config.json"
 USER_DB="${SBOX_DIR}/users.db"
 META_REALITY="${SBOX_DIR}/meta-reality.conf"
 META_SS="${SBOX_DIR}/meta-ss.conf"
 META_WS="${SBOX_DIR}/meta-ws.conf"
 META_HY2="${SBOX_DIR}/meta-hy2.conf"
 META_ANYTLS="${SBOX_DIR}/meta-anytls.conf"
+META="${SBOX_DIR}/meta.conf"
+SERVICE_NAME="sing-box"
 SBOX_INIT="/etc/init.d/sing-box"
-CRON_JOB="/etc/periodic/15min/sbox-check-expire"
-SELF_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0")"
-
-# Hysteria2（独立官方二进制，独立 OpenRC 服务）
-HY_BIN="/usr/local/bin/hysteria"
-HY_DIR="/etc/hysteria"
-HY_CONF="${HY_DIR}/config.yaml"
-HY_CERT_F="${HY_DIR}/server.crt"
-HY_KEY_F="${HY_DIR}/server.key"
 HY_INIT="/etc/init.d/hysteria-server"
+OLD_CRON_JOB="/etc/periodic/15min/sbox-check-expire"   # 旧版 v1.4 遗留的定时任务
 
 # ============== 默认端口 ==============
 SS_PORT_DEFAULT=8668
@@ -42,24 +36,29 @@ warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 error() { echo -e "${RED}  ✗${NC}  $1"; }
 title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
 
+# ============== 安全读取 key=value 配置 ==============
 read_kv() {
     local file="$1" key="$2"
     [[ -f "$file" ]] || return 1
     awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file"
 }
 
+# ============== 用户名校验 ==============
 validate_username() {
     local value="$1"
     [[ -z "$value" ]] && { error "用户名不能为空"; return 1; }
     [[ "$value" == *:* ]] && { error "用户名不能包含冒号"; return 1; }
     [[ "$value" == *[[:space:]]* ]] && { error "用户名不能包含空格或换行"; return 1; }
-    if (( ${#value} > 20 )); then
-        error "用户名过长（最多 20 个字符）"
+    local N
+    N=$(printf '%s' "$value" | python3 -c 'import sys; sys.stdout.write(str(len(sys.stdin.read())))')
+    if (( N > 20 )); then
+        error "用户名过长（最多 20 个字符，约 10 个汉字）"
         return 1
     fi
     return 0
 }
 
+# ============== UUID 校验 ==============
 validate_uuid() {
     [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
         error "UUID 格式异常"
@@ -67,6 +66,7 @@ validate_uuid() {
     }
 }
 
+# ============== 用户数据库操作 ==============
 user_exists() {
     awk -F: -v n="$1" '$1==n {found=1; exit} END {exit !found}' "$USER_DB" 2>/dev/null
 }
@@ -90,21 +90,100 @@ fi
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
 
 # ============== 系统检查（仅 Alpine） ==============
+
 check_system() {
     local OS_ID
     OS_ID=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
     if [[ "$OS_ID" != "alpine" ]]; then
-        error "本脚本仅支持 Alpine Linux"
+        error "本脚本仅支持 Alpine Linux（OpenRC），当前系统: ${OS_ID:-unknown}"
+        error "Debian/Ubuntu 请使用 a 脚本"
         exit 1
     fi
+    command -v rc-service >/dev/null 2>&1 || { error "未检测到 OpenRC（rc-service）"; exit 1; }
 }
 
-# ============== 时区 ==============
+# ============== OpenRC 兼容层 ==============
+# Alpine 没有 systemd。脚本里大量沿用 systemctl / journalctl 的写法，
+# 这里用 OpenRC 实现等价功能；服务名里的 .service 后缀会被自动忽略。
+_svc_log_file() {
+    case "$1" in
+        sing-box)        echo /var/log/sing-box.log ;;
+        hysteria-server) echo /var/log/hysteria.log ;;
+        *)               echo "/var/log/$1.log" ;;
+    esac
+}
+
+systemctl() {
+    local quiet=0 now=0 a
+    local -a args=()
+    for a in "$@"; do
+        case "$a" in
+            --quiet|-q) quiet=1 ;;
+            --now) now=1 ;;
+            --no-pager|--full|--no-ask-password) ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    local cmd="${args[0]}" svc="${args[1]%.service}"
+    case "$cmd" in
+        daemon-reload|reset-failed) return 0 ;;
+        enable)  rc-update add "$svc" default >/dev/null 2>&1; return 0 ;;
+        disable)
+            [[ $now -eq 1 ]] && rc-service "$svc" stop >/dev/null 2>&1
+            rc-update del "$svc" default >/dev/null 2>&1
+            return 0 ;;
+        start|stop|restart) rc-service "$svc" "$cmd" >/dev/null 2>&1 ;;
+        is-active)
+            if rc-service "$svc" status 2>/dev/null | grep -q started; then
+                [[ $quiet -eq 0 ]] && echo active
+                return 0
+            fi
+            [[ $quiet -eq 0 ]] && echo inactive
+            return 3 ;;
+        status) rc-service "$svc" status ;;
+        list-unit-files) ls /etc/init.d 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+journalctl() {
+    local unit="" n=40
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u) unit="${2%.service}"; shift 2 ;;
+            -n) n="$2"; shift 2 ;;
+            *)  shift ;;
+        esac
+    done
+    local f; f=$(_svc_log_file "$unit")
+    if [[ -f "$f" ]]; then tail -n "$n" "$f"; else echo "(暂无日志: $f)"; fi
+}
+
+# 部分精简 Alpine 没有 clear
+clear() { command clear 2>/dev/null || printf '\033c'; }
+
+# busybox 的 uptime 不支持 -p
+_uptime_pretty() {
+    local s d h m
+    s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null) || return 0
+    d=$((s/86400)); h=$((s%86400/3600)); m=$((s%3600/60))
+    if (( d > 0 )); then echo "${d} 天 ${h} 小时 ${m} 分钟"
+    elif (( h > 0 )); then echo "${h} 小时 ${m} 分钟"
+    else echo "${m} 分钟"; fi
+}
+
+# ============== 设置上海时区 ==============
+
 set_shanghai_timezone() {
+    title "设置系统时区"
     apk add --no-cache tzdata >/dev/null 2>&1
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
     echo "Asia/Shanghai" > /etc/timezone
-    info "系统时区已设置为 Asia/Shanghai"
+    if [[ "$(readlink -f /etc/localtime 2>/dev/null)" == "/usr/share/zoneinfo/Asia/Shanghai" ]]; then
+        info "系统时区已设置为 Asia/Shanghai"
+    else
+        warn "时区设置可能未生效，请确认已安装 tzdata（apk add tzdata）"
+    fi
 }
 
 # ============== 上海时间工具 ==============
@@ -121,13 +200,21 @@ expire_to_ts() {
         local d="${expire%%_*}" t="${expire#*_}"
         TZ=Asia/Shanghai date -d "${d} ${t//-/:}" +%s 2>/dev/null; return
     fi
-    TZ=Asia/Shanghai date -d "$expire" +%s 2>/dev/null
+    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        TZ=Asia/Shanghai date -d "${expire} 12:00:00" +%s 2>/dev/null; return
+    fi
+    local normalized="${expire/T/ }"
+    TZ=Asia/Shanghai date -d "$normalized" +%s 2>/dev/null
 }
 
 expire_display() {
     local expire="$1"
     if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
         local d="${expire%%_*}" t="${expire#*_}"; echo "${d} ${t//-/:}"
+    elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+        echo "${expire/T/ }"
+    elif [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "${expire} 12:00:00"
     else
         echo "$expire"
     fi
@@ -139,17 +226,23 @@ get_public_ip() {
     ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
     [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
+        [[ -z "$ip" ]] && ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)
+    fi
     echo "${ip:-<请手动填写服务器IP>}"
 }
 
 # ============== 端口检查 ==============
-check_port()     { ss -tlnp 2>/dev/null | grep -q ":${1} " && return 1 || return 0; }
-check_port_udp() { ss -ulnp 2>/dev/null | grep -q ":${1} " && return 1 || return 0; }
+check_port()     { ss -tlnp | grep -q ":${1} " && return 1 || return 0; }
+check_port_udp() { ss -ulnp | grep -q ":${1} " && return 1 || return 0; }
 
 # ============== 用户数据库格式化 ==============
-# 格式: NAME:UUID:EXPIRE:STATUS:NODE  (NODE 仅用于 reality/ws/both)
+# 格式: NAME:UUID:EXPIRE:STATUS:NODE
 normalize_user_db() {
     [[ ! -f "$USER_DB" ]] && return 0
+    # 快速预检：8 段且到期时间规范就直接返回，省掉一次 python 进程
+    awk -F: 'NF==0{next} NF!=8 || $3 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {bad=1} END{exit (bad?1:0)}' "$USER_DB" && return 0
     python3 - <<PYEOF
 from pathlib import Path
 import re
@@ -163,6 +256,12 @@ def normalize_expire(exp):
     exp = exp.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
         return exp + "_12-00-00"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", exp):
+        d, t = exp.split("T", 1)
+        return d + "_" + t.replace(":", "-")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", exp):
+        d, t = exp.split(" ", 1)
+        return d + "_" + t.replace(":", "-")
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", exp):
         return exp
     return exp
@@ -176,13 +275,36 @@ for line in lines:
         node = "both"
         changed = True
     elif len(parts) >= 5:
-        name, uuid, expire, status, node = parts[0], parts[1], parts[2], parts[3], parts[4] or "both"
+        name = parts[0]
+        uuid = parts[1]
+        sspass, quota, used = "", "0", "0"
+        if len(parts) == 4:
+            expire, status, node = parts[2], parts[3], "both"
+            changed = True
+        elif len(parts) == 5:
+            expire, status, node = parts[2], parts[3], (parts[4] or "both")
+        elif len(parts) == 6:
+            # 6-segment legacy line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS
+            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
+            changed = True
+        elif len(parts) == 8:
+            # 8-segment v1.8 line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS:QUOTA_GB:USED_GB
+            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
+            quota = parts[6] if parts[6] else "0"
+            used = parts[7] if len(parts) > 7 and parts[7] else "0"
+        else:
+            # corrupted line: best-effort, mark changed
+            status = parts[-2]
+            node = parts[-1] or "both"
+            expire = parts[2]
+            changed = True
     else:
         continue
     expire2 = normalize_expire(expire)
     if expire2 != expire:
         changed = True
-    out.append(":".join([name, uuid, expire2, status, node]))
+    row = [name, uuid, expire2, status, node, sspass, quota, used]
+    out.append(":".join(row))
 
 if changed:
     p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
@@ -191,13 +313,13 @@ PYEOF
 
 # ============== 加载元数据 ==============
 load_meta() {
-    REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY="" REALITY_SNI=""
-    REALITY_PORT="" REALITY_SHORTID=""
-    SS_PORT="" SS_METHOD="" SS_PASSWORD=""
-    WS_PORT="" WS_PATH="" WS_DOMAIN="" WS_TLS="" CERT_DIR=""
-    HY2_PORT="" HY2_PASSWORD="" HY2_SNI=""
-    ANYTLS_PORT="" ANYTLS_PASSWORD="" ANYTLS_SNI=""
-    ANYTLS_PRIVATE_KEY="" ANYTLS_PUBLIC_KEY="" ANYTLS_SHORTID=""
+    REALITY_PRIVATE_KEY=""  REALITY_PUBLIC_KEY=""  REALITY_SNI=""
+    REALITY_PORT=""  REALITY_SHORTID=""
+    SS_PORT=""  SS_METHOD=""  SS_PASSWORD=""
+    WS_PORT=""  WS_PATH=""  WS_DOMAIN=""  WS_CF_PORT=""  WS_TLS=""  CERT_DIR=""
+    HY2_PORT=""  HY2_PASSWORD=""  HY2_SNI=""
+    ANYTLS_PORT=""  ANYTLS_PASSWORD=""  ANYTLS_SNI=""
+    ANYTLS_PRIVATE_KEY=""  ANYTLS_PUBLIC_KEY=""  ANYTLS_SHORTID=""
 
     if [[ -f "$META_REALITY" ]]; then
         REALITY_PRIVATE_KEY=$(read_kv "$META_REALITY" "REALITY_PRIVATE_KEY")
@@ -215,6 +337,7 @@ load_meta() {
         WS_PORT=$(read_kv "$META_WS" "WS_PORT")
         WS_PATH=$(read_kv "$META_WS" "WS_PATH")
         WS_DOMAIN=$(read_kv "$META_WS" "WS_DOMAIN")
+        WS_CF_PORT=$(read_kv "$META_WS" "WS_CF_PORT")
         WS_TLS=$(read_kv "$META_WS" "WS_TLS")
         CERT_DIR=$(read_kv "$META_WS" "CERT_DIR")
         CERT_DIR=${CERT_DIR:-/etc/sing-box/ssl}
@@ -248,6 +371,9 @@ validate_sbox_config() {
     if [[ $? -ne 0 ]]; then
         error "config.json 不是合法 JSON"; return 1
     fi
+    if [[ ! -x "$SBOX_BIN" ]]; then
+        detect_sbox_bin || { error "未找到 sing-box 可执行文件（已查找 /usr/local/bin、/usr/bin、PATH）"; return 1; }
+    fi
     local VALIDATE_OUTPUT
     VALIDATE_OUTPUT=$("$SBOX_BIN" check -c "$SBOX_CONFIG" 2>&1)
     if [[ $? -ne 0 ]]; then
@@ -260,83 +386,61 @@ validate_sbox_config() {
     return 0
 }
 
-# ============== 启动 sing-box（OpenRC） ==============
+# ============== 启动 sing-box ==============
 _start_sbox() {
     validate_sbox_config || return 1
-    rc-update add sing-box default >/dev/null 2>&1
-    rc-service sing-box restart >/dev/null 2>&1
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl restart "$SERVICE_NAME"
     sleep 1
-    if rc-service sing-box status 2>/dev/null | grep -q started; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
         info "sing-box 已启动"; return 0
     else
-        error "sing-box 启动失败，运行 cat /var/log/sing-box.log 查看日志"
+        error "sing-box 启动失败，运行 tail -n 30 /var/log/sing-box.log 查看日志"
         return 1
     fi
 }
 
+# ============== 分割线 ==============
 # ============================================================
 # 安装依赖
 # ============================================================
+
 install_deps() {
     title "安装依赖..."
     apk update -q
-    apk add --no-cache curl openssl python3 bash coreutils iproute2 ca-certificates >/dev/null 2>&1
+    apk add --no-cache curl openssl python3 bash coreutils iproute2 ca-certificates tzdata >/dev/null 2>&1
     [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
     info "依赖安装完成"
 }
 
 # ============================================================
-# 安装 sing-box（从 GitHub Releases 下载静态二进制）
+# 查找 sing-box（本脚本下载版在 /usr/local/bin，apk 包版在 /usr/bin）
 # ============================================================
-install_sbox() {
-    title "安装 sing-box..."
-    if [[ -x "$SBOX_BIN" ]]; then
-        if "$SBOX_BIN" version >/dev/null 2>&1; then
-            warn "sing-box 已安装，跳过安装步骤"
+detect_sbox_bin() {
+    local candidate
+    for candidate in /usr/local/bin/sing-box /usr/bin/sing-box "$(command -v sing-box 2>/dev/null)"; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if "$candidate" version >/dev/null 2>&1; then
+            SBOX_BIN="$candidate"
             return 0
-        else
-            warn "检测到已安装的 sing-box 无法执行（常见于误装 glibc 版本，Alpine 需要 musl 版），将重新安装"
-            rm -f "$SBOX_BIN"
         fi
-    fi
-    install_deps || return 1
+    done
+    return 1
+}
 
-    local ARCH
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
-        armv7l)  ARCH="armv7" ;;
-        *) error "不支持的架构: $ARCH"; return 1 ;;
-    esac
+# ============================================================
+# 安装 sing-box
+# ============================================================
 
-    info "获取 sing-box 最新版本..."
-    local VER
-    VER=$(curl -fsSL -H "User-Agent: Mozilla/5.0" "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-          | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name','').lstrip('v'))" 2>/dev/null)
-    [[ -z "$VER" ]] && { error "无法获取 sing-box 最新版本"; return 1; }
-
-    # 注意：Alpine 是 musl libc，必须下载 -musl 后缀的静态二进制，
-    # 普通版本是动态链接 glibc 的，在 Alpine 上会静默执行失败
-    local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}-musl.tar.gz"
-    info "下载: ${URL}"
-    curl -fsSL -H "User-Agent: Mozilla/5.0" "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败"; return 1; }
-    tar -xzf /tmp/sing-box.tar.gz -C /tmp/
-    local DIR_NAME="sing-box-${VER}-linux-${ARCH}-musl"
-    cp "/tmp/${DIR_NAME}/sing-box" "$SBOX_BIN"
-    chmod +x "$SBOX_BIN"
-    rm -rf /tmp/sing-box.tar.gz "/tmp/${DIR_NAME}"
-
-    [[ -x "$SBOX_BIN" ]] || { error "sing-box 安装失败"; return 1; }
-    mkdir -p "$SBOX_DIR"
-    touch "$USER_DB" && chmod 600 "$USER_DB"
-
-    cat > "$SBOX_INIT" <<'EOF'
+_write_sbox_init() {
+    cat > "$SBOX_INIT" <<EOF
 #!/sbin/openrc-run
 name="sing-box"
 description="sing-box service"
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
+# 降低 Go GC 阈值，减少常驻内存（小内存机器）
+export GOGC=50
+command="${SBOX_BIN}"
+command_args="run -c ${SBOX_CONFIG}"
 command_background=true
 pidfile="/run/sing-box.pid"
 output_log="/var/log/sing-box.log"
@@ -348,26 +452,126 @@ depend() {
 }
 EOF
     chmod +x "$SBOX_INIT"
+}
 
+# 获取 sing-box 最新版本号（先查 API，失败再解析 releases/latest 跳转）
+_sbox_latest_ver() {
+    local VER
+    VER=$(curl -fsSL -H "User-Agent: Mozilla/5.0" --max-time 15 \
+          "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name','').lstrip('v'))" 2>/dev/null)
+    if [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        VER=$(curl -fsSL -L --max-time 15 -o /dev/null -w '%{url_effective}' \
+              "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
+              | sed -nE 's#^.*/tag/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | head -n 1)
+    fi
+    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$VER"
+}
+
+# 下载 musl 静态版（Alpine 必须用 -musl，普通版是 glibc 动态链接，会静默执行失败）
+# 用法: _download_sbox_musl <版本号>   结果写入 $SBOX_BIN（先写 .new 再原子替换）
+_download_sbox_musl() {
+    local VER="$1" ARCH URL TMPD SRC_BIN
+    case "$(uname -m)" in
+        x86_64)  ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l)  ARCH="armv7" ;;
+        *) error "不支持的架构: $(uname -m)"; return 1 ;;
+    esac
+    URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}-musl.tar.gz"
+    info "下载: ${URL}"
+    TMPD=$(mktemp -d)
+    curl -fsSL -H "User-Agent: Mozilla/5.0" --max-time 180 "$URL" -o "$TMPD/sb.tar.gz" \
+        || { error "下载失败"; rm -rf "$TMPD"; return 1; }
+    tar -xzf "$TMPD/sb.tar.gz" -C "$TMPD" || { error "解压失败"; rm -rf "$TMPD"; return 1; }
+    SRC_BIN=$(find "$TMPD" -type f -name sing-box | head -n 1)
+    [[ -n "$SRC_BIN" ]] || { error "压缩包内未找到 sing-box"; rm -rf "$TMPD"; return 1; }
+    mkdir -p "$(dirname "$SBOX_BIN")"
+    cp "$SRC_BIN" "${SBOX_BIN}.new" && chmod +x "${SBOX_BIN}.new"
+    if ! "${SBOX_BIN}.new" version >/dev/null 2>&1; then
+        error "下载的 sing-box 无法执行"; rm -f "${SBOX_BIN}.new"; rm -rf "$TMPD"; return 1
+    fi
+    mv -f "${SBOX_BIN}.new" "$SBOX_BIN"
+    rm -rf "$TMPD"
+    return 0
+}
+
+install_sbox() {
+    title "安装 sing-box..."
+    if detect_sbox_bin; then
+        warn "sing-box 已安装，跳过安装步骤"
+        mkdir -p "$SBOX_DIR"
+        [[ -f "$SBOX_INIT" ]] || _write_sbox_init
+        return 0
+    fi
+    if [[ -x /usr/local/bin/sing-box ]]; then
+        warn "检测到已安装的 sing-box 无法执行（常见于误装 glibc 版本，Alpine 需要 musl 版），将重新安装"
+        rm -f /usr/local/bin/sing-box
+    fi
+    install_deps || return 1
+
+    SBOX_BIN="/usr/local/bin/sing-box"
+    info "获取 sing-box 最新版本..."
+    local VER
+    VER=$(_sbox_latest_ver)
+    [[ -z "$VER" ]] && { error "无法获取 sing-box 最新版本（GitHub 不通？）"; return 1; }
+    _download_sbox_musl "$VER" || return 1
+
+    mkdir -p "$SBOX_DIR"
+    touch "$USER_DB" && chmod 600 "$USER_DB"
+    _write_sbox_init
+    detect_sbox_bin || { error "sing-box 安装失败"; return 1; }
     info "sing-box 安装成功: $($SBOX_BIN version 2>/dev/null | head -1)"
 }
 
 # ============================================================
-# 卸载
+# 卸载 sing-box
 # ============================================================
+
+_remove_cron_entries() {
+    local CRONF=/etc/crontabs/root TMP
+    [[ -f "$CRONF" ]] || return 0
+    TMP=$(mktemp)
+    grep -v -e "check-expire" -e "quota-collect" -e "quota-reset" -e "/var/log/sing-box.log" "$CRONF" > "$TMP"
+    cat "$TMP" > "$CRONF"
+    rm -f "$TMP"
+}
+
 uninstall_sbox() {
-    title "卸载所有节点..."
-    read -rp "确认卸载？将删除所有配置、证书和用户数据 [y/N]: " CONFIRM
+    title "卸载 sing-box..."
+    read -rp "确认卸载？将删除所有配置和用户数据 [y/N]: " CONFIRM
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
 
-    rc-service sing-box stop 2>/dev/null
-    rc-update del sing-box default 2>/dev/null
-    rc-service hysteria-server stop 2>/dev/null
-    rc-update del hysteria-server default 2>/dev/null
-
-    rm -f "$SBOX_BIN" "$SBOX_INIT" "$HY_BIN" "$HY_INIT" "$CRON_JOB"
-    rm -rf "$SBOX_DIR" "$HY_DIR"
-    info "已完全卸载"
+    # 1. 停全部相关服务
+    for u in "$SERVICE_NAME" "hysteria-server"; do
+        rc-service "$u" stop >/dev/null 2>&1
+        rc-update del "$u" default >/dev/null 2>&1
+    done
+    # 2. 删 OpenRC 服务脚本
+    rm -f "$SBOX_INIT" "$HY_INIT"
+    # 3. 删二进制与快捷命令
+    rm -f "$SBOX_BIN"
+    rm -f /usr/local/bin/sing-box
+    rm -f /usr/local/bin/hysteria
+    rm -f /usr/local/bin/singbox_manager.sh
+    rm -f /usr/local/bin/c
+    # 4. 删全部配置与元数据（含 sing-box / hysteria / 机器人 / SSL）
+    rm -rf "$SBOX_DIR"
+    rm -rf /etc/hysteria
+    rm -rf /var/lib/sbox
+    # 5. 清 cron、logrotate 与日志
+    _remove_cron_entries
+    rm -f "$OLD_CRON_JOB" /etc/logrotate.d/sbox
+    rm -f /var/log/sbox-expire.log* /var/log/sing-box.log* /var/log/hysteria.log*
+    # 6. 打印残留自检
+    echo ""
+    echo "残留自检："
+    local leftover=0 f
+    for f in /usr/local/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria "$SBOX_INIT" "$HY_INIT" "$OLD_CRON_JOB"; do
+        if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
+    done
+    if grep -qE "check-expire|quota-collect|quota-reset" /etc/crontabs/root 2>/dev/null; then echo "  残留: cron 任务"; leftover=1; fi
+    [[ "$leftover" -eq 0 ]] && info "无残留，sing-box 已完全卸载" || warn "存在残留，请按上面路径手动处理"
     exit 0
 }
 
@@ -375,14 +579,120 @@ uninstall_sbox() {
 # 生成 Reality 密钥对
 # ============================================================
 gen_keypair() {
-    local OUTPUT
-    OUTPUT=$("$SBOX_BIN" generate reality-keypair 2>&1)
-    if [[ $? -ne 0 ]]; then
-        error "sing-box generate reality-keypair 执行失败:"
-        echo "$OUTPUT"
+    PRIVATE_KEY=""
+    PUBLIC_KEY=""
+    if ! detect_sbox_bin; then
+        error "找不到可用的 sing-box，请先运行「一键安装」"
+        return 1
     fi
-    PRIVATE_KEY=$(echo "$OUTPUT" | grep -i "PrivateKey" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$OUTPUT" | grep -i "PublicKey" | awk '{print $NF}')
+
+    local OUTPUT STATUS
+    OUTPUT=$("$SBOX_BIN" generate reality-keypair 2>&1)
+    STATUS=$?
+    if [[ $STATUS -ne 0 ]]; then
+        error "sing-box 密钥生成失败: ${OUTPUT:-未知错误}"
+        return 1
+    fi
+
+    PRIVATE_KEY=$(printf '%s\n' "$OUTPUT" | awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            lowered = tolower(line)
+            if (index(lowered, "privatekey:") > 0) {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                print line
+                exit
+            }
+        }')
+    PUBLIC_KEY=$(printf '%s\n' "$OUTPUT" | awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            lowered = tolower(line)
+            if (index(lowered, "publickey:") > 0) {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+                print line
+                exit
+            }
+        }')
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        error "无法解析 Reality 密钥输出: ${OUTPUT}"
+        return 1
+    fi
+    if [[ "$PRIVATE_KEY" == "$PUBLIC_KEY" ]]; then
+        error "Reality 私钥与公钥不应相同，请重新生成"
+        return 1
+    fi
+}
+
+# ============================================================
+# IP 优先级设置
+# ============================================================
+_read_ip_priority() {
+    local ds=""
+    [[ -f "$META" ]] && ds=$(read_kv "$META" "IP_PRIORITY")
+    echo "$ds"
+}
+
+_get_ip_priority_desc() {
+    local ds
+    ds=$(_read_ip_priority)
+    case "$ds" in
+        prefer_ipv4) echo "IPv4 优先（v4失败自动切v6）" ;;
+        prefer_ipv6) echo "IPv6 优先（v6失败自动切v4）" ;;
+        ipv4_only)   echo "仅 IPv4" ;;
+        ipv6_only)   echo "仅 IPv6" ;;
+        *)           echo "系统默认" ;;
+    esac
+}
+
+_save_ip_priority() {
+    local ds="$1"
+    mkdir -p "$(dirname "$META")"
+    touch "$META"
+    if grep -q "^IP_PRIORITY=" "$META" 2>/dev/null; then
+        sed -i "s|^IP_PRIORITY=.*|IP_PRIORITY=${ds}|" "$META"
+    else
+        echo "IP_PRIORITY=${ds}" >> "$META"
+    fi
+}
+
+ip_priority_menu() {
+    title "网络优先级（IPv4/IPv6）"
+    load_meta
+    local CURRENT_DESC
+    CURRENT_DESC=$(_get_ip_priority_desc)
+    echo ""
+    echo -e "当前模式：${CYAN}${CURRENT_DESC}${NC}"
+    echo -e "${YELLOW}（Reality / SS / WS / Hysteria2 统一生效）${NC}"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} IPv4 优先   — 优先走 v4，v4 不通自动切 v6"
+    echo -e "  ${GREEN}2.${NC} IPv6 优先   — 优先走 v6，v6 不通自动切 v4"
+    echo -e "  ${GREEN}3.${NC} 仅 IPv4     — 强制只走 v4"
+    echo -e "  ${GREEN}4.${NC} 仅 IPv6     — 强制只走 v6"
+    echo -e "  ${GREEN}5.${NC} 系统默认"
+    echo -e "  ${GREEN}0.${NC} 返回"
+    echo ""
+    read -rp "选择: " OPT
+    local DS=""
+    local DESC=""
+    case "$OPT" in
+        1) DS="prefer_ipv4"; DESC="IPv4 优先" ;;
+        2) DS="prefer_ipv6"; DESC="IPv6 优先" ;;
+        3) DS="ipv4_only";   DESC="仅 IPv4" ;;
+        4) DS="ipv6_only";   DESC="仅 IPv6" ;;
+        5) DS="AsIs";        DESC="系统默认" ;;
+        0) return ;;
+        *) warn "无效选项"; return ;;
+    esac
+    _save_ip_priority "$DS"
+    if has_reality || has_shadowsocks || has_ws || has_hy2 || has_anytls; then
+        rebuild_config
+        _inject_all_users
+        _start_sbox
+    fi
+    info "已生效：${DESC}"
 }
 
 # ============================================================
@@ -390,16 +700,20 @@ gen_keypair() {
 # ============================================================
 rebuild_config() {
     load_meta
+    local IP_PRIO
+    IP_PRIO=$(_read_ip_priority)
 
     HAS_REALITY=0; has_reality && HAS_REALITY=1
     HAS_SS=0; has_shadowsocks && HAS_SS=1
     HAS_WS=0; has_ws && HAS_WS=1
+    HAS_HY2=0; has_hy2 && HAS_HY2=1
     HAS_ANYTLS=0; has_anytls && HAS_ANYTLS=1
 
-    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_ANYTLS
+    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO
     export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
+    export HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY
     export ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_SNI ANYTLS_PRIVATE_KEY ANYTLS_SHORTID
 
     python3 - <<PYEOF
@@ -424,10 +738,13 @@ if os.environ.get("HAS_REALITY") == "1":
     })
 
 if os.environ.get("HAS_SS") == "1":
+    # SS 多用户（SS-2022 EIH）：顶层 password 是服务端主密钥（老单密码客户端继续能用），
+    # users[] 是各用户独立 EIH 密钥，由 _inject_all_users 按 users.db 注入
     cfg["inbounds"].append({
         "type": "shadowsocks", "tag": "inbound-shadowsocks",
         "listen": "::", "listen_port": int(os.environ["SS_PORT"]),
-        "method": os.environ["SS_METHOD"], "password": os.environ["SS_PASSWORD"]
+        "method": os.environ["SS_METHOD"], "password": os.environ["SS_PASSWORD"],
+        "users": []
     })
 
 if os.environ.get("HAS_WS") == "1":
@@ -464,7 +781,13 @@ if os.environ.get("HAS_ANYTLS") == "1":
         }
     })
 
-cfg["outbounds"] = [{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}]
+ds = os.environ.get("IP_PRIO", "")
+outbound = {"type": "direct", "tag": "direct"}
+if ds and ds != "AsIs":
+    outbound["domain_strategy"] = ds
+
+cfg["outbounds"] = [outbound, {"type": "block", "tag": "block"}]
+
 cfg["route"] = {
     "rules": [
         {"protocol": "dns", "action": "hijack-dns"},
@@ -476,36 +799,55 @@ cfg["route"] = {
 with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
-    # 重建配置后，自动把 DB 里所有 active 用户重新注入，避免 users 为空导致节点无法连接
+    # 重建配置后，把 DB 里所有 active 用户重新注入，避免 users 为空导致节点无法连接
     _inject_all_users
 }
 
 # ============================================================
-# 注入用户到 config.json（Reality 和 WS，按 UUID 区分）
+# 注入用户到 config.json（Reality/WS 用 UUID，SS 用独立密码）
+# 用法：_inject_user <UUID> <NAME> <EXPIRE> <NODE> [SSPASS]
 # ============================================================
 _inject_user() {
-    local UUID=$1 NAME=$2 NODE=$3
+    local UUID=$1 NAME=$2 EXPIRE=$3 NODE=$4 SSPASS=${5:-}
 
-    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" \
+    INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" INJECT_SSPASS="$SSPASS" \
     INJECT_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
 import json, os
 uuid = os.environ["INJECT_UUID"]
 name = os.environ["INJECT_NAME"]
 node = os.environ["INJECT_NODE"]
+sspass = os.environ.get("INJECT_SSPASS", "")
 cfg_path = os.environ["INJECT_CONFIG"]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
+# VLESS inbound tags 允许注入用户
 VLESS_TAGS = {"inbound-reality", "inbound-ws"}
 
 for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
     users = inbound.get("users")
-    if users is None or tag not in VLESS_TAGS:
+    if users is None:
         continue
+    # SS 入口：按用户名(name)管理独立 EIH 密码
+    if tag == "inbound-shadowsocks":
+        # single-password mode: only master password works, drop per-user entries
+        inbound["users"] = [u for u in users if u.get("name") != name]
+        continue
+    # 仅对 VLESS 节点操作用户列表，跳过 Hysteria2 / AnyTLS 等
+    if tag not in VLESS_TAGS:
+        continue
+    # 移除已存在的同 UUID 用户
     inbound["users"] = [u for u in users if u.get("uuid") != uuid]
-    should_add = node == "both" or (node == "reality" and tag == "inbound-reality") or (node == "ws" and tag == "inbound-ws")
+    # 按节点类型注入
+    should_add = False
+    if node == "both":
+        should_add = True
+    elif node == "reality" and tag == "inbound-reality":
+        should_add = True
+    elif node == "ws" and tag == "inbound-ws":
+        should_add = True
     if should_add:
         user_entry = {"name": name, "uuid": uuid}
         if tag == "inbound-reality":
@@ -517,13 +859,16 @@ with open(cfg_path, "w", encoding="utf-8") as f:
 PYEOF
 }
 
+# ============================================================
+# 重建后将所有 active 用户重新注入
+# ============================================================
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
     normalize_user_db
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         [[ "$STATUS" != "active" ]] && continue
         NODE=${NODE:-both}
-        _inject_user "$UUID" "$NAME" "$NODE"
+        _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE" "$SSPASS"
     done < "$USER_DB"
 }
 
@@ -532,23 +877,11 @@ _inject_all_users() {
 # ============================================================
 init_reality() {
     title "配置 VLESS + Reality"
-    if has_reality; then
-        warn "Reality 已存在，重新配置会生成新密钥，现有用户链接将失效"
-        read -rp "确认继续？[y/N]: " C
-        [[ "$C" != "y" && "$C" != "Y" ]] && return
-    fi
-
-    gen_keypair
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败"; return 1
-    fi
+    gen_keypair || return 1
 
     while true; do
         read -rp "监听端口 [默认 8443]: " REALITY_PORT
         REALITY_PORT=${REALITY_PORT:-8443}
-        if ! [[ "$REALITY_PORT" =~ ^[0-9]+$ ]] || (( REALITY_PORT < 1 || REALITY_PORT > 65535 )); then
-            error "端口必须是 1-65535"; continue
-        fi
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用"
     done
 
@@ -557,7 +890,6 @@ init_reality() {
     local REALITY_SHORTID
     REALITY_SHORTID=$(openssl rand -hex 8)
 
-    mkdir -p "$SBOX_DIR"
     cat > "$META_REALITY" <<EOF
 REALITY_PRIVATE_KEY=${PRIVATE_KEY}
 REALITY_PUBLIC_KEY=${PUBLIC_KEY}
@@ -575,31 +907,6 @@ EOF
 }
 
 # ============================================================
-# 单独修改 Reality 监听端口（不改密钥，不影响已有用户）
-# ============================================================
-change_reality_port() {
-    title "修改 Reality 监听端口"
-    has_reality || { error "尚未配置 Reality 节点"; return; }
-    load_meta
-    echo -e "当前端口: ${CYAN}${REALITY_PORT}${NC}"
-    local NEW_PORT
-    while true; do
-        read -rp "新端口: " NEW_PORT
-        [[ -z "$NEW_PORT" ]] && { warn "已取消"; return; }
-        if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || (( NEW_PORT < 1 || NEW_PORT > 65535 )); then
-            error "端口必须是 1-65535 的数字"; continue
-        fi
-        [[ "$NEW_PORT" == "$REALITY_PORT" ]] && { warn "与当前端口相同"; return; }
-        check_port "$NEW_PORT" && break || warn "端口 ${NEW_PORT} 已被占用，请换一个"
-    done
-    sed -i "s|^REALITY_PORT=.*|REALITY_PORT=${NEW_PORT}|" "$META_REALITY"
-    rebuild_config
-    _inject_all_users
-    _start_sbox
-    info "端口已修改为 ${NEW_PORT}，请重新获取分享链接"
-}
-
-# ============================================================
 # 初始化 Shadowsocks 节点
 # ============================================================
 init_shadowsocks() {
@@ -613,9 +920,6 @@ init_shadowsocks() {
     while true; do
         read -rp "监听端口 [默认 ${PORT}]: " PORT
         PORT=${PORT:-$SS_PORT_DEFAULT}
-        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-            error "端口必须是 1-65535"; continue
-        fi
         check_port "$PORT" && break || warn "端口 ${PORT} 已被占用"
     done
 
@@ -624,7 +928,6 @@ init_shadowsocks() {
     SS_PASSWORD=$(openssl rand -base64 16)
     [[ -n "$SS_PASSWORD" ]] || { error "密码生成失败"; return 1; }
 
-    mkdir -p "$SBOX_DIR"
     cat > "$META_SS" <<EOF
 SS_PORT=${SS_PORT}
 SS_METHOD=${SS_METHOD}
@@ -641,8 +944,9 @@ EOF
 _print_ss_link() {
     load_meta
     [[ -z "$SS_PASSWORD" ]] && return
-    local SERVER_IP USERINFO
+    local SERVER_IP
     SERVER_IP=$(get_public_ip)
+    local USERINFO
     USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
     echo ""
     echo -e "${GREEN}===== Shadowsocks 信息 =====${NC}"
@@ -656,21 +960,18 @@ _print_ss_link() {
 }
 
 # ============================================================
-# 初始化 WS+TLS 节点（自签证书，配合 CF 等前置代理使用）
+# 初始化 WS+CF 节点
 # ============================================================
 init_ws_cf() {
     title "配置 VLESS + WS + TLS"
     while true; do
         read -rp "监听端口 [默认 8445]: " WS_PORT
         WS_PORT=${WS_PORT:-8445}
-        if ! [[ "$WS_PORT" =~ ^[0-9]+$ ]] || (( WS_PORT < 1 || WS_PORT > 65535 )); then
-            error "端口必须是 1-65535"; continue
-        fi
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用"
     done
     read -rp "WS 路径 [默认 /vless]: " WS_PATH
     WS_PATH=${WS_PATH:-/vless}
-    read -rp "你的域名（已在 CF 等前置解析）: " WS_DOMAIN
+    read -rp "你的域名（已在 CF 解析）: " WS_DOMAIN
     [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return 1
 
     CERT_DIR="/etc/sing-box/ssl"
@@ -688,6 +989,7 @@ init_ws_cf() {
 WS_PORT=${WS_PORT}
 WS_PATH=${WS_PATH}
 WS_DOMAIN=${WS_DOMAIN}
+WS_CF_PORT=${WS_PORT}
 WS_TLS=tls
 CERT_DIR=${CERT_DIR}
 EOF
@@ -696,18 +998,29 @@ EOF
     rebuild_config || return 1
     _inject_all_users
     _start_sbox || return 1
-    info "WS+TLS 节点配置完成"
-    echo -e "${YELLOW}提示：${NC}${WS_DOMAIN} 需解析到本机，并在前置代理（如 CF）开启 TLS（完全/Full 模式）"
+    info "WS+CF 节点配置完成"
+    echo -e "${YELLOW}CF 配置：${NC}${WS_DOMAIN} 解析到本机并开启橙云，SSL 使用完全（Full）"
 }
 
 # ============================================================
-# Hysteria2（独立官方 hysteria 二进制，独立 OpenRC 服务）
 # ============================================================
+# Hysteria2（独立官方 hysteria server v2.12.x，二次重构成独立服务体系，不走 sing-box）
+# ============================================================
+HY_BIN="/usr/local/bin/hysteria"
+HY_SERVICE="hysteria-server.service"
+HY_CONF="/etc/hysteria/config.yaml"
+HY_DIR="/etc/hysteria"
+HY_CERT_F="/etc/hysteria/server.crt"
+HY_KEY_F="/etc/hysteria/server.key"
+
 detect_hyst_arch(){
     case "$(uname -m)" in
         x86_64|amd64)  echo "hysteria-linux-amd64" ;;
         aarch64|arm64) echo "hysteria-linux-arm64" ;;
         armv7l|armv6l) echo "hysteria-linux-arm" ;;
+        riscv64)       echo "hysteria-linux-riscv64" ;;
+        s390x)         echo "hysteria-linux-s390x" ;;
+        i386|i686)     echo "hysteria-linux-386" ;;
         *) return 1 ;;
     esac
 }
@@ -716,9 +1029,14 @@ hy_installed_ver(){
     [[ -x "$HY_BIN" ]] || return 1
     "$HY_BIN" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
 }
+hy_latest_ver(){
+    curl -fsSL --max-time 15 https://api.github.com/repos/HyNetworks/hysteria/releases/latest 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name","").lstrip("app/v"))' 2>/dev/null
+}
 
 install_hysteria(){
     title "安装官方 Hysteria"
+    command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1
     if [[ -x "$HY_BIN" ]]; then
         info "已安装 Hysteria: $(hy_installed_ver || echo 未知)"
         return 0
@@ -731,6 +1049,26 @@ install_hysteria(){
     chmod +x "$HY_BIN"
     [[ -x "$HY_BIN" ]] || { error "安装失败"; return 1; }
     info "hysteria 安装成功: $("$HY_BIN" version | head -1)"
+}
+
+update_hysteria_binary(){
+    title "更新 Hysteria 官方二进制"
+    [[ -x "$HY_BIN" ]] || { error "hysteria 未安装，请先安装"; return 1; }
+    local FN NEW BAK OLD_VER NEW_VER
+    FN=$(detect_hyst_arch) || { error "不支持的架构"; return 1; }
+    NEW="${HY_BIN}.new"; BAK="${HY_BIN}.bak"
+    curl -fsSL --max-time 120 "https://download.hysteria.network/app/latest/${FN}" -o "$NEW" \
+      || { error "下载新版本失败"; return 1; }
+    chmod +x "$NEW"
+    "$NEW" version >/dev/null 2>&1 || { error "下载的不是有效二进制"; rm -f "$NEW"; return 1; }
+    OLD_VER=$(hy_installed_ver)
+    NEW_VER=$("$NEW" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+    if [[ "$OLD_VER" == "$NEW_VER" ]]; then
+        info "已是最新版本: ${NEW_VER}"; rm -f "$NEW"; return 0
+    fi
+    mv "$HY_BIN" "$BAK"; mv "$NEW" "$HY_BIN"; chmod +x "$HY_BIN"; rm -f "$BAK"
+    info "更新完成: ${OLD_VER:-旧} → ${NEW_VER:-新}"
+    systemctl restart "$HY_SERVICE" 2>/dev/null && info "hysteria 服务已重启"
 }
 
 _gen_hy2_cert(){
@@ -749,11 +1087,13 @@ _gen_hy2_cert(){
     return 0
 }
 
+
 _setup_hy2_service(){
     cat > "$HY_INIT" <<EOF
 #!/sbin/openrc-run
 name="hysteria-server"
 description="Hysteria2 server (official)"
+export GOGC=50
 command="${HY_BIN}"
 command_args="server -c ${HY_CONF}"
 command_background=true
@@ -770,19 +1110,21 @@ EOF
 }
 
 _start_hy2_service(){
-    rc-update add hysteria-server default >/dev/null 2>&1
-    rc-service hysteria-server restart >/dev/null 2>&1
-    sleep 1
-    if rc-service hysteria-server status 2>/dev/null | grep -q started; then
-        info "hysteria 服务运行中"; return 0
+    systemctl enable "$HY_SERVICE" >/dev/null 2>&1
+    systemctl restart "$HY_SERVICE"
+    sleep 2
+    if systemctl is-active --quiet "$HY_SERVICE"; then
+        info "hysteria 服务运行中"
+        return 0
     else
-        error "hysteria 启动失败，运行 cat /var/log/hysteria.log 查看日志"
+        error "hysteria 启动失败:"
+        tail -n 15 /var/log/hysteria.log 2>&1
         return 1
     fi
 }
 
 init_hy2() {
-    title "配置 Hysteria2（独立官方 hysteria）"
+    title "配置 Hysteria2（独立官方 hysteria,BBR不限速）"
 
     if has_hy2; then
         warn "Hysteria2 已存在，重新配置将覆盖并重启服务"
@@ -790,9 +1132,9 @@ init_hy2() {
         [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
     fi
 
-    local PORT SNI UP DOWN PASS
-    read -rp "监听端口 [默认 ${HY2_PORT_DEFAULT}]: " PORT
-    PORT=${PORT:-$HY2_PORT_DEFAULT}
+    local PORT SNI PASS HOP_ASK HOP_RANGE HOP_START HOP_END
+    read -rp "监听端口 [默认 443]: " PORT
+    PORT=${PORT:-443}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
         error "端口必须是 1-65535"; return 1
     fi
@@ -801,61 +1143,65 @@ init_hy2() {
     read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
     SNI=${SNI:-www.bing.com}
 
-    read -rp "服务器上行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " UP
-    read -rp "服务器下行带宽 Mbps（填整数，启用 brutal 拥塞控制）[如 100]: " DOWN
-    UP=${UP:-0}; DOWN=${DOWN:-0}
-    if (( UP <= 0 )) || (( DOWN <= 0 )); then
-        warn "带宽未填或为 0，将不启用 brutal（用默认 BBR，带宽不受限）"
+
+    HOP_RANGE=""
+    read -rp "Enable UDP port hopping [y/N]: " HOP_ASK
+    if [[ "$HOP_ASK" == "y" || "$HOP_ASK" == "Y" ]]; then
+        HOP_START=$((RANDOM % 40000 + 10000))
+        HOP_END=$((HOP_START + 999))
+        HOP_RANGE="${HOP_START}-${HOP_END}"
+        info "Port-hop range ${HOP_START}-${HOP_END}"
     fi
 
     PASS=$(openssl rand -hex 16)
     [[ -n "$PASS" ]] || { error "密码生成失败"; return 1; }
 
+    command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1
     _gen_hy2_cert "$SNI" || return 1
 
-    mkdir -p "$HY_DIR"
-    cat > "$HY_CONF" <<EOF2
-listen: :${PORT}
+    mkdir -p "$HY_DIR" /var/www/masq
+    local LISTEN_VALUE=":${PORT}"
+    [[ -n "$HOP_RANGE" ]] && LISTEN_VALUE=":${PORT},${HOP_RANGE}"
+    cat > "$HY_CONF" <<'EOF'
+listen: :443
 obfs:
   type: salamander
   salamander:
-    password: ${PASS}
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
+    password: OBFSPASS
+ignoreClientBandwidth: false
+congestion:
+  type: bbr
 auth:
   type: password
-  password: ${PASS}
+  password: AUTH_PASSWORD
 masquerade:
   type: proxy
   proxy:
     url: https://news.ycombinator.com/
     rewriteHost: true
-bandwidth:
-  up: ${UP} mbps
-  down: ${DOWN} mbps
-tls:
-  cert: ${HY_CERT_F}
-  key: ${HY_KEY_F}
-EOF2
 
-    cat > "$META_HY2" <<EOF
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+EOF
+    sed -i "s|OBFSPASS|${PASS}|g" "$HY_CONF"
+    sed -i "s|AUTH_PASSWORD|${PASS}|g" "$HY_CONF"
+    sed -i "s|listen: :443|listen: ${LISTEN_VALUE}|g" "$HY_CONF"
+
+    cat > "$META_HY2" <<EOF2
 HY2_PORT=${PORT}
 HY2_SNI=${SNI}
 HY2_PASSWORD=${PASS}
-HY2_UP=${UP}
-HY2_DOWN=${DOWN}
-EOF
+HY2_PORT_RANGE=${HOP_RANGE}
+HY2_CERT=${HY_CERT_F}
+HY2_KEY=${HY_KEY_F}
+EOF2
     chmod 600 "$META_HY2" "$HY_CONF"
 
     install_hysteria || return 1
     _setup_hy2_service || return 1
     _start_hy2_service || return 1
-    info "Hysteria2 配置完成（端口 ${PORT}/UDP，带宽 up=${UP} down=${DOWN} Mbps）"
+    info "HY2 BBR不限速 ${PORT} ${HOP_RANGE}"
     _print_hy2_link
 }
 
@@ -863,20 +1209,29 @@ remove_hy2() {
     has_hy2 || { error "Hysteria2 未启用"; return 1; }
     read -rp "确认移除 Hysteria2（停止并删除服务/配置/证书）？[y/N]: " C
     [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    rc-service hysteria-server stop 2>/dev/null
-    rc-update del hysteria-server default 2>/dev/null
+    systemctl stop "$HY_SERVICE" 2>/dev/null
+    systemctl disable "$HY_SERVICE" 2>/dev/null
     rm -f "$HY_INIT"
     rm -rf "$HY_DIR"
     rm -f "$META_HY2"
-    info "Hysteria2 已移除（二进制保留，可用菜单重装）"
+    systemctl daemon-reload
+    info "Hysteria2 已移除（二进制保留，可用菜单更新/重装）"
+}
+
+hy2_share_link() {
+    local SERVER=$1 PORT=$2 PASS=$3 SNI=$4 RANGE=${5:-}
+    local HOST="$SERVER"
+    [[ "$HOST" == *:* && "$HOST" != \[*\] ]] && HOST="[${HOST}]"
+    local QUERY="sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}"
+    [[ -n "$RANGE" ]] && QUERY="${QUERY}&mport=${RANGE}"
+    printf 'hy2://%s@%s:%s/?%s#Hysteria2-%s\n' "$PASS" "$HOST" "$PORT" "$QUERY" "$PORT"
 }
 
 _print_hy2_link() {
     has_hy2 || return 1
-    local PORT PASS SNI SERVER_IP UP DOWN
+    local PORT PASS SNI SERVER_IP RANGE
     PORT=$(read_kv "$META_HY2" HY2_PORT); PASS=$(read_kv "$META_HY2" HY2_PASSWORD)
-    SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip)
-    UP=$(read_kv "$META_HY2" HY2_UP); DOWN=$(read_kv "$META_HY2" HY2_DOWN)
+    SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip); RANGE=$(read_kv "$META_HY2" HY2_PORT_RANGE)
     echo ""
     echo -e "${GREEN}===== Hysteria2 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
@@ -885,9 +1240,9 @@ _print_hy2_link() {
     echo -e "SNI    : ${SNI}"
     echo -e "证书   : 自签名，客户端需 insecure=1"
     echo -e "混淆   : Salamander（密码同值）"
-    echo -e "带宽   : 上行 ${UP:-0} / 下行 ${DOWN:-0} Mbps (brutal)"
+    echo -e "Hop: ${RANGE:-none} (Clash ports)"
     echo -e "${CYAN}分享链接:${NC}"
-    echo "hy2://${PASS}@${SERVER_IP}:${PORT}/?sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}#Hysteria2-${PORT}"
+    hy2_share_link "$SERVER_IP" "$PORT" "$PASS" "$SNI" "$RANGE"
     echo ""
 }
 
@@ -897,10 +1252,11 @@ show_hy2_link() {
 }
 
 # ============================================================
-# AnyTLS（Reality 伪装）
+# AnyTLS（Reality 伪装，独立密钥对，不再用自签证书）
 # ============================================================
 init_anytls() {
     title "配置 AnyTLS + Reality"
+
     if has_anytls; then
         warn "AnyTLS 已存在，重新配置将生成新密码/密钥"
         read -rp "确认继续？[y/N]: " C
@@ -918,10 +1274,7 @@ init_anytls() {
     read -rp "伪装域名 [默认 www.microsoft.com]: " SNI
     SNI=${SNI:-www.microsoft.com}
 
-    gen_keypair
-    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "密钥生成失败"; return 1
-    fi
+    gen_keypair || return 1
 
     ANYTLS_PORT=$PORT
     ANYTLS_PASSWORD=$(openssl rand -hex 16)
@@ -986,43 +1339,47 @@ show_anytls_link() {
 }
 
 # ============================================================
-# 节点配置菜单（安装/移除各协议）
+# 节点配置选择菜单
 # ============================================================
-node_menu() {
-    title "节点配置"
+init_config() {
+    title "节点配置..."
     mkdir -p "$SBOX_DIR"
     touch "$USER_DB" && chmod 600 "$USER_DB"
+    normalize_user_db
     load_meta
 
     echo ""
     echo "当前节点状态："
-    has_reality     && echo -e "  ${GREEN}✓${NC} Reality 已启用（端口 ${REALITY_PORT}）"     || echo -e "  ${RED}✗${NC} Reality 未启用"
-    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用（端口 ${SS_PORT}）"       || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
-    has_ws          && echo -e "  ${GREEN}✓${NC} WS+TLS 已启用（端口 ${WS_PORT}）"            || echo -e "  ${RED}✗${NC} WS+TLS 未启用"
-    has_hy2         && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用（端口 ${HY2_PORT}）"        || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
-    has_anytls      && echo -e "  ${GREEN}✓${NC} AnyTLS 已启用（端口 ${ANYTLS_PORT}）"        || echo -e "  ${RED}✗${NC} AnyTLS 未启用"
+    has_reality     && echo -e "  ${GREEN}✓${NC} Reality 已启用"    || echo -e "  ${RED}✗${NC} Reality 未启用"
+    has_shadowsocks && echo -e "  ${GREEN}✓${NC} Shadowsocks 已启用" || echo -e "  ${RED}✗${NC} Shadowsocks 未启用"
+    has_ws          && echo -e "  ${GREEN}✓${NC} WS+CF 已启用"      || echo -e "  ${RED}✗${NC} WS+CF 未启用"
+    has_hy2         && echo -e "  ${GREEN}✓${NC} Hysteria2 已启用"  || echo -e "  ${RED}✗${NC} Hysteria2 未启用"
+    has_anytls      && echo -e "  ${GREEN}✓${NC} AnyTLS 已启用"    || echo -e "  ${RED}✗${NC} AnyTLS 未启用"
     echo ""
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
     echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks"
     echo -e "  ${GREEN}3.${NC} 配置 VLESS + WS + TLS"
     echo -e "  ${GREEN}4.${NC} 配置 Hysteria2"
     echo -e "  ${GREEN}5.${NC} 配置 AnyTLS"
-    echo -e "  ${GREEN}6.${NC} 修改 Reality 端口"
     has_reality     && echo -e "  ${RED}10.${NC} 移除 Reality"
     has_shadowsocks && echo -e "  ${RED}11.${NC} 移除 Shadowsocks"
-    has_ws          && echo -e "  ${RED}12.${NC} 移除 WS+TLS"
+    has_ws          && echo -e "  ${RED}12.${NC} 移除 WS+CF"
     has_hy2         && echo -e "  ${RED}13.${NC} 移除 Hysteria2"
     has_anytls      && echo -e "  ${RED}14.${NC} 移除 AnyTLS"
-    echo -e "  ${GREEN}0.${NC} 返回"
     echo ""
     read -rp "选择: " MODE_SEL
     case $MODE_SEL in
-        1) init_reality ;;
+        1)
+            if has_reality; then
+                warn "Reality 已存在，重新配置将覆盖"
+                read -rp "确认？[y/N]: " C
+                [[ "$C" != "y" && "$C" != "Y" ]] && return
+            fi
+            init_reality ;;
         2) init_shadowsocks ;;
         3) init_ws_cf ;;
         4) init_hy2 ;;
         5) init_anytls ;;
-        6) change_reality_port ;;
         10)
             has_reality || { error "Reality 未启用"; return; }
             read -rp "确认移除 Reality？[y/N]: " C
@@ -1039,47 +1396,71 @@ node_menu() {
             info "Shadowsocks 已移除" ;;
         12)
             has_ws || { error "WS 未启用"; return; }
-            read -rp "确认移除 WS+TLS？[y/N]: " C
+            read -rp "确认移除 WS+CF？[y/N]: " C
             [[ "$C" != "y" && "$C" != "Y" ]] && return
             rm -f "$META_WS"
             rebuild_config; _inject_all_users; _start_sbox
-            info "WS+TLS 已移除" ;;
+            info "WS+CF 已移除" ;;
         13) remove_hy2 ;;
         14) remove_anytls ;;
-        0) return ;;
         *) error "无效选择" ;;
     esac
 }
-
 # ============================================================
-# 打印用户分享链接（Reality / WS，按用户 NODE 权限）
+# 打印用户分享链接
 # ============================================================
 _print_link() {
-    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both}
+    local USERNAME=$1 UUID=$2 EXPIRE=$3 NODE=${4:-both} SSPASS=${5:-}
     load_meta
+
     local EXPIRE_SHOW
     EXPIRE_SHOW=$(expire_display "$EXPIRE")
 
     echo ""
-    echo -e "${GREEN}===== 用户信息 =====${NC}"
+    echo -e "${GREEN}===== 节点信息 =====${NC}"
     echo -e "用户名 : ${USERNAME}"
     echo -e "UUID   : ${UUID}"
     echo -e "到期   : ${EXPIRE_SHOW}"
     echo -e "节点   : ${NODE}"
 
     if [[ "$NODE" == "reality" || "$NODE" == "both" ]] && has_reality; then
-        local SERVER_IP
+        local SERVER_IP SHORTID
         SERVER_IP=$(get_public_ip)
+        SHORTID=$(python3 -c "
+import json
+d=json.load(open('$SBOX_CONFIG', encoding='utf-8'))
+for i in d.get('inbounds',[]):
+    if i.get('tag')=='inbound-reality':
+        print(i['tls']['reality']['short_id'][0]); break
+" 2>/dev/null)
+
         echo ""
         echo -e "${CYAN}── Reality 节点 ──${NC}"
         echo -e "地址   : ${SERVER_IP}"
         echo -e "端口   : ${REALITY_PORT}"
         echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
         echo -e "SNI    : ${REALITY_SNI}"
-        echo -e "ShortID: ${REALITY_SHORTID}"
-        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORTID}#${USERNAME}-reality"
+        echo -e "ShortID: ${SHORTID}"
+
+        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
+    fi
+
+    if false; then # 单密码模式：不再展示 SS 个人节点，只用主密码
+        if [[ -n "$SSPASS" ]]; then
+            local SS_USERINFO SS_LINK
+            SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | base64 -w0)
+            SS_LINK="ss://${SS_USERINFO}@${SERVER_IP:-$(get_public_ip)}:${SS_PORT}#${USERNAME}-ss"
+            echo ""
+            echo -e "${CYAN}── Shadowsocks 个人节点 ──${NC}"
+            echo -e "地址   : ${SERVER_IP:-$(get_public_ip)}"
+            echo -e "端口   : ${SS_PORT}"
+            echo -e "加密   : ${SS_METHOD}"
+            echo -e "密码   : ${SSPASS}（个人独立密码）"
+            echo -e "${CYAN}分享链接:${NC}"
+            echo "$SS_LINK"
+        fi
     fi
 
     if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
@@ -1087,12 +1468,13 @@ _print_link() {
         ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
         ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
         echo ""
-        echo -e "${CYAN}── WS+TLS 节点 ──${NC}"
+        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
         echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : ${WS_PORT}"
+        echo -e "端口   : ${WS_CF_PORT:-443}"
         echo -e "WS路径 : ${WS_PATH}"
+        echo -e "TLS    : 开启"
         echo -e "SNI    : ${WS_DOMAIN}"
-        local WS_LINK="vless://${UUID}@${WS_DOMAIN}:${WS_PORT}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=tls&sni=${WS_DOMAIN}#${ENCODED_NAME}"
+        local WS_LINK="vless://${UUID}@${WS_DOMAIN}:${WS_CF_PORT:-443}/?type=ws&encryption=none&host=${WS_DOMAIN}&path=${ENCODED_PATH}&security=tls&sni=${WS_DOMAIN}#${ENCODED_NAME}"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$WS_LINK"
     fi
@@ -1100,15 +1482,16 @@ _print_link() {
 }
 
 # ============================================================
-# 创建用户（用户仅归属 Reality / WS，SS·HY2·AnyTLS 为共享单节点）
+# 添加用户
 # ============================================================
 add_user() {
-    title "创建用户"
     load_meta
     normalize_user_db
 
     read -rp "用户名（备注用）: " USERNAME
+    [[ -z "$USERNAME" ]] && error "用户名不能为空" && return
     validate_username "$USERNAME" || return
+
     if user_exists "$USERNAME"; then
         error "用户 ${USERNAME} 已存在"; return
     fi
@@ -1117,58 +1500,79 @@ add_user() {
     local AVAIL_NODES=()
     has_reality && AVAIL_NODES+=("reality")
     has_ws && AVAIL_NODES+=("ws")
+    has_shadowsocks && AVAIL_NODES+=("ss")
 
     if [[ ${#AVAIL_NODES[@]} -eq 0 ]]; then
-        error "尚未配置 Reality 或 WS 节点，请先在「节点配置」中初始化"
+        error "尚未配置 Reality、WS 或 SS 节点，请先初始化"
         return
     fi
 
     if [[ ${#AVAIL_NODES[@]} -eq 1 ]]; then
         NODE="${AVAIL_NODES[0]}"
         local NODE_DESC="Reality"
-        [[ "$NODE" == "ws" ]] && NODE_DESC="WS+TLS"
+        [[ "$NODE" == "ws" ]] && NODE_DESC="WS+CF"
+        [[ "$NODE" == "ss" ]] && NODE_DESC="Shadowsocks"
+        echo ""
         info "当前仅有 ${NODE_DESC} 节点，用户将加入该节点"
     else
         echo ""
         echo "请选择加入的节点："
-        echo -e "  ${GREEN}1.${NC} Reality + WS"
-        echo -e "  ${GREEN}2.${NC} 仅 Reality"
-        echo -e "  ${GREEN}3.${NC} 仅 WS"
-        read -rp "选择 [1/2/3，默认1]: " NODE_SEL
-        case ${NODE_SEL:-1} in
-            2) NODE="reality" ;;
-            3) NODE="ws" ;;
-            *) NODE="both" ;;
-        esac
+        local IDX=1 OPT_ALL=0 OPT_R=0 OPT_W=0 OPT_S=0
+        if has_reality && has_ws; then
+            echo -e "  ${GREEN}${IDX}.${NC} Reality + WS"; OPT_ALL=$IDX; IDX=$((IDX+1))
+        fi
+        has_reality && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Reality"; OPT_R=$IDX; IDX=$((IDX+1)); }
+        has_ws && { echo -e "  ${GREEN}${IDX}.${NC} 仅 WS"; OPT_W=$IDX; IDX=$((IDX+1)); }
+        has_shadowsocks && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Shadowsocks（独立密码）"; OPT_S=$IDX; IDX=$((IDX+1)); }
+        read -rp "选择 [默认${OPT_ALL:-$OPT_R}]: " NODE_SEL
+        NODE_SEL=${NODE_SEL:-${OPT_ALL:-$OPT_R}}
+        if [[ "$NODE_SEL" == "$OPT_R" && "$OPT_R" != "0" ]]; then NODE="reality"
+        elif [[ "$NODE_SEL" == "$OPT_W" && "$OPT_W" != "0" ]]; then NODE="ws"
+        elif [[ "$NODE_SEL" == "$OPT_S" && "$OPT_S" != "0" ]]; then NODE="ss"
+        else NODE="both"; fi
     fi
 
-    read -rp "到期天数 [默认 30 天]: " DAYS
-    DAYS=${DAYS:-30}
+    read -rp "到期天数 [默认 999 天]: " DAYS
+    DAYS=${DAYS:-999}
     if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
         error "天数必须是纯数字"; return
     fi
 
-    local EXPIRE UUID
     EXPIRE=$(expire_noon_str "$DAYS")
     [[ -z "$EXPIRE" ]] && { error "到期时间计算失败"; return; }
-    UUID=$(cat /proc/sys/kernel/random/uuid)
 
-    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}" >> "$USER_DB"
-    _inject_user "$UUID" "$USERNAME" "$NODE"
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    # 单密码模式：SS 只用初始化时的主密码，不再给每个用户生成独立密码
+    local SSPASS=""
+    local QUOTA="0"
+    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}:${QUOTA}:0" >> "$USER_DB"
+    _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE" "$SSPASS"
 
     validate_sbox_config || {
-        sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
         rebuild_config; _inject_all_users
         error "配置校验失败，已回滚本次添加"; return 1
     }
 
     _start_sbox || {
-        sed -i "/^${USERNAME}:${UUID}:/d" "$USER_DB"
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (len(l.split(':')) >= 2 and l.split(':')[1] == "$UUID")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
         rebuild_config; _inject_all_users
         error "启动失败，已回滚本次添加"; return 1
     }
 
-    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE" "$SSPASS"
 }
 
 # ============================================================
@@ -1181,19 +1585,88 @@ delete_user() {
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
+
     if ! user_exists "$USERNAME"; then
         error "用户不存在"; return
     fi
 
-    sed -i "/^${USERNAME}:/d" "$USER_DB"
-    rebuild_config
-    _inject_all_users
-    _start_sbox
-    info "用户 ${USERNAME} 已删除"
+    UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
+    local USER_NODE DEL_NODE="both" USER_SSPASS=""
+    USER_NODE=$(get_user_field "$USERNAME" 5)
+    USER_NODE=${USER_NODE:-both}
+    USER_SSPASS=$(get_user_field "$USERNAME" 6)
+
+    if [[ "$USER_NODE" == "both" ]] && has_reality && has_ws; then
+        echo "删除哪个节点的权限？"
+        echo "  1. Reality + WS（彻底删除）"
+        echo "  2. 仅 Reality"
+        echo "  3. 仅 WS"
+        read -rp "选择 [1/2/3，默认1]: " DEL_SEL
+        case ${DEL_SEL:-1} in 2) DEL_NODE="reality" ;; 3) DEL_NODE="ws" ;; *) DEL_NODE="both" ;; esac
+    else
+        DEL_NODE="$USER_NODE"
+    fi
+
+    # 从 config.json 移除（SS 按用户名 name 删，VLESS 按 uuid 删）
+    USER_SSPASS="$USER_SSPASS" python3 - <<PYEOF
+import json, os
+del_node = "$DEL_NODE"
+ss_name = "$USERNAME"
+ss_nodes = {"ss", "both"}
+with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for inbound in cfg.get("inbounds", []):
+    tag = inbound.get("tag", "")
+    users = inbound.get("users")
+    if users is None:
+        continue
+    if tag == "inbound-shadowsocks":
+        if del_node in ss_nodes:
+            inbound["users"] = [u for u in users if u.get("name") != ss_name]
+    elif del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
+        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
+with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+
+    if [[ "$DEL_NODE" == "both" || "$DEL_NODE" == "$USER_NODE" ]]; then
+        # 彻底删除
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = [l for l in lines if not (l.startswith("$USERNAME:") and l.split(":")[0] == "$USERNAME")]
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+        info "用户 ${USERNAME} 已彻底删除"
+    else
+        # 部分删除：只移除一个节点
+        local NEW_NODE
+        [[ "$DEL_NODE" == "reality" ]] && NEW_NODE="ws" || NEW_NODE="reality"
+        DB_PATH="$USER_DB" TARGET_USER="$USERNAME" NEW_NODE="$NEW_NODE" python3 - <<'PYEOF'
+import os
+from pathlib import Path
+p = Path(os.environ["DB_PATH"])
+out = []
+for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+    parts = line.split(":")
+    if parts and parts[0] == os.environ["TARGET_USER"]:
+        parts = (parts + ["both"] * 6)[:6]
+        parts[4] = os.environ["NEW_NODE"]
+    out.append(":".join(parts))
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+        info "用户 ${USERNAME} 已移除 ${DEL_NODE} 权限，保留 ${NEW_NODE}"
+    fi
+
+    validate_sbox_config || { rebuild_config; _inject_all_users; }
+    systemctl restart "$SERVICE_NAME"
 }
 
 # ============================================================
-# 启用 / 禁用用户
+# 禁用 / 启用用户
 # ============================================================
 toggle_user() {
     local ACTION=$1
@@ -1203,292 +1676,695 @@ toggle_user() {
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
+
     if ! user_exists "$USERNAME"; then
         error "用户不存在"; return
     fi
 
-    local UUID NODE
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
-    NODE=$(get_user_field "$USERNAME" 5)
-    NODE=${NODE:-both}
+    local USER_NODE OP_NODE USER_SSPASS=""
+    USER_NODE=$(get_user_field "$USERNAME" 5)
+    USER_NODE=${USER_NODE:-both}
+    OP_NODE="$USER_NODE"
+    USER_SSPASS=$(get_user_field "$USERNAME" 6)
 
-    if [[ "$ACTION" == "禁用" ]]; then
-        DB_PATH="$USER_DB" TARGET="$USERNAME" python3 - <<'PYEOF'
-import os
+    if [[ "$ACTION" == "disable" ]]; then
+        # 从 config.json 移除（SS 按名删，VLESS 按 uuid 删）
+        python3 - <<PYEOF
+import json
+op_node = "$OP_NODE"
+ss_name = "$USERNAME"
+ss_nodes = {"ss", "both"}
+with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for inbound in cfg.get("inbounds", []):
+    tag = inbound.get("tag", "")
+    users = inbound.get("users")
+    if users is None:
+        continue
+    if tag == "inbound-shadowsocks":
+        if op_node in ss_nodes:
+            inbound["users"] = [u for u in users if u.get("name") != ss_name]
+    elif op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
+        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
+with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+
+        # 更新 db 状态（保留第6段 SS 密码，启用时还能注回去）
+        python3 - <<PYEOF
 from pathlib import Path
-p = Path(os.environ["DB_PATH"])
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
-for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+for line in lines:
+    if not line.startswith("$USERNAME:"):
+        out.append(line); continue
     parts = line.split(":")
-    if parts and parts[0] == os.environ["TARGET"] and len(parts) >= 4:
-        parts[3] = "disabled"
+    if len(parts) < 5:
+        parts += ["both"] * (5 - len(parts))
+    parts[3] = "disabled"
     out.append(":".join(parts))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        rebuild_config
-        _inject_all_users
-        _start_sbox
         info "用户 ${USERNAME} 已禁用"
     else
-        local EXPIRE EXPIRE_TS NOW_TS
+        # 启用
+        local EXPIRE
         EXPIRE=$(get_user_field "$USERNAME" 3)
+        local EXPIRE_TS NOW_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
         NOW_TS=$(now_shanghai_ts)
         if [[ -n "$EXPIRE_TS" ]] && (( NOW_TS >= EXPIRE_TS )); then
-            warn "用户 ${USERNAME} 已过期，请先续期再启用"
+            warn "用户 ${USERNAME} 已过期（$(expire_display "$EXPIRE")），无法启用"
+            warn "请先重置到期时间再启用"
             return
         fi
-        DB_PATH="$USER_DB" TARGET="$USERNAME" python3 - <<'PYEOF'
+
+        # 单密码模式：不再补 SS 独立密码，只用主密码
+        if false; then
+            if [[ -z "$USER_SSPASS" ]]; then
+                load_meta
+                case "${SS_METHOD:-2022-blake3-aes-128-gcm}" in
+                    2022-blake3-aes-128-gcm) USER_SSPASS=$("$SBOX_BIN" generate rand --base64 16 2>/dev/null || openssl rand -base64 16) ;;
+                    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) USER_SSPASS=$("$SBOX_BIN" generate rand --base64 32 2>/dev/null || openssl rand -base64 32) ;;
+                    *) USER_SSPASS="$SS_PASSWORD" ;;
+                esac
+                DB_SSPASS="$USER_SSPASS" TARGET_USER="$USERNAME" python3 - <<'PYEOF2'
 import os
 from pathlib import Path
-p = Path(os.environ["DB_PATH"])
+p = Path("$USER_DB")
 out = []
 for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
     parts = line.split(":")
-    if parts and parts[0] == os.environ["TARGET"] and len(parts) >= 4:
-        parts[3] = "active"
+    if parts and parts[0] == os.environ["TARGET_USER"]:
+        while len(parts) < 6:
+            parts.append("")
+        parts[5] = os.environ["DB_SSPASS"]
+    out.append(":".join(parts))
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF2
+            fi
+        fi
+        _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$OP_NODE" "$USER_SSPASS"
+
+        python3 - <<PYEOF
+from pathlib import Path
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = []
+for line in lines:
+    if not line.startswith("$USERNAME:"):
+        out.append(line); continue
+    parts = line.split(":")
+    if len(parts) < 5:
+        parts += ["both"] * (5 - len(parts))
+    parts[3] = "active"
     out.append(":".join(parts))
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        _inject_user "$UUID" "$USERNAME" "$NODE"
-        _start_sbox
         info "用户 ${USERNAME} 已启用"
     fi
+
+    validate_sbox_config || { rebuild_config; _inject_all_users; return 1; }
+    systemctl restart "$SERVICE_NAME"
 }
 
 # ============================================================
-# 续期用户
+# 重置到期时间
 # ============================================================
 renew_user() {
-    title "续期用户"
+    title "重置到期时间"
     normalize_user_db
     list_users_brief
 
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
+
     if ! user_exists "$USERNAME"; then
         error "用户不存在"; return
     fi
 
-    read -rp "续期天数 [默认 30 天]: " DAYS
-    DAYS=${DAYS:-30}
+    read -rp "续期天数 [默认 999 天]: " DAYS
+    DAYS=${DAYS:-999}
     if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
         error "天数必须是纯数字"; return
     fi
 
-    local UUID NODE NEW_EXPIRE
+    NEW_EXPIRE=$(expire_noon_str "$DAYS")
+    [[ -z "$NEW_EXPIRE" ]] && { error "到期时间计算失败"; return; }
+
     UUID=$(get_user_field "$USERNAME" 2)
     validate_uuid "$UUID" || return
+    local STATUS NODE SSPASS=""
+    STATUS=$(get_user_field "$USERNAME" 4)
     NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
-    NEW_EXPIRE=$(expire_noon_str "$DAYS")
+    STATUS=${STATUS:-active}
+    SSPASS=$(get_user_field "$USERNAME" 6)
 
-    sed -i "s|^${USERNAME}:${UUID}:.*|${USERNAME}:${UUID}:${NEW_EXPIRE}:active:${NODE}|" "$USER_DB"
-    _inject_user "$UUID" "$USERNAME" "$NODE"
-    _start_sbox
-    info "用户 ${USERNAME} 到期时间已更新为 $(expire_display "$NEW_EXPIRE")（已自动启用）"
+    # 更新 db（续期后恢复为 active，保留第6段 SS 密码）
+    python3 - <<PYEOF
+from pathlib import Path
+keep_ss = """$SSPASS"""
+p = Path("$USER_DB")
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
+out = []
+for line in lines:
+    parts = line.split(":")
+    if len(parts) >= 2 and parts[0] == "$USERNAME" and parts[1] == "$UUID":
+        row = "$USERNAME:$UUID:$NEW_EXPIRE:active:$NODE"
+        if keep_ss:
+            row += ":" + keep_ss
+        out.append(row)
+    else:
+        out.append(line)
+p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+PYEOF
+
+    _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE" "$SSPASS"
+    validate_sbox_config && systemctl restart "$SERVICE_NAME"
+
+    if [[ "$STATUS" == "disabled" ]]; then
+        info "用户 ${USERNAME} 到期已更新为 ${NEW_EXPIRE}，已自动恢复启用"
+    else
+        info "用户 ${USERNAME} 到期已更新为 ${NEW_EXPIRE}"
+    fi
 }
 
 # ============================================================
-# 用户列表
+# 列出用户（完整版）
 # ============================================================
 list_users() {
     title "用户列表"
     normalize_user_db
     [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
 
-    printf "  %-15s %-38s %-20s %-8s %-8s\n" "用户名" "UUID" "到期时间" "状态" "节点"
-    echo "  ────────────────────────────────────────────────────────────────────────────────"
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    local TOTAL ACTIVE DISABLED
+    TOTAL=$(wc -l < "$USER_DB")
+    ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+    DISABLED=$((TOTAL - ACTIVE))
+    echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
+    echo -e "  ${YELLOW}USER EXPIRE STATUS NODE${NC}"
+    echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         NODE=${NODE:-both}
-        local COLOR=$NC
-        [[ "$STATUS" == "active" ]] && COLOR=$GREEN || COLOR=$RED
-        printf "  ${COLOR}%-15s %-38s %-20s %-8s %-8s${NC}\n" "$NAME" "$UUID" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
+        local COLOR=$NC STATUS_ICON="○" EXPIRE_SHOW
+        EXPIRE_SHOW=$(expire_display "$EXPIRE")
+        if [[ "$STATUS" == "active" ]]; then
+            COLOR=$GREEN; STATUS_ICON="●"
+        elif [[ "$STATUS" == "disabled" ]]; then
+            COLOR=$RED; STATUS_ICON="○"
+        fi
+        printf "  ${COLOR}%-15s %-20s %-14s %s${NC}\n" \
+            "$NAME" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE"
     done < "$USER_DB"
     echo ""
 }
 
+# ============================================================
+# 列出用户（简略版）
+# ============================================================
 list_users_brief() {
     normalize_user_db
     echo ""
     [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         NODE=${NODE:-both}
         printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
     done < "$USER_DB"
     echo ""
 }
 
+# ============================================================
+# 查看用户分享链接
+# ============================================================
 show_user_link() {
     title "查看用户分享链接"
     normalize_user_db
     list_users_brief
+
     read -rp "输入用户名: " USERNAME
     [[ -z "$USERNAME" ]] && return
+    validate_username "$USERNAME" || return
+
     if ! user_exists "$USERNAME"; then
         error "用户不存在"; return
     fi
-    local UUID EXPIRE NODE STATUS
+
+    local UUID EXPIRE NODE STATUS SSPASS
     UUID=$(get_user_field "$USERNAME" 2)
+    validate_uuid "$UUID" || return
     EXPIRE=$(get_user_field "$USERNAME" 3)
     STATUS=$(get_user_field "$USERNAME" 4)
     NODE=$(get_user_field "$USERNAME" 5)
     NODE=${NODE:-both}
-    [[ "$STATUS" == "disabled" ]] && warn "用户 ${USERNAME} 当前已禁用"
-    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
+    SSPASS=$(get_user_field "$USERNAME" 6)
+
+    if [[ "$STATUS" == "disabled" ]]; then
+        warn "用户 ${USERNAME} 当前已禁用"
+    fi
+
+    _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE" "$SSPASS"
 }
 
+
 # ============================================================
-# 到期检查（供 crond 调用）
+# 到期检查（cron 调用）
 # ============================================================
 check_expire() {
-    [[ ! -f "$USER_DB" ]] && exit 0
+    title "检查到期用户..."
     normalize_user_db
-    local NOW_TS CHANGED=0 EXPIRED_UUIDS=""
+    local NOW_TS
     NOW_TS=$(now_shanghai_ts)
+    local CHANGED=0
+    local EXPIRED_UUIDS=""
 
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE; do
+    [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
+
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
         [[ "$STATUS" != "active" ]] && continue
         local EXPIRE_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
         [[ -z "$EXPIRE_TS" ]] && continue
         if (( NOW_TS >= EXPIRE_TS )); then
+            warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），自动禁用"
             EXPIRED_UUIDS="${EXPIRED_UUIDS} ${UUID}"
             CHANGED=1
         fi
     done < "$USER_DB"
 
     if [[ $CHANGED -eq 1 ]]; then
+        # 批量更新 db
         BATCH_UUIDS="$EXPIRED_UUIDS" DB_PATH="$USER_DB" python3 - <<'PYEOF'
 import os
 from pathlib import Path
 uuids = set(os.environ["BATCH_UUIDS"].split())
 p = Path(os.environ["DB_PATH"])
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
 out = []
-for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+for line in lines:
     parts = line.split(":")
     if len(parts) >= 2 and parts[1] in uuids:
         if len(parts) < 5:
             parts += ["both"] * (5 - len(parts))
         parts[3] = "disabled"
-    out.append(":".join(parts))
+        out.append(":".join(parts))
+    else:
+        out.append(line)
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
-        rebuild_config
-        _inject_all_users
-        validate_sbox_config && rc-service sing-box restart >/dev/null 2>&1
+
+        # 批量从 config.json 移除（VLESS 按 uuid，SS 按用户名 name）
+        BATCH_UUIDS="$EXPIRED_UUIDS" CFG_PATH="$SBOX_CONFIG" DB_PATH="$USER_DB" python3 - <<'PYEOF'
+import json, os
+expired = set(os.environ["BATCH_UUIDS"].split())
+names = set()
+try:
+    for line in open(os.environ["DB_PATH"], encoding="utf-8", errors="ignore").read().splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[1] in expired:
+            names.add(parts[0])
+except OSError:
+    pass
+with open(os.environ["CFG_PATH"], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for inbound in cfg.get("inbounds", []):
+    users = inbound.get("users")
+    if users is None:
+        continue
+    if inbound.get("tag") == "inbound-shadowsocks":
+        inbound["users"] = [u for u in users if u.get("name") not in names]
+    else:
+        inbound["users"] = [u for u in users if u.get("uuid") not in expired]
+with open(os.environ["CFG_PATH"], "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+
+        validate_sbox_config && systemctl restart "$SERVICE_NAME"
+        info "已重启 sing-box"
+    else
+        info "没有到期用户"
     fi
 }
-
-setup_cron() {
-    mkdir -p /etc/periodic/15min
-    cat > "$CRON_JOB" <<EOF
-#!/bin/sh
-${SELF_PATH} check-expire
-EOF
-    chmod +x "$CRON_JOB"
-    rc-update add crond default >/dev/null 2>&1
-    rc-service crond start >/dev/null 2>&1 || rc-service crond restart >/dev/null 2>&1
-}
-
 # ============================================================
-# 节点信息总览
+# 节点信息展示
 # ============================================================
 show_info() {
     title "节点信息"
     load_meta
     normalize_user_db
 
-    local SBOX_STATUS USER_COUNT ACTIVE_COUNT PUBLIC_IP
-    SBOX_STATUS=$(rc-service sing-box status 2>/dev/null | grep -q started && echo active || echo inactive)
+    local SBOX_STATUS USER_COUNT ACTIVE_COUNT
+    local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
+
+    SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
     USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
     ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+
     PUBLIC_IP=$(get_public_ip)
+    LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
+    SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
+    UPTIME_INFO=$(_uptime_pretty)
 
-    echo -e "sing-box: $( [[ "$SBOX_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
-    echo -e "用户数  : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
-    echo -e "公网IP  : ${PUBLIC_IP}"
+    echo -e "状态   : $( [[ "$SBOX_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+    echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
+    echo -e "公网IP : ${PUBLIC_IP}"
+    echo -e "负载   : ${LOAD_INFO:-N/A}  内存 ${MEM_INFO:-N/A}  交换 ${SWAP_INFO:-N/A}"
+    echo -e "在线   : ${UPTIME_INFO:-N/A}"
     echo ""
 
-    has_reality && { echo -e "${CYAN}Reality${NC} 端口 ${REALITY_PORT}  SNI ${REALITY_SNI}"; }
-    has_shadowsocks && { echo -e "${CYAN}Shadowsocks${NC} 端口 ${SS_PORT}"; }
-    has_ws && { echo -e "${CYAN}WS+TLS${NC} 端口 ${WS_PORT}  域名 ${WS_DOMAIN}"; }
-    has_hy2 && { echo -e "${CYAN}Hysteria2${NC} 端口 ${HY2_PORT}/UDP"; }
-    has_anytls && { echo -e "${CYAN}AnyTLS${NC} 端口 ${ANYTLS_PORT}"; }
-    echo ""
+    if has_reality; then
+        local SHORTID
+        SHORTID=$(python3 -c "
+import json
+d=json.load(open('$SBOX_CONFIG', encoding='utf-8'))
+for i in d.get('inbounds',[]):
+    if i.get('tag')=='inbound-reality':
+        print(i['tls']['reality']['short_id'][0]); break
+" 2>/dev/null)
+        echo -e "${CYAN}── Reality 节点 ──${NC}"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${REALITY_PORT}"
+        echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
+        echo -e "SNI    : ${REALITY_SNI}"
+        echo -e "ShortID: ${SHORTID}"
+        echo -e "协议   : VLESS+Reality+TCP"
+        if [[ -f "$USER_DB" ]]; then
+            echo -e "${CYAN}分享链接:${NC}"
+            local RNAME RUUID REXP RSTATUS RNODE
+            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS RQUOTA RUSED; do
+                [[ "$RSTATUS" != "active" ]] && continue
+                RNODE=${RNODE:-both}
+                [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
+                echo "[${RNAME}] vless://${RUUID}@${PUBLIC_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${RNAME}-reality"
+            done < "$USER_DB"
+        fi
+        echo ""
+    fi
+
+    if has_shadowsocks; then
+        local SS_USERINFO_SHOW SS_LINK_SHOW
+        SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+        SS_LINK_SHOW="ss://${SS_USERINFO_SHOW}@${PUBLIC_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
+        echo -e "${CYAN}── Shadowsocks 节点 ──${NC}"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${SS_PORT}"
+        echo -e "加密   : ${SS_METHOD}"
+        echo -e "密码   : ${SS_PASSWORD}（公共密码，老客户端继续可用）"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$SS_LINK_SHOW"
+        # 单密码模式：不再展示各用户独立密码链接，只保留主密码
+        if false; then
+            local SNAME SUUID SEXP SSTATUS SNODE SSPW SS_UI SS_LK
+            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW SQUOTA SUSED; do
+                [[ "$SSTATUS" != "active" ]] && continue
+                SNODE=${SNODE:-both}
+                [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
+                [[ -z "$SSPW" ]] && continue
+                SS_UI=$(printf '%s' "${SS_METHOD}:${SSPW}" | base64 -w0)
+                SS_LK="ss://${SS_UI}@${PUBLIC_IP}:${SS_PORT}#${SNAME}-ss"
+                echo "[${SNAME}] ${SS_LK}"
+            done < "$USER_DB"
+        fi
+        echo ""
+    fi
+
+    if has_ws; then
+        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
+        echo -e "域名   : ${WS_DOMAIN}"
+        echo -e "端口   : ${WS_CF_PORT:-443}"
+        echo -e "WS路径 : ${WS_PATH}"
+        echo -e "协议   : VLESS+WS+TLS"
+        echo ""
+    fi
+
+    if has_hy2; then
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_PORT_RANGE_SHOW HY2_LINK_SHOW
+        HY2_STATUS=$(systemctl is-active "$HY_SERVICE" 2>/dev/null)
+        HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
+        HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
+        HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
+        HY2_PORT_RANGE_SHOW=$(read_kv "$META_HY2" "HY2_PORT_RANGE")
+        HY2_LINK_SHOW=$(hy2_share_link "$PUBLIC_IP" "$HY2_PORT_SHOW" "$HY2_PASSWORD_SHOW" "$HY2_SNI_SHOW" "$HY2_PORT_RANGE_SHOW")
+        echo -e "${CYAN}── Hysteria2 节点 ──${NC}"
+        echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${HY2_PORT_SHOW} (UDP)"
+        echo -e "密码   : ${HY2_PASSWORD_SHOW}"
+        echo -e "SNI    : ${HY2_SNI_SHOW}"
+        echo -e "协议   : Hysteria2（独立官方服务，自签名，客户端需 insecure=1）"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$HY2_LINK_SHOW"
+        echo ""
+    fi
+
+    if has_anytls; then
+        local AT_PORT_SHOW AT_PASSWORD_SHOW AT_SNI_SHOW AT_PUBKEY_SHOW AT_SHORTID_SHOW AT_STATUS_SHOW AT_LINK_SHOW
+        AT_PORT_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PORT")
+        AT_PASSWORD_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PASSWORD")
+        AT_SNI_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
+        AT_PUBKEY_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
+        AT_SHORTID_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
+        AT_STATUS_SHOW=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&pbk=${AT_PUBKEY_SHOW}&sid=${AT_SHORTID_SHOW}&fp=chrome&security=reality#AnyTLS-${AT_PORT_SHOW}"
+        echo -e "${CYAN}── AnyTLS 节点 ──${NC}"
+        echo -e "状态   : $( [[ "$AT_STATUS_SHOW" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
+        echo -e "地址   : ${PUBLIC_IP}"
+        echo -e "端口   : ${AT_PORT_SHOW}"
+        echo -e "密码   : ${AT_PASSWORD_SHOW}"
+        echo -e "SNI    : ${AT_SNI_SHOW}"
+        echo -e "公钥   : ${AT_PUBKEY_SHOW}"
+        echo -e "ShortID: ${AT_SHORTID_SHOW}"
+        echo -e "协议   : AnyTLS + Reality"
+        echo -e "${CYAN}分享链接:${NC}"
+        echo "$AT_LINK_SHOW"
+        echo ""
+    fi
+
+    if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2 && ! has_anytls; then
+        warn "尚未配置任何节点"
+    fi
 }
 
 # ============================================================
-# 一键安装（首次使用）
+# 更新 sing-box
 # ============================================================
-full_install() {
-    check_system
-    set_shanghai_timezone
-    install_sbox || return 1
-    init_reality || return 1
-    setup_cron
-    info "安装完成，可继续在「节点配置」中添加更多协议，或直接「创建用户」"
+
+update_sbox() {
+    title "更新 sing-box..."
+    detect_sbox_bin >/dev/null 2>&1 || { error "未找到 sing-box，请先安装（菜单 1）"; return 1; }
+    local CURRENT_VER LATEST NEW_VER
+    CURRENT_VER=$("$SBOX_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
+    info "当前版本: ${CURRENT_VER:-未知}"
+    info "正在检查最新版本..."
+    LATEST=$(_sbox_latest_ver)
+    [[ -z "$LATEST" ]] && { error "无法获取最新版本（GitHub 不通？）"; return 1; }
+    if [[ "$CURRENT_VER" == "$LATEST" ]]; then
+        info "已是最新版本: ${LATEST}"
+        return 0
+    fi
+    info "发现新版本: ${LATEST}，正在更新..."
+    _download_sbox_musl "$LATEST" || return 1
+    NEW_VER=$("$SBOX_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
+    info "更新完成: ${CURRENT_VER:-未知} → ${NEW_VER:-未知}"
+    [[ -f "$SBOX_INIT" ]] || _write_sbox_init
+    if validate_sbox_config; then
+        systemctl restart "$SERVICE_NAME"
+        info "sing-box 已重启"
+    else
+        warn "新版本校验现有配置失败，未重启服务，请检查配置"
+    fi
 }
+
+# ============================================================
+# 更新脚本
+# ============================================================
+update_script() {
+    title "更新管理脚本..."
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
+    info "正在从 GitHub 拉取最新版本..."
+    local TMP_SCRIPT="/tmp/singbox_new.sh"
+    # 用 -f 让 curl 返回 HTTP 错误码（404 等），以便区分"仓库不存在"和"纯网络失败"
+    rm -f "$TMP_SCRIPT"
+    local HTTP_CODE
+    HTTP_CODE=$(curl -fsSL -w '%{http_code}' "$SCRIPT_URL" -o "$TMP_SCRIPT" 2>/dev/null)
+    local CURL_RC=$?
+    if [[ $CURL_RC -ne 0 || -z "$HTTP_CODE" ]]; then
+        error "下载失败（可能是网络不通或 GitHub 被墙），请检查网络或稍后重试"; return
+    fi
+    if [[ "$HTTP_CODE" == "404" || "$HTTP_CODE" == "403" ]]; then
+        error "GitHub 上的管理脚本仓库不存在（Http $HTTP_CODE），无法自动更新"
+        error "请手动从作者仓库获取较新版本，或忽略此选项"
+        return
+    fi
+    if [[ "$HTTP_CODE" != "200" || ! -s "$TMP_SCRIPT" ]]; then
+        error "下载失败（Http $HTTP_CODE），请稍后重试"; return
+    fi
+    # 检查是否是合法脚本（防止 404 页面覆盖）
+    if ! head -1 "$TMP_SCRIPT" | grep -q "^#!/bin/bash"; then
+        error "下载内容不是合法脚本（可能未发布到 GitHub），取消更新"
+        rm -f "$TMP_SCRIPT"; return
+    fi
+    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
+        error "脚本语法错误，取消更新"; rm -f "$TMP_SCRIPT"; return
+    fi
+    cp "$TMP_SCRIPT" /usr/local/bin/singbox_manager.sh
+    chmod +x /usr/local/bin/singbox_manager.sh
+    rm -f "$TMP_SCRIPT"
+    info "脚本已更新"
+    info "正在重新启动新版本..."
+    sleep 1
+    exec bash /usr/local/bin/singbox_manager.sh
+}
+
+# ============================================================
+# 安装快捷命令 c
+# ============================================================
+install_shortcut() {
+    local SELF_PATH
+    SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    local TARGET="/usr/local/bin/singbox_manager.sh"
+    # 用 cat 而非 cp，兼容 bash <(curl) 管道运行方式（cp 会因 /proc/.../pipe 失败）
+    if [[ "$SELF_PATH" != "$TARGET" ]]; then
+        cat "$0" > "$TARGET" 2>/dev/null
+        [[ $? -ne 0 || ! -s "$TARGET" ]] && { error "复制脚本到 $TARGET 失败"; return 1; }
+        chmod +x "$TARGET"
+    fi
+    cp "$TARGET" /usr/local/bin/c || { error "安装快捷命令 c 失败"; return 1; }
+    chmod +x /usr/local/bin/c
+    info "快捷命令已安装: c"
+}
+
+# ============================================================
+# 设置 cron 到期检查
+# ============================================================
+
+setup_cron() {
+    local BIN=/usr/local/bin/singbox_manager.sh CRONF=/etc/crontabs/root
+    mkdir -p /etc/crontabs
+    touch "$CRONF"
+    _remove_cron_entries
+    {
+        echo "*/15 * * * * ${BIN} --check-expire >/dev/null 2>&1"
+        # 每周日 4 点清空服务日志，防止撑爆小硬盘（不依赖 logrotate）
+        echo "0 4 * * 0 : > /var/log/sing-box.log; : > /var/log/hysteria.log"
+    } >> "$CRONF"
+    chmod 600 "$CRONF"
+    rm -f "$OLD_CRON_JOB" /etc/logrotate.d/sbox /var/log/sbox-expire.log
+    rc-update add crond default >/dev/null 2>&1
+    rc-service crond restart >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1
+    info "已设置每 15 分钟自动检查到期用户"
+}
+
+# ============================================================
+# 启动时自动探测 sing-box 实际路径
+# ============================================================
+detect_sbox_bin >/dev/null 2>&1 || true
+
+# ============================================================
+# CLI 模式（供 cron 调用）
+# ============================================================
+if [[ "$1" == "--check-expire" || "$1" == "check-expire" ]]; then
+    normalize_user_db
+    check_expire
+    exit 0
+fi
+if [[ "$1" == "--quota-collect" || "$1" == "--quota-reset" || "$1" == "--quota-enforce" ]]; then
+    exit 0   # 轻量版已移除流量统计，仅为兼容旧版遗留的 cron 任务
+fi
+
 
 # ============================================================
 # 主菜单
 # ============================================================
 main_menu() {
     while true; do
-        echo ""
-        echo -e "${CYAN}========== 多协议节点管理（Alpine）==========${NC}"
-        echo -e "  ${GREEN}1.${NC} 一键安装（首次使用，先装 Reality）"
-        echo -e "  ${GREEN}2.${NC} 节点配置（增删 Reality/SS/WS/Hy2/AnyTLS，改端口）"
-        echo -e "  ${GREEN}3.${NC} 创建用户"
-        echo -e "  ${GREEN}4.${NC} 删除用户"
-        echo -e "  ${GREEN}5.${NC} 续期用户"
-        echo -e "  ${GREEN}6.${NC} 禁用用户"
-        echo -e "  ${GREEN}7.${NC} 启用用户"
-        echo -e "  ${GREEN}8.${NC} 用户列表"
-        echo -e "  ${GREEN}9.${NC} 查看用户分享链接"
-        echo -e "  ${GREEN}10.${NC} 查看 SS / Hysteria2 / AnyTLS 链接"
-        echo -e "  ${GREEN}11.${NC} 节点信息总览"
-        echo -e "  ${GREEN}12.${NC} 手动执行到期检查"
-        echo -e "  ${GREEN}13.${NC} 卸载全部"
-        echo -e "  ${GREEN}0.${NC} 退出"
-        echo -e "${CYAN}==============================================${NC}"
-        read -rp "选择: " CHOICE
-        case "$CHOICE" in
-            1) full_install ;;
-            2) node_menu ;;
-            3) add_user ;;
-            4) delete_user ;;
-            5) renew_user ;;
-            6) toggle_user "禁用" ;;
-            7) toggle_user "启用" ;;
-            8) list_users ;;
-            9) show_user_link ;;
-            10)
-                echo -e "  1) Shadowsocks  2) Hysteria2  3) AnyTLS"
-                read -rp "选择: " S
-                case "$S" in
-                    1) show_ss_link 2>/dev/null || _print_ss_link ;;
-                    2) show_hy2_link ;;
-                    3) show_anytls_link ;;
-                    *) error "无效选择" ;;
-                esac ;;
+        clear
+        normalize_user_db
+        load_meta
+
+        local SBOX_STATUS USER_COUNT ACTIVE_COUNT
+        SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
+        ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+
+        local MODE_STR=""
+        has_reality     && MODE_STR="Reality"
+        has_shadowsocks && MODE_STR="${MODE_STR:+$MODE_STR+}SS"
+        has_ws          && MODE_STR="${MODE_STR:+$MODE_STR+}WS"
+        has_hy2         && MODE_STR="${MODE_STR:+$MODE_STR+}HY2"
+        has_anytls      && MODE_STR="${MODE_STR:+$MODE_STR+}AT"
+        [[ -z "$MODE_STR" ]] && MODE_STR="未配置"
+
+        local STATUS_COLOR=$RED STATUS_TEXT="● 已停止"
+        [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
+
+        echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.6 Alpine Lite${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
+        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 节点中心${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 sing-box 并配置节点"
+        echo -e "${BLUE}║${NC}   ${GREEN}2.${NC}  添加 / 移除协议节点"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 用户中心${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  新建用户          ${GREEN}4.${NC}  删除用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户          ${GREEN}6.${NC}  启用用户"
+        echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  用户续期          ${GREEN}8.${NC}  用户列表"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 运行信息${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 节点运行信息"
+        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
+        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 sing-box     ${GREEN}13.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box"
+        echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
+        echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
+        echo -ne " 请选择 » "
+        read -r OPT
+
+        case $OPT in
+            1)  check_system; set_shanghai_timezone; install_sbox; init_config; setup_cron ;;
+            2)  init_config ;;
+            3)  add_user ;;
+            4)  delete_user ;;
+            5)  toggle_user disable ;;
+            6)  toggle_user enable ;;
+            7)  renew_user ;;
+            8)  list_users ;;
+            9)  show_user_link ;;
             11) show_info ;;
-            12) check_expire; info "到期检查已执行" ;;
-            13) uninstall_sbox ;;
-            0) exit 0 ;;
-            *) error "无效选择" ;;
+            12) update_sbox ;;
+            13) update_script ;;
+            16) update_hysteria_binary ;;
+            14) ip_priority_menu ;;
+            15) uninstall_sbox ;;
+            0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
+            *)  warn "无效选项" ;;
         esac
+
+        echo ""
+        echo -ne "${BLUE}按 Enter 返回菜单...${NC}"
+        read -r _
     done
 }
 
-show_ss_link() { has_shadowsocks || { error "Shadowsocks 尚未配置"; return 1; }; load_meta; _print_ss_link; }
-
-# ============== 入口 ==============
-if [[ "$1" == "check-expire" ]]; then
-    check_expire
-    exit 0
-fi
-
+# ============================================================
+# 脚本入口
+# ============================================================
+# 先把快捷命令 c 装上，保证无论后面发生什么，c 都可用。
+# c 装好后，即使系统检查/初始化出错，用户也能直接敲 c 重进菜单排查。
 check_system
+grep -q "quota-" /etc/crontabs/root 2>/dev/null && setup_cron >/dev/null 2>&1
+install_shortcut
+normalize_user_db
 main_menu
