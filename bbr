@@ -2,8 +2,7 @@
 # ============================================================
 # Linux 服务器一键优化脚本
 # 功能：DNS 设置 / BBR TCP / 虚拟内存(Swap)
-# 作者：yourname
-# 仓库：https://github.com/yourname/server-optimize
+# 版本：v1.2.0
 # ============================================================
 
 # 颜色定义
@@ -81,29 +80,78 @@ backup_file() {
 # 模块 1：DNS 设置
 # ============================================================
 setup_dns() {
-    title "DNS 设置 (Cloudflare 1.1.1.1)"
+    while true; do
+        # 读取当前 DNS
+        local current_dns
+        current_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  (无法读取)")
 
-    local ipv4_dns1="1.1.1.1"
-    local ipv4_dns2="1.0.0.1"
-    local ipv6_dns1="2606:4700:4700::1111"
-    local ipv6_dns2="2606:4700:4700::1001"
+        echo ""
+        echo -e "  ${CYAN}优化DNS地址${NC}"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -e "  ${YELLOW}当前DNS地址${NC}"
+        echo "$current_dns" | while read -r line; do
+            echo -e "  ${GREEN}$line${NC}"
+        done
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} 国外DNS优化:"
+        echo -e "     v4: ${CYAN}1.1.1.1  8.8.8.8${NC}"
+        echo -e "     v6: ${CYAN}2606:4700:4700::1111  2001:4860:4860::8888${NC}"
+        echo -e "  ${GREEN}2.${NC} 国内DNS优化:"
+        echo -e "     v4: ${CYAN}223.5.5.5  183.60.83.19${NC}"
+        echo -e "     v6: ${CYAN}2400:3200::1  2400:da00::6666${NC}"
+        echo -e "  ${GREEN}3.${NC} 手动编辑DNS配置"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -e "  ${RED}0.${NC} 返回上一级选单"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -ne "  请输入你的选择: "
+        read -r dns_choice
 
-    # 检测 DNS 管理方式
+        case "$dns_choice" in
+            1)
+                _apply_dns "1.1.1.1" "8.8.8.8" "2606:4700:4700::1111" "2001:4860:4860::8888"
+                ;;
+            2)
+                _apply_dns "223.5.5.5" "183.60.83.19" "2400:3200::1" "2400:da00::6666"
+                ;;
+            3)
+                step "打开 /etc/resolv.conf 手动编辑..."
+                # 先解锁
+                chattr -i /etc/resolv.conf 2>/dev/null || true
+                ${EDITOR:-vi} /etc/resolv.conf
+                info "编辑完成"
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选择，请输入 0-3"
+                ;;
+        esac
+
+        echo ""
+        echo -ne "  ${YELLOW}按 Enter 继续...${NC}"
+        read -r
+    done
+}
+
+# 应用 DNS 配置
+_apply_dns() {
+    local v4_1="$1" v4_2="$2" v6_1="$3" v6_2="$4"
+
+    step "正在应用 DNS 设置..."
+
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        step "检测到 systemd-resolved，修改 /etc/systemd/resolved.conf"
         backup_file "/etc/systemd/resolved.conf"
-
         cat > /etc/systemd/resolved.conf <<EOF
 [Resolve]
-DNS=${ipv4_dns1} ${ipv4_dns2} ${ipv6_dns1} ${ipv6_dns2}
+DNS=${v4_1} ${v4_2} ${v6_1} ${v6_2}
 FallbackDNS=8.8.8.8 8.8.4.4
 DNSSEC=no
 DNSOverTLS=no
 Cache=yes
 EOF
-
         systemctl restart systemd-resolved
-        # 确保 /etc/resolv.conf 指向 stub
         if [[ ! -L /etc/resolv.conf ]]; then
             backup_file "/etc/resolv.conf"
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
@@ -111,40 +159,28 @@ EOF
         info "systemd-resolved DNS 设置完成"
 
     elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        step "检测到 NetworkManager，使用 nmcli 设置 DNS"
-        # 获取活动连接
         local conn
         conn=$(nmcli -t -f NAME,DEVICE,STATE con show --active | grep -v "lo" | head -1 | cut -d: -f1)
         if [[ -n "$conn" ]]; then
-            nmcli con mod "$conn" ipv4.dns "${ipv4_dns1},${ipv4_dns2}" 2>/dev/null || true
-            nmcli con mod "$conn" ipv6.dns "${ipv6_dns1},${ipv6_dns2}" 2>/dev/null || true
+            nmcli con mod "$conn" ipv4.dns "${v4_1},${v4_2}" 2>/dev/null || true
+            nmcli con mod "$conn" ipv6.dns "${v6_1},${v6_2}" 2>/dev/null || true
             nmcli con mod "$conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
             nmcli con up "$conn" &>/dev/null || true
-            info "NetworkManager DNS 设置完成 (连接: $conn)"
+            info "NetworkManager DNS 设置完成"
         else
-            warn "未找到活动连接，回退到直接修改 resolv.conf"
-            _write_resolv_conf "$ipv4_dns1" "$ipv4_dns2" "$ipv6_dns1" "$ipv6_dns2"
+            _write_resolv_conf "$v4_1" "$v4_2" "$v6_1" "$v6_2"
         fi
 
     else
-        step "直接修改 /etc/resolv.conf"
-        _write_resolv_conf "$ipv4_dns1" "$ipv4_dns2" "$ipv6_dns1" "$ipv6_dns2"
+        _write_resolv_conf "$v4_1" "$v4_2" "$v6_1" "$v6_2"
     fi
 
-    # 验证 DNS 连通性
-    step "验证 DNS 连通性..."
-    if ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
-        success "DNS 设置成功，1.1.1.1 可达"
+    # 验证连通性
+    if ping -c 1 -W 3 "$v4_1" &>/dev/null; then
+        success "DNS 设置成功，${v4_1} 可达 ✓"
     else
-        warn "无法 ping 通 1.1.1.1，请检查网络"
+        warn "无法 ping 通 ${v4_1}，请检查网络"
     fi
-
-    # 显示当前 DNS
-    echo ""
-    echo -e "  ${CYAN}当前 DNS 解析配置:${NC}"
-    cat /etc/resolv.conf | grep "^nameserver" | while read -r line; do
-        echo -e "    ${GREEN}$line${NC}"
-    done
 }
 
 # 直接写 resolv.conf（防 DHCP 覆盖）
@@ -253,64 +289,82 @@ EOF
 # 模块 3：虚拟内存（Swap）
 # ============================================================
 setup_swap() {
-    title "虚拟内存 (Swap) 配置"
+    while true; do
+        # 读取当前 Swap 用量
+        local swap_used swap_total swap_pct
+        swap_used=$(free -m | awk '/^Swap:/{print $3}')
+        swap_total=$(free -m | awk '/^Swap:/{print $2}')
+        if [[ "$swap_total" -gt 0 ]]; then
+            swap_pct=$(( swap_used * 100 / swap_total ))
+        else
+            swap_pct=0
+        fi
 
+        echo ""
+        echo -e "  ${CYAN}设置虚拟内存${NC}"
+        echo -e "  当前虚拟内存: ${YELLOW}${swap_used}M/${swap_total}M (${swap_pct}%)${NC}"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -e "  ${GREEN}1.${NC} 分配1024M         ${GREEN}2.${NC} 分配2048M         ${GREEN}3.${NC} 分配4096M         ${GREEN}4.${NC} 自定义大小"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -e "  ${RED}0.${NC} 返回上一级选单"
+        echo -e "  ${BLUE}------------------------${NC}"
+        echo -ne "  请输入你的选择: "
+        read -r swap_choice
+
+        case "$swap_choice" in
+            1) _apply_swap 1024 ;;
+            2) _apply_swap 2048 ;;
+            3) _apply_swap 4096 ;;
+            4)
+                echo -ne "  请输入自定义大小(MB): "
+                read -r custom_mb
+                if [[ "$custom_mb" =~ ^[0-9]+$ ]] && [[ "$custom_mb" -ge 128 ]]; then
+                    _apply_swap "$custom_mb"
+                else
+                    warn "无效大小，请输入不小于 128 的数字"
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "无效选择，请输入 0-4" ;;
+        esac
+
+        echo ""
+        echo -ne "  ${YELLOW}按 Enter 继续...${NC}"
+        read -r
+    done
+}
+
+# 执行 Swap 创建
+_apply_swap() {
+    local swap_size_mb="$1"
     local swap_file="/swapfile"
 
-    # 检查当前 Swap
+    # 如果已有 Swap，先关闭清除
     local current_swap
     current_swap=$(free -m | awk '/^Swap:/{print $2}')
-    step "当前 Swap 大小: ${current_swap}MB"
-
     if [[ "$current_swap" -gt 0 ]]; then
-        warn "检测到已有 Swap (${current_swap}MB)"
-        echo -ne "  是否覆盖重建？[y/N] "
-        read -r answer
-        if [[ "${answer,,}" != "y" ]]; then
-            info "跳过 Swap 配置"
-            return 0
-        fi
-        # 关闭旧 Swap
         step "关闭旧 Swap..."
         swapoff "$swap_file" 2>/dev/null || swapoff -a 2>/dev/null || true
         rm -f "$swap_file"
-        # 从 fstab 移除旧记录
         sed -i '/swapfile/d' /etc/fstab
-        sed -i '/swap/d' /etc/fstab
+        sed -i '/\/swapfile/d' /etc/fstab
     fi
 
-    # 自动计算 Swap 大小
-    local mem_mb
-    mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local swap_size_mb
-
-    if [[ "$mem_mb" -le 2048 ]]; then
-        swap_size_mb=$(( mem_mb * 2 ))
-        step "物理内存 <= 2GB，Swap = 内存 x2 = ${swap_size_mb}MB"
-    elif [[ "$mem_mb" -le 8192 ]]; then
-        swap_size_mb=$mem_mb
-        step "物理内存 2~8GB，Swap = 等同内存 = ${swap_size_mb}MB"
-    else
-        swap_size_mb=4096
-        step "物理内存 > 8GB，Swap 固定 4GB"
-    fi
-
-    local swap_size_gb=$(( swap_size_mb / 1024 ))
-    step "准备创建 ${swap_size_gb}GB Swap 文件: $swap_file"
+    step "正在创建 ${swap_size_mb}MB Swap 文件..."
 
     # 创建 Swap 文件
     if command -v fallocate &>/dev/null; then
-        fallocate -l "${swap_size_gb}G" "$swap_file"
+        fallocate -l "${swap_size_mb}M" "$swap_file"
     else
         dd if=/dev/zero of="$swap_file" bs=1M count="$swap_size_mb" status=progress
     fi
 
-    # 设置权限
+    # 设置权限并激活
     chmod 600 "$swap_file"
     mkswap "$swap_file"
     swapon "$swap_file"
 
-    # 写入 fstab（持久化）
+    # 写入 fstab 持久化
     if ! grep -q "$swap_file" /etc/fstab; then
         echo "${swap_file} none swap sw 0 0" >> /etc/fstab
         step "已写入 /etc/fstab 持久化"
@@ -324,12 +378,10 @@ vm.vfs_cache_pressure = 50
 EOF
     sysctl -p /etc/sysctl.d/99-swap.conf &>/dev/null
 
-    # 验证
     local new_swap
     new_swap=$(free -h | awk '/^Swap:/{print $2}')
     success "Swap 创建成功！当前大小: $new_swap"
-    echo -e "  ${CYAN}swappiness: ${GREEN}10${NC}"
-    echo -e "  ${CYAN}vfs_cache_pressure: ${GREEN}50${NC}"
+    echo -e "  ${CYAN}swappiness: ${GREEN}10  ${CYAN}vfs_cache_pressure: ${GREEN}50${NC}"
 }
 
 # ============================================================
