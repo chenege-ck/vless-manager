@@ -2,9 +2,9 @@
 # ============================================================
 # Linux 服务器一键优化脚本
 # 功能：DNS 设置 / BBR TCP / 虚拟内存(Swap)
-# 版本：v1.5.2
+# 版本：v1.5.3
 # ============================================================
-
+ 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
-
+ 
 # 工具函数
 info()    { echo -e "${GREEN}  ✓${NC}  $1"; }
 warn()    { echo -e "${YELLOW}  ⚠${NC}  $1"; }
@@ -21,7 +21,7 @@ error()   { echo -e "${RED}  ✗${NC}  $1"; }
 title()   { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────────${NC}"; }
 success() { echo -e "${GREEN}  >> $1${NC}"; }
 step()    { echo -e "${PURPLE}  →${NC}  $1"; }
-
+ 
 # ============================================================
 # 检查 root 权限
 # ============================================================
@@ -32,7 +32,7 @@ check_root() {
         exit 1
     fi
 }
-
+ 
 # ============================================================
 # 检测操作系统
 # ============================================================
@@ -46,7 +46,7 @@ detect_os() {
     else
         OS_ID="unknown"
     fi
-
+ 
     case "$OS_ID" in
         ubuntu|debian|linuxmint)
             PKG_MGR="apt"
@@ -63,7 +63,7 @@ detect_os() {
             ;;
     esac
 }
-
+ 
 # ============================================================
 # 备份文件（带时间戳）
 # ============================================================
@@ -75,28 +75,54 @@ backup_file() {
         step "已备份: $file → $bak"
     fi
 }
-
+ 
 # ============================================================
 # 模块 1：DNS 设置
 # ============================================================
+RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
+ 
+# 默认路由所在网卡（真正出网的网卡）
+_default_ifaces() {
+    { ip -4 route show default; ip -6 route show default; } 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u
+}
+ 
+# 是否有可用的 IPv6 出口（没有的话写 v6 DNS 只会拖慢解析）
+_has_ipv6() {
+    [[ -n "$(ip -6 route show default 2>/dev/null)" ]]
+}
+ 
+_resolv_first_ns() {
+    awk '/^nameserver/{print $2; exit}' "$RESOLV_CONF" 2>/dev/null
+}
+ 
+# 当前"实际在用"的 DNS（空格分隔）
+_current_dns_list() {
+    if [[ "$(_resolv_first_ns)" == "127.0.0.53" ]] && command -v resolvectl &>/dev/null; then
+        # systemd-resolved stub：resolv.conf 里只有 127.0.0.53，真实上游要问 resolved
+        resolvectl dns 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' \
+            | tr ' ' '\n' | grep -v '^$' | awk '!s[$0]++' | tr '\n' ' '
+    else
+        awk '/^nameserver/{print $2}' "$RESOLV_CONF" 2>/dev/null | tr '\n' ' '
+    fi
+}
+ 
 setup_dns() {
     while true; do
-        # 读取当前 DNS（兼容 systemd-resolved）
-        local current_dns
-        if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl &>/dev/null; then
-            current_dns=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers: //' | tr ' ' '\n' | grep -v '^$' | sed 's/^/nameserver /')
-            [[ -z "$current_dns" ]] && current_dns=$(grep "^DNS=" /etc/systemd/resolved.conf 2>/dev/null | cut -d= -f2 | tr ' ' '\n' | grep -v '^$' | sed 's/^/nameserver /')
-        else
-            current_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  (无法读取)")
-        fi
-
+        local current_dns s
+        current_dns=$(_current_dns_list)
+ 
         echo ""
         echo -e "  ${CYAN}优化DNS地址${NC}"
         echo -e "  ${BLUE}------------------------${NC}"
         echo -e "  ${YELLOW}当前DNS地址${NC}"
-        echo "$current_dns" | while read -r line; do
-            echo -e "  ${GREEN}$line${NC}"
-        done
+        if [[ -z "${current_dns// /}" ]]; then
+            echo -e "  ${GREEN}(无法读取)${NC}"
+        else
+            for s in $current_dns; do
+                echo -e "  ${GREEN}nameserver $s${NC}"
+            done
+        fi
         echo -e "  ${BLUE}------------------------${NC}"
         echo ""
         echo -e "  ${GREEN}1.${NC} 国外DNS优化:"
@@ -111,20 +137,16 @@ setup_dns() {
         echo -e "  ${BLUE}------------------------${NC}"
         echo -ne "  请输入你的选择: "
         read -r dns_choice
-
+ 
         case "$dns_choice" in
             1)
-                _apply_dns "1.1.1.1" "8.8.8.8" "2606:4700:4700::1111" "2001:4860:4860::8888"
+                _apply_dns "1.1.1.1" "8.8.8.8" "2606:4700:4700::1111" "2001:4860:4860::8888" "www.cloudflare.com"
                 ;;
             2)
-                _apply_dns "223.5.5.5" "183.60.83.19" "2400:3200::1" "2400:da00::6666"
+                _apply_dns "223.5.5.5" "183.60.83.19" "2400:3200::1" "2400:da00::6666" "www.baidu.com"
                 ;;
             3)
-                step "打开 /etc/resolv.conf 手动编辑..."
-                # 先解锁
-                chattr -i /etc/resolv.conf 2>/dev/null || true
-                ${EDITOR:-vi} /etc/resolv.conf
-                info "编辑完成"
+                _manual_edit_dns
                 ;;
             0)
                 return 0
@@ -133,139 +155,304 @@ setup_dns() {
                 warn "无效选择，请输入 0-3"
                 ;;
         esac
-
+ 
         echo ""
         echo -ne "  ${YELLOW}按 Enter 继续...${NC}"
         read -r
     done
 }
-
-# 应用 DNS 配置
+ 
+# ------------------------------------------------------------
+# 手动编辑：先处理符号链接，否则改了也会被系统服务覆盖
+# ------------------------------------------------------------
+_manual_edit_dns() {
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+ 
+    if [[ -L "$RESOLV_CONF" ]]; then
+        warn "$RESOLV_CONF 是符号链接 → $(readlink -f "$RESOLV_CONF")"
+        warn "直接编辑会被系统服务（systemd-resolved 等）覆盖，先转换为普通文件"
+        local tmp
+        tmp=$(mktemp)
+        cp -L "$RESOLV_CONF" "$tmp" 2>/dev/null || : > "$tmp"
+        rm -f "$RESOLV_CONF"
+        cat "$tmp" > "$RESOLV_CONF"
+        rm -f "$tmp"
+    fi
+ 
+    backup_file "$RESOLV_CONF"
+    step "打开 $RESOLV_CONF 手动编辑..."
+    ${EDITOR:-vi} "$RESOLV_CONF"
+ 
+    step "编辑后的 nameserver:"
+    grep "^nameserver" "$RESOLV_CONF" 2>/dev/null | sed 's/^/      /'
+ 
+    echo -ne "  是否锁定文件，防止 DHCP/网络服务覆盖？[y/N]: "
+    local lock
+    read -r lock
+    if [[ "$lock" =~ ^[Yy]$ ]]; then
+        if chattr +i "$RESOLV_CONF" 2>/dev/null; then
+            info "已锁定（解锁: chattr -i $RESOLV_CONF）"
+        else
+            warn "当前文件系统不支持锁定，DHCP 仍可能覆盖"
+        fi
+    fi
+}
+ 
+# ------------------------------------------------------------
+# 应用 DNS：配置 → 验证 → 失败则强制接管 → 再验证
+# 只有验证通过才会提示"已生效"
+# ------------------------------------------------------------
 _apply_dns() {
-    local v4_1="$1" v4_2="$2" v6_1="$3" v6_2="$4"
-
-    step "正在应用 DNS 设置..."
-
-    # ── 方式1：systemd-resolved ──────────────────────────────
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        step "检测到 systemd-resolved，写入 drop-in 配置..."
-
-        mkdir -p /etc/systemd/resolved.conf.d/
-        cat > /etc/systemd/resolved.conf.d/custom-dns.conf <<EOF
+    local v4_1="$1" v4_2="$2" v6_1="$3" v6_2="$4" test_domain="${5:-www.cloudflare.com}"
+    local -a servers=("$v4_1" "$v4_2")
+ 
+    if _has_ipv6; then
+        servers+=("$v6_1" "$v6_2")
+    else
+        step "未检测到 IPv6 默认路由，跳过 IPv6 DNS（避免解析超时）"
+    fi
+ 
+    step "正在应用 DNS 设置: ${servers[*]}"
+ 
+    # 先让各网络管理服务知道（持久化，防止重启/重连后被 DHCP 改回去）
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        _dns_via_nm "${servers[@]}"
+    fi
+    if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        _dns_via_networkd "${servers[@]}"
+    fi
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl &>/dev/null; then
+        _dns_via_resolved "${servers[@]}"
+    fi
+ 
+    sleep 1
+ 
+    # 验证；常规方式没生效就直接接管 resolv.conf
+    if ! _verify_dns "${servers[@]}"; then
+        warn "常规方式未让 DNS 生效，改为直接接管 $RESOLV_CONF ..."
+        _write_resolv_conf "${servers[@]}"
+        sleep 1
+    fi
+ 
+    if _verify_dns "${servers[@]}"; then
+        success "DNS 配置已生效 → $(_current_dns_list)"
+    else
+        error "DNS 设置失败：系统实际使用的 DNS 仍不是目标值"
+        echo -e "  ${YELLOW}--- 当前 $RESOLV_CONF ---${NC}"
+        sed 's/^/    /' "$RESOLV_CONF" 2>/dev/null
+        if command -v resolvectl &>/dev/null; then
+            echo -e "  ${YELLOW}--- resolvectl dns ---${NC}"
+            resolvectl dns 2>/dev/null | sed 's/^/    /'
+        fi
+        return 1
+    fi
+ 
+    # 真实解析测试（只提示，不影响上面的结论）
+    if timeout 8 getent ahosts "$test_domain" &>/dev/null; then
+        info "解析测试通过: $test_domain"
+    else
+        warn "解析测试失败: $test_domain（配置已写入，但该 DNS 可能无法从本机访问，请检查防火墙/网络）"
+    fi
+}
+ 
+# 某网卡上的 DNS 是否"全部"属于目标列表（混入 DHCP 下发的旧 DNS 就算失败）
+_link_dns_only_ours() {
+    local iface="$1"; shift
+    local ours=" $* " out s
+    out=$(resolvectl dns "$iface" 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//')
+    if [[ -z "${out// /}" ]]; then
+        # 该网卡自身没有 DNS，则看全局 DNS
+        out=$(resolvectl dns 2>/dev/null | grep '^Global' | sed 's/^[^:]*:[[:space:]]*//')
+        [[ -n "${out// /}" ]] || return 1
+    fi
+    for s in $out; do
+        [[ "$ours" == *" $s "* ]] || return 1
+    done
+    return 0
+}
+ 
+# 验证"系统实际使用"的 DNS，而不是看配置有没有写成功
+_verify_dns() {
+    local -a want=("$@")
+    local first_ns
+    first_ns=$(_resolv_first_ns)
+ 
+    if [[ "$first_ns" == "127.0.0.53" ]]; then
+        # 应用走 systemd-resolved，要看 resolved 真正用的上游
+        command -v resolvectl &>/dev/null || return 1
+        local ifaces iface
+        ifaces=$(_default_ifaces)
+        if [[ -z "$ifaces" ]]; then
+            resolvectl dns 2>/dev/null | grep -qF -- "${want[0]}"
+            return
+        fi
+        while IFS= read -r iface; do
+            [[ -z "$iface" ]] && continue
+            _link_dns_only_ours "$iface" "${want[@]}" || return 1
+        done <<< "$ifaces"
+        return 0
+    fi
+ 
+    # 应用直接读 resolv.conf
+    [[ "$first_ns" == "${want[0]}" ]]
+}
+ 
+_join_comma() { local IFS=,; echo "$*"; }
+ 
+# ── systemd-resolved ─────────────────────────────────────────
+_dns_via_resolved() {
+    local -a servers=("$@")
+    step "检测到 systemd-resolved，写入配置..."
+ 
+    rm -f /etc/systemd/resolved.conf.d/custom-dns.conf   # 旧版本遗留
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf <<EOF
 [Resolve]
-DNS=${v4_1} ${v4_2} ${v6_1} ${v6_2}
+DNS=${servers[*]}
 FallbackDNS=8.8.8.8 8.8.4.4
 DNSSEC=no
 DNSOverTLS=no
 EOF
-        systemctl restart systemd-resolved
-        sleep 1
-
-        # 对所有活动网卡立即应用（关键！）
-        local ifaces
-        ifaces=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$')
-        while IFS= read -r iface; do
-            [[ -z "$iface" ]] && continue
-            resolvectl dns "$iface" "$v4_1" "$v4_2" "$v6_1" "$v6_2" 2>/dev/null && \
-                step "已对网卡 $iface 应用 DNS" || true
-        done <<< "$ifaces"
-
-        info "systemd-resolved 配置完成"
-    fi
-
-    # ── 方式2：NetworkManager（可与上面共存）────────────────────
-    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        step "检测到 NetworkManager，同步设置..."
-        local conn
-        conn=$(nmcli -t -f NAME con show --active 2>/dev/null | grep -v "^lo" | head -1)
-        if [[ -n "$conn" ]]; then
-            nmcli con mod "$conn" ipv4.dns "${v4_1},${v4_2}" 2>/dev/null || true
-            nmcli con mod "$conn" ipv6.dns "${v6_1},${v6_2}" 2>/dev/null || true
-            nmcli con mod "$conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
-            nmcli con mod "$conn" ipv6.ignore-auto-dns yes 2>/dev/null || true
-            nmcli con up "$conn" &>/dev/null || true
-            info "NetworkManager 配置完成"
-        fi
-    fi
-
-    # ── 方式3：直接写 resolv.conf（兜底）───────────────────────
-    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null && \
-       ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        _write_resolv_conf "$v4_1" "$v4_2" "$v6_1" "$v6_2"
-    fi
-
-    # ── 验证实际生效的 DNS ───────────────────────────────────
+    systemctl restart systemd-resolved
     sleep 1
-    local actual_dns=""
-    if command -v resolvectl &>/dev/null; then
-        actual_dns=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers:[[:space:]]*//')
-    fi
-    [[ -z "$actual_dns" ]] && \
-        actual_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
-
-    if [[ "$actual_dns" == *"$v4_1"* ]]; then
-        success "DNS 已生效 → $actual_dns"
-    else
-        warn "DNS 设置后当前值: ${actual_dns:-未知}"
-        warn "如未生效请手动执行: resolvectl status"
-    fi
+ 
+    # 关键：DHCP 下发的网卡级 DNS 优先级高于全局 DNS，必须覆盖出网网卡
+    local iface
+    for iface in $(_default_ifaces); do
+        if resolvectl dns "$iface" "${servers[@]}" 2>/dev/null; then
+            resolvectl default-route "$iface" yes 2>/dev/null || true
+            step "已覆盖网卡 $iface 的 DNS"
+        else
+            warn "覆盖网卡 $iface 的 DNS 失败"
+        fi
+    done
+    resolvectl flush-caches 2>/dev/null || true
 }
-
-# 直接写 resolv.conf（防 DHCP 覆盖）
-_write_resolv_conf() {
-    local d1="$1" d2="$2" d3="$3" d4="$4"
-
-    # 如果当前是不可变文件，先解锁
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-
-    backup_file "/etc/resolv.conf"
-
-    cat > /etc/resolv.conf <<EOF
-# Generated by server-optimize - $(date)
-nameserver ${d1}
-nameserver ${d2}
-nameserver ${d3}
-nameserver ${d4}
-options edns0 trust-ad
+ 
+# ── NetworkManager ───────────────────────────────────────────
+_dns_via_nm() {
+    local -a servers=("$@") v4=() v6=()
+    local s iface conn
+    for s in "${servers[@]}"; do
+        if [[ "$s" == *:* ]]; then v6+=("$s"); else v4+=("$s"); fi
+    done
+ 
+    step "检测到 NetworkManager，写入连接配置..."
+    for iface in $(_default_ifaces); do
+        conn=$(nmcli -g GENERAL.CONNECTION dev show "$iface" 2>/dev/null)
+        if [[ -z "$conn" || "$conn" == "--" ]]; then
+            continue
+        fi
+        if ! nmcli con mod "$conn" ipv4.dns "$(_join_comma "${v4[@]}")" ipv4.ignore-auto-dns yes 2>/dev/null; then
+            warn "NetworkManager 修改连接 '$conn' 失败"
+            continue
+        fi
+        if ((${#v6[@]})); then
+            nmcli con mod "$conn" ipv6.dns "$(_join_comma "${v6[@]}")" ipv6.ignore-auto-dns yes 2>/dev/null || true
+        fi
+        # reapply 不会断开连接（比 con up 更安全，不会掉 SSH）
+        if nmcli dev reapply "$iface" &>/dev/null; then
+            step "NetworkManager 连接 '$conn' ($iface) 已应用"
+        else
+            warn "reapply 失败，连接 '$conn' 的设置将在下次重连时生效"
+        fi
+    done
+}
+ 
+# ── systemd-networkd（含 netplan 后端）────────────────────────
+_dns_via_networkd() {
+    local -a servers=("$@")
+    local iface nfile base dropdir
+    for iface in $(_default_ifaces); do
+        nfile=$(networkctl status "$iface" 2>/dev/null | sed -n 's/^[[:space:]]*Network File:[[:space:]]*//p' | head -1)
+        if [[ -z "$nfile" || ! -f "$nfile" ]]; then
+            continue
+        fi
+        base=$(basename "$nfile")
+        dropdir="/etc/systemd/network/${base}.d"
+        mkdir -p "$dropdir"
+        cat > "$dropdir/99-custom-dns.conf" <<EOF
+[Network]
+DNS=
+DNS=${servers[*]}
+ 
+[DHCPv4]
+UseDNS=no
+ 
+[DHCPv6]
+UseDNS=no
+ 
+[IPv6AcceptRA]
+UseDNS=no
 EOF
-
-    # 锁定，防止 DHCP 自动覆盖
-    chattr +i /etc/resolv.conf 2>/dev/null && \
-        step "已锁定 /etc/resolv.conf 防止 DHCP 覆盖" || true
-
-    info "resolv.conf DNS 设置完成"
+        networkctl reload 2>/dev/null || true
+        step "已为 networkd 配置 $base 写入 drop-in（重启后保持）"
+    done
 }
-
+ 
+# ── 直接写 resolv.conf（强制接管）────────────────────────────
+_write_resolv_conf() {
+    local -a servers=("$@")
+    local s
+ 
+    # glibc 最多只读取前 3 个 nameserver
+    local -a use=("${servers[@]:0:3}")
+    if ((${#servers[@]} > 3)); then
+        step "glibc 最多使用 3 个 nameserver，取前 3 个: ${use[*]}"
+    fi
+ 
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+    if [[ -e "$RESOLV_CONF" ]]; then
+        backup_file "$RESOLV_CONF"
+    fi
+ 
+    # 必须先删除：若是符号链接（指向 resolved 的 stub），直接写会写进 /run，随即被覆盖
+    rm -f "$RESOLV_CONF"
+    {
+        echo "# Generated by server-optimize - $(date)"
+        for s in "${use[@]}"; do
+            echo "nameserver $s"
+        done
+        echo "options edns0 trust-ad"
+    } > "$RESOLV_CONF"
+ 
+    if chattr +i "$RESOLV_CONF" 2>/dev/null; then
+        step "已锁定 $RESOLV_CONF 防止 DHCP 覆盖（解锁: chattr -i $RESOLV_CONF）"
+    else
+        warn "无法锁定 $RESOLV_CONF（文件系统不支持），重启或 DHCP 续约后可能被覆盖"
+    fi
+}
+ 
 # ============================================================
 # 模块 2：BBR TCP 拥塞控制
 # ============================================================
 setup_bbr() {
     title "BBR TCP 拥塞控制"
-
+ 
     # 检测内核版本
     local kernel_ver
     kernel_ver=$(uname -r)
     local kernel_major kernel_minor
     kernel_major=$(echo "$kernel_ver" | cut -d. -f1)
     kernel_minor=$(echo "$kernel_ver" | cut -d. -f2)
-
+ 
     step "当前内核版本: $kernel_ver"
-
+ 
     if [[ "$kernel_major" -lt 4 ]] || { [[ "$kernel_major" -eq 4 ]] && [[ "$kernel_minor" -lt 9 ]]; }; then
         error "内核版本过低（需要 >= 4.9），BBR 无法启用"
         error "请升级内核后重试"
         return 1
     fi
-
+ 
     if [[ "$kernel_major" -lt 5 ]]; then
         warn "内核版本 $kernel_ver < 5.x，BBR 功能受限，建议升级到 5.x+"
     fi
-
+ 
     # 检查是否已启用 BBR
     local current_cc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     step "当前拥塞控制算法: $current_cc"
-
+ 
     if [[ "$current_cc" == "bbr" ]]; then
         local current_qdisc
         current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
@@ -274,14 +461,14 @@ setup_bbr() {
             return 0
         fi
     fi
-
+ 
     # 写入 BBR 配置
     step "写入 BBR sysctl 配置..."
     cat > /etc/sysctl.d/99-bbr.conf <<EOF
 # BBR TCP 拥塞控制 - server-optimize
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
+ 
 # TCP 优化
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -293,16 +480,16 @@ net.ipv4.tcp_wmem = 4096 65536 67108864
 net.core.netdev_max_backlog = 30000
 net.ipv4.tcp_max_syn_backlog = 8192
 EOF
-
+ 
     # 应用配置
     sysctl -p /etc/sysctl.d/99-bbr.conf &>/dev/null
-
+ 
     # 验证
     local new_cc
     new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local new_qdisc
     new_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-
+ 
     if [[ "$new_cc" == "bbr" ]]; then
         success "BBR 启用成功！"
         echo -e "  ${CYAN}拥塞控制: ${GREEN}$new_cc${NC}"
@@ -312,7 +499,7 @@ EOF
         warn "请检查内核是否支持 BBR: lsmod | grep bbr"
     fi
 }
-
+ 
 # ============================================================
 # 模块 3：虚拟内存（Swap）
 # ============================================================
@@ -327,7 +514,7 @@ setup_swap() {
         else
             swap_pct=0
         fi
-
+ 
         echo ""
         echo -e "  ${CYAN}设置虚拟内存${NC}"
         echo -e "  当前虚拟内存: ${YELLOW}${swap_used}M/${swap_total}M (${swap_pct}%)${NC}"
@@ -338,7 +525,7 @@ setup_swap() {
         echo -e "  ${BLUE}------------------------${NC}"
         echo -ne "  请输入你的选择: "
         read -r swap_choice
-
+ 
         case "$swap_choice" in
             1) _apply_swap 1024 ;;
             2) _apply_swap 2048 ;;
@@ -355,18 +542,18 @@ setup_swap() {
             0) return 0 ;;
             *) warn "无效选择，请输入 0-4" ;;
         esac
-
+ 
         echo ""
         echo -ne "  ${YELLOW}按 Enter 继续...${NC}"
         read -r
     done
 }
-
+ 
 # 执行 Swap 创建
 _apply_swap() {
     local swap_size_mb="$1"
     local swap_file="/swapfile"
-
+ 
     # 如果已有 Swap，先关闭清除
     local current_swap
     current_swap=$(free -m | awk '/^Swap:/{print $2}')
@@ -377,27 +564,27 @@ _apply_swap() {
         sed -i '/swapfile/d' /etc/fstab
         sed -i '/\/swapfile/d' /etc/fstab
     fi
-
+ 
     step "正在创建 ${swap_size_mb}MB Swap 文件..."
-
+ 
     # 创建 Swap 文件
     if command -v fallocate &>/dev/null; then
         fallocate -l "${swap_size_mb}M" "$swap_file"
     else
         dd if=/dev/zero of="$swap_file" bs=1M count="$swap_size_mb" status=progress
     fi
-
+ 
     # 设置权限并激活
     chmod 600 "$swap_file"
     mkswap "$swap_file"
     swapon "$swap_file"
-
+ 
     # 写入 fstab 持久化
     if ! grep -q "$swap_file" /etc/fstab; then
         echo "${swap_file} none swap sw 0 0" >> /etc/fstab
         step "已写入 /etc/fstab 持久化"
     fi
-
+ 
     # 优化 swappiness
     cat > /etc/sysctl.d/99-swap.conf <<EOF
 # Swap 优化 - server-optimize
@@ -405,79 +592,74 @@ vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 EOF
     sysctl -p /etc/sysctl.d/99-swap.conf &>/dev/null
-
+ 
     local new_swap
     new_swap=$(free -h | awk '/^Swap:/{print $2}')
     success "Swap 创建成功！当前大小: $new_swap"
     echo -e "  ${CYAN}swappiness: ${GREEN}10  ${CYAN}vfs_cache_pressure: ${GREEN}50${NC}"
 }
-
+ 
 # ============================================================
 # 显示系统信息
 # ============================================================
 show_sysinfo() {
     echo ""
     echo -e "  ${CYAN}━━━━━━━━━━━━━━━━ 系统信息 ━━━━━━━━━━━━━━━━${NC}"
-
+ 
     # OS
     local os_name
     os_name=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
     echo -e "  ${YELLOW}系统:${NC}   $os_name"
-
+ 
     # 内核
     echo -e "  ${YELLOW}内核:${NC}   $(uname -r)"
-
+ 
     # 内存
     local mem_info
     mem_info=$(free -h | awk '/^Mem:/{print $2 " / " $3 " used"}')
     echo -e "  ${YELLOW}内存:${NC}   $mem_info"
-
+ 
     # Swap
     local swap_info
     swap_info=$(free -h | awk '/^Swap:/{if($2=="0B") print "未配置"; else print $2}')
     echo -e "  ${YELLOW}Swap:${NC}   $swap_info"
-
-    # 当前 DNS（兼容 systemd-resolved）
+ 
+    # 当前 DNS（实际在用的）
     local dns_servers
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl &>/dev/null; then
-        dns_servers=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers: //' | tr '\n' ' ')
-        [[ -z "$dns_servers" ]] && dns_servers=$(grep "^DNS=" /etc/systemd/resolved.conf 2>/dev/null | cut -d= -f2)
-    else
-        dns_servers=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
-    fi
+    dns_servers=$(_current_dns_list)
     echo -e "  ${YELLOW}DNS:${NC}    ${dns_servers:-未知}"
-
+ 
     # 当前 TCP 拥塞算法
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     local cc_mark=""
     [[ "$cc" == "bbr" ]] && cc_mark="${GREEN} ✓${NC}"
     echo -e "  ${YELLOW}TCP CC:${NC} ${cc}${cc_mark}"
-
+ 
     echo -e "  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 }
-
+ 
 # ============================================================
 # 同步更新脚本
 # ============================================================
 self_update() {
     local url="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/bbr"
     local tmp_file="/tmp/optimize_update.sh"
-
+ 
     step "正在从 GitHub 拉取最新脚本..."
-
+ 
     if curl -fsSL "$url" -o "$tmp_file" 2>/dev/null; then
         if grep -q "bash" "$tmp_file" 2>/dev/null; then
             chmod +x "$tmp_file"
-
+ 
             # 如果当前是真实文件（非管道）也同步更新
             if [[ -f "$0" && "$0" != /proc/* ]]; then
                 cp "$tmp_file" "$0"
                 chmod +x "$0"
                 step "已更新本地文件: $0"
             fi
-
+ 
             success "脚本更新成功！正在重新启动..."
             sleep 1
             exec bash "$tmp_file"
@@ -490,7 +672,7 @@ self_update() {
         error "下载失败，请检查网络连接"
     fi
 }
-
+ 
 # ============================================================
 # 主菜单
 # ============================================================
@@ -501,12 +683,12 @@ main_menu() {
         echo "  ╔══════════════════════════════════════╗"
         echo "  ║       Linux 服务器一键优化工具       ║"
         echo "  ║    DNS · BBR · Swap · 网络加速       ║"
-        echo "  ║              v1.5.1                  ║"
+        echo "  ║              v1.5.3                  ║"
         echo "  ╚══════════════════════════════════════╝"
         echo -e "${NC}"
-
+ 
         show_sysinfo
-
+ 
         echo -e "  ${GREEN}1.${NC} 设置 DNS"
         echo -e "  ${GREEN}2.${NC} 开启 BBR TCP 拥塞控制"
         echo -e "  ${GREEN}3.${NC} 配置虚拟内存 (Swap)"
@@ -516,7 +698,7 @@ main_menu() {
         echo ""
         echo -ne "  ${CYAN}请选择 [1-6]:${NC} "
         read -r choice
-
+ 
         case "$choice" in
             1) setup_dns ;;
             2) setup_bbr ;;
@@ -538,13 +720,13 @@ main_menu() {
                 warn "无效选择，请输入 1-6"
                 ;;
         esac
-
+ 
         echo ""
         echo -ne "  ${YELLOW}按 Enter 返回菜单...${NC}"
         read -r
     done
 }
-
+ 
 # ============================================================
 # 入口
 # ============================================================
