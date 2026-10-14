@@ -98,10 +98,19 @@ _resolv_first_ns() {
  
 # 当前"实际在用"的 DNS（空格分隔）
 _current_dns_list() {
-    if [[ "$(_resolv_first_ns)" == "127.0.0.53" ]] && command -v resolvectl &>/dev/null; then
-        # systemd-resolved stub：resolv.conf 里只有 127.0.0.53，真实上游要问 resolved
-        resolvectl dns 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' \
-            | tr ' ' '\n' | grep -v '^$' | awk '!s[$0]++' | tr '\n' ' '
+    if [[ "$(_resolv_first_ns)" == "127.0.0.53" ]]; then
+        # systemd-resolved stub：127.0.0.53 只是本机转发入口，真实上游要另外取
+        local upstream=""
+        if command -v resolvectl &>/dev/null; then
+            upstream=$(resolvectl dns 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' \
+                | tr ' ' '\n' | grep -v '^$' | awk '!s[$0]++' | tr '\n' ' ')
+        fi
+        # 备用：resolved 自己生成的上游列表
+        if [[ -z "${upstream// /}" && -f /run/systemd/resolve/resolv.conf ]]; then
+            upstream=$(awk '/^nameserver/{print $2}' /run/systemd/resolve/resolv.conf | awk '!s[$0]++' | tr '\n' ' ')
+        fi
+        # 实在取不到，明确标注，避免误以为这就是 DNS
+        echo "${upstream:-127.0.0.53(本地stub,上游未知)}"
     else
         awk '/^nameserver/{print $2}' "$RESOLV_CONF" 2>/dev/null | tr '\n' ' '
     fi
@@ -733,3 +742,4 @@ main_menu() {
 check_root
 detect_os
 main_menu
+ 
