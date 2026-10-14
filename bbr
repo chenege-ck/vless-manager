@@ -2,7 +2,7 @@
 # ============================================================
 # Linux 服务器一键优化脚本
 # 功能：DNS 设置 / BBR TCP / 虚拟内存(Swap)
-# 版本：v1.2.0
+# 版本：v1.3.0
 # ============================================================
 
 # 颜色定义
@@ -81,9 +81,14 @@ backup_file() {
 # ============================================================
 setup_dns() {
     while true; do
-        # 读取当前 DNS
+        # 读取当前 DNS（兼容 systemd-resolved）
         local current_dns
-        current_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  (无法读取)")
+        if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl &>/dev/null; then
+            current_dns=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers: //' | tr ' ' '\n' | grep -v '^$' | sed 's/^/nameserver /')
+            [[ -z "$current_dns" ]] && current_dns=$(grep "^DNS=" /etc/systemd/resolved.conf 2>/dev/null | cut -d= -f2 | tr ' ' '\n' | grep -v '^$' | sed 's/^/nameserver /')
+        else
+            current_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  (无法读取)")
+        fi
 
         echo ""
         echo -e "  ${CYAN}优化DNS地址${NC}"
@@ -409,9 +414,14 @@ show_sysinfo() {
     swap_info=$(free -h | awk '/^Swap:/{if($2=="0B") print "未配置"; else print $2}')
     echo -e "  ${YELLOW}Swap:${NC}   $swap_info"
 
-    # 当前 DNS
+    # 当前 DNS（兼容 systemd-resolved）
     local dns_servers
-    dns_servers=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl &>/dev/null; then
+        dns_servers=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers: //' | tr '\n' ' ')
+        [[ -z "$dns_servers" ]] && dns_servers=$(grep "^DNS=" /etc/systemd/resolved.conf 2>/dev/null | cut -d= -f2)
+    else
+        dns_servers=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    fi
     echo -e "  ${YELLOW}DNS:${NC}    ${dns_servers:-未知}"
 
     # 当前 TCP 拥塞算法
@@ -435,6 +445,7 @@ main_menu() {
         echo "  ╔══════════════════════════════════════╗"
         echo "  ║       Linux 服务器一键优化工具       ║"
         echo "  ║    DNS · BBR · Swap · 网络加速       ║"
+        echo "  ║              v1.3.0                  ║"
         echo "  ╚══════════════════════════════════════╝"
         echo -e "${NC}"
 
