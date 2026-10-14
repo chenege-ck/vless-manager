@@ -630,11 +630,20 @@ ip_priority_menu() {
     esac
     _save_ip_priority "$DS"
     if has_reality || has_shadowsocks || has_ws || has_hy2 || has_anytls; then
-        rebuild_config
-        _inject_all_users
-        _start_sbox
+        if ! rebuild_config; then
+            error "配置重建失败，设置已保存但尚未生效"
+            return 1
+        fi
+        if ! _inject_all_users; then
+            error "用户注入失败，设置已保存但尚未确认生效"
+            return 1
+        fi
+        if ! _start_sbox; then
+            error "sing-box 校验或重启失败，设置已保存但尚未生效"
+            return 1
+        fi
     fi
-    info "已生效：${DESC}"
+    info "已保存：${DESC}"
 }
 
 # ============================================================
@@ -739,7 +748,16 @@ if os.environ.get("HAS_ANYTLS") == "1":
 ds = os.environ.get("IP_PRIO", "")
 outbound = {"type": "direct", "tag": "direct"}
 if ds and ds != "AsIs":
-    outbound["domain_strategy"] = ds
+    # sing-box 1.12+：使用 domain_resolver 替代已弃用的 domain_strategy
+    cfg["dns"] = {
+        "servers": [
+            {"type": "local", "tag": "local"}
+        ]
+    }
+    outbound["domain_resolver"] = {
+        "server": "local",
+        "strategy": ds
+    }
 
 cfg["outbounds"] = [outbound, {"type": "block", "tag": "block"}]
 
