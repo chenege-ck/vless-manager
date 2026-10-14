@@ -2,7 +2,7 @@
 # ============================================================
 # Linux 服务器一键优化脚本
 # 功能：DNS 设置 / BBR TCP / 虚拟内存(Swap)
-# 版本：v1.4.0
+# 版本：v1.5.1
 # ============================================================
 
 # 颜色定义
@@ -19,7 +19,7 @@ info()    { echo -e "${GREEN}  ✓${NC}  $1"; }
 warn()    { echo -e "${YELLOW}  ⚠${NC}  $1"; }
 error()   { echo -e "${RED}  ✗${NC}  $1"; }
 title()   { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────────${NC}"; }
-success() { echo -e "${GREEN}  ✅ $1${NC}"; }
+success() { echo -e "${GREEN}  >> $1${NC}"; }
 step()    { echo -e "${PURPLE}  →${NC}  $1"; }
 
 # ============================================================
@@ -146,45 +146,68 @@ _apply_dns() {
 
     step "正在应用 DNS 设置..."
 
+    # ── 方式1：systemd-resolved ──────────────────────────────
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        backup_file "/etc/systemd/resolved.conf"
-        cat > /etc/systemd/resolved.conf <<EOF
+        step "检测到 systemd-resolved，写入 drop-in 配置..."
+
+        mkdir -p /etc/systemd/resolved.conf.d/
+        cat > /etc/systemd/resolved.conf.d/custom-dns.conf <<EOF
 [Resolve]
 DNS=${v4_1} ${v4_2} ${v6_1} ${v6_2}
 FallbackDNS=8.8.8.8 8.8.4.4
 DNSSEC=no
 DNSOverTLS=no
-Cache=yes
 EOF
         systemctl restart systemd-resolved
-        if [[ ! -L /etc/resolv.conf ]]; then
-            backup_file "/etc/resolv.conf"
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        fi
-        info "systemd-resolved DNS 设置完成"
+        sleep 1
 
-    elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        # 对所有活动网卡立即应用（关键！）
+        local ifaces
+        ifaces=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$')
+        while IFS= read -r iface; do
+            [[ -z "$iface" ]] && continue
+            resolvectl dns "$iface" "$v4_1" "$v4_2" "$v6_1" "$v6_2" 2>/dev/null && \
+                step "已对网卡 $iface 应用 DNS" || true
+        done <<< "$ifaces"
+
+        info "systemd-resolved 配置完成"
+    fi
+
+    # ── 方式2：NetworkManager（可与上面共存）────────────────────
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        step "检测到 NetworkManager，同步设置..."
         local conn
-        conn=$(nmcli -t -f NAME,DEVICE,STATE con show --active | grep -v "lo" | head -1 | cut -d: -f1)
+        conn=$(nmcli -t -f NAME con show --active 2>/dev/null | grep -v "^lo" | head -1)
         if [[ -n "$conn" ]]; then
             nmcli con mod "$conn" ipv4.dns "${v4_1},${v4_2}" 2>/dev/null || true
             nmcli con mod "$conn" ipv6.dns "${v6_1},${v6_2}" 2>/dev/null || true
             nmcli con mod "$conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
+            nmcli con mod "$conn" ipv6.ignore-auto-dns yes 2>/dev/null || true
             nmcli con up "$conn" &>/dev/null || true
-            info "NetworkManager DNS 设置完成"
-        else
-            _write_resolv_conf "$v4_1" "$v4_2" "$v6_1" "$v6_2"
+            info "NetworkManager 配置完成"
         fi
+    fi
 
-    else
+    # ── 方式3：直接写 resolv.conf（兜底）───────────────────────
+    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null && \
+       ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
         _write_resolv_conf "$v4_1" "$v4_2" "$v6_1" "$v6_2"
     fi
 
-    # 验证连通性
-    if ping -c 1 -W 3 "$v4_1" &>/dev/null; then
-        success "DNS 设置成功，${v4_1} 可达 ✓"
+    # ── 验证实际生效的 DNS ───────────────────────────────────
+    sleep 1
+    local actual_dns=""
+    if command -v resolvectl &>/dev/null; then
+        actual_dns=$(resolvectl status 2>/dev/null | grep -m1 "DNS Servers:" | sed 's/.*DNS Servers:[[:space:]]*//')
+    fi
+    [[ -z "$actual_dns" ]] && \
+        actual_dns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+
+    if [[ "$actual_dns" == *"$v4_1"* ]]; then
+        success "DNS 已生效 → $actual_dns"
     else
-        warn "无法 ping 通 ${v4_1}，请检查网络"
+        warn "DNS 设置后当前值: ${actual_dns:-未知}"
+        warn "如未生效请手动执行: resolvectl status"
     fi
 }
 
@@ -480,17 +503,17 @@ main_menu() {
         echo "  ╔══════════════════════════════════════╗"
         echo "  ║       Linux 服务器一键优化工具       ║"
         echo "  ║    DNS · BBR · Swap · 网络加速       ║"
-        echo "  ║              v1.4.0                  ║"
+        echo "  ║              v1.5.1                  ║"
         echo "  ╚══════════════════════════════════════╝"
         echo -e "${NC}"
 
         show_sysinfo
 
-        echo -e "  ${GREEN}1.${NC} 设置 DNS (Cloudflare 1.1.1.1 + IPv6)"
+        echo -e "  ${GREEN}1.${NC} 设置 DNS"
         echo -e "  ${GREEN}2.${NC} 开启 BBR TCP 拥塞控制"
         echo -e "  ${GREEN}3.${NC} 配置虚拟内存 (Swap)"
-        echo -e "  ${GREEN}4.${NC} ✨ 一键全部执行"
-        echo -e "  ${GREEN}5.${NC} 🔄 同步更新脚本"
+        echo -e "  ${GREEN}4.${NC} 一键全部执行"
+        echo -e "  ${GREEN}5.${NC} 同步更新脚本"
         echo -e "  ${RED}6.${NC} 退出"
         echo ""
         echo -ne "  ${CYAN}请选择 [1-6]:${NC} "
