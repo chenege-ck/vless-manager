@@ -2,7 +2,7 @@
 # ============================================================
 # Linux 服务器一键优化脚本
 # 功能：DNS 设置 / BBR TCP / 虚拟内存(Swap)
-# 版本：v1.5.1
+# 版本：v1.5.2
 # ============================================================
 
 # 颜色定义
@@ -463,26 +463,24 @@ show_sysinfo() {
 # ============================================================
 self_update() {
     local url="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/bbr"
-    local script_path
-    script_path=$(realpath "$0")
+    local tmp_file="/tmp/optimize_update.sh"
 
     step "正在从 GitHub 拉取最新脚本..."
-    step "地址: $url"
-
-    # 下载到临时文件
-    local tmp_file
-    tmp_file=$(mktemp /tmp/bbr_update.XXXXXX)
 
     if curl -fsSL "$url" -o "$tmp_file" 2>/dev/null; then
-        # 检查下载内容是否有效（至少要有 bash 关键字）
         if grep -q "bash" "$tmp_file" 2>/dev/null; then
             chmod +x "$tmp_file"
-            cp "$tmp_file" "$script_path"
-            chmod +x "$script_path"
-            rm -f "$tmp_file"
+
+            # 如果当前是真实文件（非管道）也同步更新
+            if [[ -f "$0" && "$0" != /proc/* ]]; then
+                cp "$tmp_file" "$0"
+                chmod +x "$0"
+                step "已更新本地文件: $0"
+            fi
+
             success "脚本更新成功！正在重新启动..."
             sleep 1
-            exec bash "$script_path"
+            exec bash "$tmp_file"
         else
             rm -f "$tmp_file"
             error "下载内容异常，更新中止"
