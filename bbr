@@ -1,1 +1,63 @@
-的师范大学
+#!/bin/bash
+# VLESS 智能节点控制台 (sing-box) v1.8.6
+# Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ============== 路径 ==============
+SBOX_BIN="/usr/local/bin/sing-box"
+SBOX_CONFIG="/etc/sing-box/config.json"
+SBOX_DIR="/etc/sing-box"
+USER_DB="${SBOX_DIR}/users.db"
+META_REALITY="${SBOX_DIR}/meta-reality.conf"
+META_SS="${SBOX_DIR}/meta-ss.conf"
+META_WS="${SBOX_DIR}/meta-ws.conf"
+META_HY2="${SBOX_DIR}/meta-hy2.conf"
+META_ANYTLS="${SBOX_DIR}/meta-anytls.conf"
+META="${SBOX_DIR}/meta.conf"
+SERVICE_NAME="sing-box"
+
+# ============== 默认端口 ==============
+SS_PORT_DEFAULT=8668
+HY2_PORT_DEFAULT=8999
+ANYTLS_PORT_DEFAULT=8585
+
+# ============== 工具函数 ==============
+info()  { echo -e "${GREEN}  ✓${NC}  $1"; }
+warn()  { echo -e "${YELLOW}  ⚠${NC}  $1"; }
+error() { echo -e "${RED}  ✗${NC}  $1"; }
+title() { echo -e "\n${BLUE}┌─${NC} ${CYAN}$1${NC}"; echo -e "${BLUE}└────────────────────────────${NC}"; }
+
+# ============== 安全读取 key=value 配置 ==============
+read_kv() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file"
+}
+
+# ============== 用户名校验 ==============
+validate_username() {
+    local value="$1"
+    [[ -z "$value" ]] && { error "用户名不能为空"; return 1; }
+    [[ "$value" == *:* ]] && { error "用户名不能包含冒号"; return 1; }
+    [[ "$value" == *[[:space:]]* ]] && { error "用户名不能包含空格或换行"; return 1; }
+    local N
+    N=$(printf '%s' "$value" | python3 -c 'import sys; sys.stdout.write(str(len(sys.stdin.read())))')
+    if (( N > 20 )); then
+        error "用户名过长（最多 20 个字符，约 10 个汉字）"
+        return 1
+    fi
+    return 0
+}
+
+# ============== UUID 校验 ==============
+validate_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+        error "UUID 格式异常"
+        return 1
+    }
