@@ -2185,6 +2185,733 @@ EOF
 }
 
 # ============================================================
+# 服务器网络优化（BBR3 / 缓冲区 / swap）—— 独立功能，菜单 16
+# 备份与状态放在 /etc/sbox-tune，卸载 sing-box 不会删除它
+# ============================================================
+TUNE_BASE="${TUNE_BASE:-/etc/sbox-tune}"
+TUNE_BACKUP="${TUNE_BASE}/backup-orig"
+TUNE_STATE="${TUNE_BASE}/tune.state"
+TUNE_CONF="${TUNE_CONF:-/etc/sysctl.d/99-sbox-tune.conf}"
+TUNE_SYSCTL_MAIN="${TUNE_SYSCTL_MAIN:-/etc/sysctl.conf}"
+TUNE_SYSCTL_DIR="${TUNE_SYSCTL_DIR:-/etc/sysctl.d}"
+TUNE_SWAPFILE="/swapfile.sbox"
+TUNE_LIMITS_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+TUNE_LIMITS_CONF="${TUNE_LIMITS_DIR}/99-sbox-tune.conf"
+TUNE_MODLOAD="/etc/modules-load.d/sbox-bbr.conf"
+TUNE_XAN_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+TUNE_XAN_KEY="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+TUNE_NEED_REBOOT=0
+
+# ---------- 状态文件 ----------
+tune_state_get() { read_kv "$TUNE_STATE" "$1"; }
+
+tune_state_set() {
+    local k="$1" v="$2" tmp
+    mkdir -p "$TUNE_BASE"
+    touch "$TUNE_STATE"
+    tmp=$(mktemp)
+    awk -F= -v k="$k" '$1!=k' "$TUNE_STATE" > "$tmp"
+    echo "${k}=${v}" >> "$tmp"
+    cat "$tmp" > "$TUNE_STATE"
+    rm -f "$tmp"
+}
+
+# ---------- 小工具 ----------
+tune_mb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1048576}'; }
+
+tune_yes() {  # tune_yes "提示" 默认(Y/N)
+    local a
+    read -rp "$1" a
+    a="${a:-$2}"
+    [[ "$a" =~ ^[Yy]$ ]]
+}
+
+tune_read_int() {  # tune_read_int "提示" 最小 最大 默认值 → 结果在 TUNE_READ
+    local prompt="$1" min="$2" max="$3" def="$4" val
+    while true; do
+        if [[ -n "$def" ]]; then
+            read -rp "${prompt} [回车=${def}]: " val
+            val="${val:-$def}"
+        else
+            read -rp "${prompt}: " val
+        fi
+        val="${val// /}"
+        if [[ "$val" =~ ^[0-9]{1,7}$ ]] && (( 10#$val >= min && 10#$val <= max )); then
+            TUNE_READ=$((10#$val))
+            return 0
+        fi
+        warn "请输入 ${min} ~ ${max} 之间的整数"
+    done
+}
+
+tune_default_iface() {
+    local d
+    d=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    [[ -z "$d" ]] && d=$(ip -o -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    echo "$d"
+}
+
+# ---------- 环境检查 ----------
+tune_check_env() {
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null)
+    [[ -z "$virt" ]] && virt="none"
+    case "$virt" in
+        lxc|lxc-libvirt|openvz|docker|podman|systemd-nspawn|wsl)
+            error "检测到容器环境（${virt}），与宿主机共用内核，无法在此优化"
+            warn "请在宿主机上执行，容器会自动继承"
+            return 1 ;;
+    esac
+    if [[ -f /proc/1/environ ]] && grep -a -q "container=lxc" /proc/1/environ 2>/dev/null; then
+        error "检测到 LXC 容器环境，无法在此优化"
+        return 1
+    fi
+    if [[ ! -w /proc/sys/net/ipv4/tcp_rmem ]]; then
+        error "无法写入内核参数（/proc/sys 只读），当前环境不支持"
+        return 1
+    fi
+    return 0
+}
+
+# ---------- 首次备份（只做一次，之后只读，仅用于恢复） ----------
+tune_backup_once() {
+    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
+        info "原始备份已存在（只读保护），不会被覆盖"
+        return 0
+    fi
+    title "首次运行：备份原始系统设置"
+    # 上次中断留下的半成品备份，清掉重来
+    chattr -R -i "$TUNE_BACKUP" 2>/dev/null
+    rm -rf "$TUNE_BACKUP"
+    mkdir -p "${TUNE_BACKUP}/files" || { error "无法创建备份目录"; return 1; }
+
+    local f
+    for f in /etc/sysctl.conf /etc/security/limits.conf /etc/fstab /etc/default/grub; do
+        [[ -e "$f" ]] && cp -a "$f" "${TUNE_BACKUP}/files/$(echo "$f" | tr '/' '_')"
+    done
+    [[ -d /etc/sysctl.d ]] && cp -a /etc/sysctl.d "${TUNE_BACKUP}/files/_etc_sysctl.d"
+    [[ -d "$TUNE_LIMITS_DIR" ]] && cp -a "$TUNE_LIMITS_DIR" "${TUNE_BACKUP}/files/_sbox_service.d"
+
+    # 全部内核参数的当前值（恢复时按这个还原）
+    sysctl -a 2>/dev/null | tr '\t' ' ' > "${TUNE_BACKUP}/sysctl-all.txt"
+    uname -r > "${TUNE_BACKUP}/kernel.txt"
+    dpkg -l 'linux-image*' 2>/dev/null | awk '/^ii/{print $2}' > "${TUNE_BACKUP}/kernels.txt"
+    free -m > "${TUNE_BACKUP}/mem.txt" 2>/dev/null
+    swapon --show > "${TUNE_BACKUP}/swap.txt" 2>&1
+    tc qdisc show > "${TUNE_BACKUP}/qdisc.txt" 2>/dev/null
+    systemd-detect-virt > "${TUNE_BACKUP}/virt.txt" 2>/dev/null
+    (cd "$TUNE_BACKUP" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + > SHA256SUMS 2>/dev/null)
+
+    if [[ ! -s "${TUNE_BACKUP}/sysctl-all.txt" ]]; then
+        error "备份失败（读取不到内核参数）"
+        return 1
+    fi
+    date '+%Y-%m-%d %H:%M:%S' > "${TUNE_BACKUP}/.done"
+
+    # 跳过符号链接（chattr 不支持），再以 .done 的实际属性判断是否锁定成功
+    find "$TUNE_BACKUP" ! -type l -exec chattr +i {} + 2>/dev/null
+    if lsattr -d "${TUNE_BACKUP}/.done" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+        info "原始设置已备份并锁定（chattr +i）: ${TUNE_BACKUP}"
+    else
+        chmod -R a-w "$TUNE_BACKUP" 2>/dev/null
+        warn "文件系统不支持锁定，已改为只读权限: ${TUNE_BACKUP}"
+    fi
+    return 0
+}
+
+# ---------- 计算缓冲区 ----------
+# 输入: RTT(ms) 带宽(Mbps) 内存(MB)
+# 输出: TUNE_BDP TUNE_RMAX TUNE_WMAX TUNE_NOTE
+tune_calc() {
+    local rtt="$1" bw="$2" mem="$3"
+    local memcap=$(( mem * 1024 * 1024 * 4 / 100 ))   # 单连接最多占物理内存 4%
+    local min=$(( 8 * 1024 * 1024 )) max=$(( 256 * 1024 * 1024 ))
+    local r w
+    TUNE_BDP=$(( bw * rtt * 125 ))                      # Mbps*1e6/8 * ms/1000
+    r=$(( TUNE_BDP * 15 / 10 ))                         # 接收：1.5 × BDP（有效窗口只有缓冲的一部分）
+    w=$(( TUNE_BDP * 18 / 10 ))                         # 发送：1.8 × BDP
+    TUNE_NOTE="按 带宽×延迟 计算"
+    (( r > memcap )) && { r=$memcap; TUNE_NOTE="受内存 4% 单连接上限限制"; }
+    (( w > memcap )) && { w=$memcap; TUNE_NOTE="受内存 4% 单连接上限限制"; }
+    (( r < min )) && r=$min
+    (( w < min )) && w=$min
+    (( r > max )) && { r=$max; TUNE_NOTE="已达 256MB 上限"; }
+    (( w > max )) && { w=$max; TUNE_NOTE="已达 256MB 上限"; }
+    TUNE_RMAX=$r
+    TUNE_WMAX=$w
+}
+
+# ---------- swap ----------
+tune_swap_target_mb() {
+    local m="$1"
+    if   (( m <= 600 ));  then echo 1024
+    elif (( m <= 1200 )); then echo 1536
+    elif (( m <= 4400 )); then echo 2048
+    else echo 0
+    fi
+}
+
+# 输出: TUNE_SWAP_ADD(MB, 0=不创建) TUNE_SWAP_WHY
+tune_swap_plan() {
+    local mem="$1" cur target add free_mb fstype
+    cur=$(free -m | awk '/^Swap:/{print $2}')
+    cur=${cur:-0}
+    target=$(tune_swap_target_mb "$mem")
+    TUNE_SWAP_ADD=0
+    if (( target == 0 )); then
+        TUNE_SWAP_WHY="内存充足，无需 swap"; return 0
+    fi
+    add=$(( target - cur ))
+    if (( add < 256 )); then
+        TUNE_SWAP_WHY="已有 swap ${cur}MB，足够"; return 0
+    fi
+    fstype=$(findmnt -no FSTYPE / 2>/dev/null)
+    case "$fstype" in
+        btrfs|zfs|overlay) TUNE_SWAP_WHY="根分区为 ${fstype}，跳过"; return 0 ;;
+    esac
+    free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+    if (( free_mb < add + 500 )); then
+        TUNE_SWAP_WHY="磁盘剩余 ${free_mb}MB 不足，跳过"; return 0
+    fi
+    TUNE_SWAP_ADD=$add
+    TUNE_SWAP_WHY="新增 ${add}MB（现有 ${cur}MB）"
+}
+
+tune_create_swap() {
+    local mb="$1"
+    swapoff "$TUNE_SWAPFILE" 2>/dev/null
+    rm -f "$TUNE_SWAPFILE"
+    info "正在创建 ${mb}MB swap，请稍候..."
+    if ! dd if=/dev/zero of="$TUNE_SWAPFILE" bs=1M count="$mb" status=none 2>/dev/null; then
+        rm -f "$TUNE_SWAPFILE"; error "swap 文件创建失败（磁盘空间不足？）"; return 1
+    fi
+    chmod 600 "$TUNE_SWAPFILE"
+    if ! mkswap "$TUNE_SWAPFILE" >/dev/null 2>&1 || ! swapon "$TUNE_SWAPFILE" 2>/dev/null; then
+        rm -f "$TUNE_SWAPFILE"; error "swap 挂载失败，已清理"; return 1
+    fi
+    sed -i "\|^${TUNE_SWAPFILE}[[:space:]]|d" /etc/fstab
+    echo "${TUNE_SWAPFILE} none swap sw 0 0" >> /etc/fstab
+    tune_state_set SWAP_FILE "$TUNE_SWAPFILE"
+    tune_state_set SWAP_MB "$mb"
+    info "swap ${mb}MB 已启用并写入开机挂载"
+}
+
+# ---------- 写入 sysctl 配置 ----------
+tune_emit() {  # 仅当内核有这个参数才写入，避免老内核报错
+    local key="$1" val="$2" p
+    p=$(echo "$key" | tr '.' '/')
+    [[ -e "/proc/sys/${p}" ]] && printf '%s = %s\n' "$key" "$val"
+}
+
+tune_bbr_available() {
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr && return 0
+    modprobe tcp_bbr 2>/dev/null
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+}
+
+# 参数: RTT BW MEM RMAX WMAX WANT_KERNEL(0/1)
+tune_write_conf() {
+    local rtt="$1" bw="$2" mem="$3" rmax="$4" wmax="$5" want_kernel="$6"
+    local page=4096 mem_bytes=$(( mem * 1024 * 1024 ))
+    local tm_low=$(( mem_bytes * 12 / 100 / page ))
+    local tm_mid=$(( mem_bytes * 18 / 100 / page ))
+    local tm_high=$(( mem_bytes * 25 / 100 / page ))
+    local backlog=32768 orphans=32768 swap_now
+    (( mem <= 1200 )) && { backlog=16384; orphans=16384; }
+    swap_now=$(free -m | awk '/^Swap:/{print $2}')
+
+    mkdir -p "$(dirname "$TUNE_CONF")"
+    {
+        echo "# sing-box 管理脚本 - 网络优化（自动生成，请勿手改，恢复请用菜单 16）"
+        echo "# 生成时间: $(date '+%F %T')  延迟=${rtt}ms  带宽=${bw}Mbps  内存=${mem}MB"
+        tune_emit net.core.default_qdisc fq
+        if tune_bbr_available || [[ "$want_kernel" == "1" ]]; then
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+        tune_emit net.core.rmem_max "$rmax"
+        tune_emit net.core.wmem_max "$wmax"
+        tune_emit net.ipv4.tcp_rmem "4096 131072 ${rmax}"
+        tune_emit net.ipv4.tcp_wmem "4096 16384 ${wmax}"
+        tune_emit net.ipv4.tcp_mem "${tm_low} ${tm_mid} ${tm_high}"
+        tune_emit net.ipv4.tcp_window_scaling 1
+        tune_emit net.ipv4.tcp_sack 1
+        tune_emit net.ipv4.tcp_dsack 1
+        tune_emit net.ipv4.tcp_recovery 1
+        tune_emit net.ipv4.tcp_mtu_probing 1
+        tune_emit net.ipv4.tcp_slow_start_after_idle 0
+        tune_emit net.ipv4.tcp_notsent_lowat 131072
+        tune_emit net.ipv4.tcp_tw_reuse 1
+        tune_emit net.ipv4.tcp_fin_timeout 20
+        tune_emit net.core.somaxconn "$backlog"
+        tune_emit net.core.netdev_max_backlog "$backlog"
+        tune_emit net.ipv4.tcp_max_syn_backlog "$backlog"
+        tune_emit net.ipv4.tcp_max_orphans "$orphans"
+        tune_emit net.ipv4.ip_local_port_range "10000 65535"
+        tune_emit fs.file-max 1048576
+        tune_emit fs.nr_open 1048576
+        (( ${swap_now:-0} > 0 )) && tune_emit vm.swappiness 10
+    } > "$TUNE_CONF"
+}
+
+# 其他 sysctl 文件里如果有同名参数，开机时可能覆盖我们（/etc/sysctl.conf 最后加载）。
+# 做法：把冲突行加前缀注释（可逆），恢复时去掉前缀。原始文件另有备份。
+tune_neutralize_conflicts() {
+    local keys f tmp prev newlist=""
+    keys=$(awk -F' = ' '/^[a-z]/{print $1}' "$TUNE_CONF")
+    [[ -z "$keys" ]] && return 0
+    prev=$(tune_state_get TOUCHED)
+    for f in "$TUNE_SYSCTL_MAIN" "$TUNE_SYSCTL_DIR"/*.conf; do
+        [[ -f "$f" && ! -L "$f" && "$f" != "$TUNE_CONF" ]] || continue
+        tmp=$(mktemp)
+        if awk -v K="$keys" '
+            BEGIN { n=split(K,a,"\n"); for(i=1;i<=n;i++) s[a[i]]=1 }
+            {
+                l=$0; sub(/^[ \t]+/,"",l)
+                if (l !~ /^[#;]/ && index(l,"=")>0) {
+                    k=substr(l,1,index(l,"=")-1); gsub(/[ \t]/,"",k); sub(/^-/,"",k)
+                    if (k in s) { print "# [sbox-tune] " $0; changed=1; next }
+                }
+                print
+            }
+            END { exit changed ? 0 : 1 }' "$f" > "$tmp"; then
+            cat "$tmp" > "$f"
+            warn "已注释 ${f} 中与优化冲突的同名参数（可恢复）"
+            [[ " $prev $newlist " == *" $f "* ]] || newlist="${newlist}${f} "
+        fi
+        rm -f "$tmp"
+    done
+    [[ -n "$newlist" ]] && tune_state_set TOUCHED "${prev:+$prev }${newlist% }"
+    return 0
+}
+
+# ---------- 立即生效 ----------
+tune_apply_runtime() {
+    local out line IF
+    out=$(sysctl -p "$TUNE_CONF" 2>&1 >/dev/null)
+    if [[ -n "$out" ]]; then
+        while IFS= read -r line; do warn "sysctl: $line"; done <<< "$out"
+    fi
+    info "内核参数已热生效（无需重启）"
+
+    # default_qdisc 只对新建网卡生效，这里让当前网卡立刻用上 fq
+    IF=$(tune_default_iface)
+    if [[ -n "$IF" ]] && command -v tc >/dev/null 2>&1; then
+        if ! tc qdisc show dev "$IF" 2>/dev/null | grep -qw fq; then
+            if tc qdisc replace dev "$IF" root fq 2>/dev/null; then
+                tune_state_set QDISC_CHANGED "$IF"
+                info "网卡 ${IF} 队列已切换为 fq"
+            else
+                warn "网卡队列切换失败，重启后会按 default_qdisc 生效"
+            fi
+        fi
+    fi
+
+    # 开机加载 bbr 模块
+    echo "tcp_bbr" > "$TUNE_MODLOAD" 2>/dev/null
+
+    # sing-box 文件句柄
+    mkdir -p "$TUNE_LIMITS_DIR"
+    printf '[Service]\nLimitNOFILE=1048576\n' > "$TUNE_LIMITS_CONF"
+    systemctl daemon-reload 2>/dev/null
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        if systemctl restart "$SERVICE_NAME" 2>/dev/null; then
+            info "sing-box 已重启，新参数对新连接生效"
+        else
+            warn "sing-box 重启失败，请检查: systemctl status $SERVICE_NAME"
+        fi
+    fi
+}
+
+# ---------- XanMod 内核（BBRv3） ----------
+tune_cpu_level() {
+    awk 'BEGIN { level = 0
+        while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+        if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
+        if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
+        if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
+        if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
+        print level }'
+}
+
+# 官方主线分支只有 v2/v3，v1 只能用 LTS 分支；v4 机器装 v3
+tune_xanmod_pkg() {
+    [[ "$(uname -m)" == "x86_64" ]] || return 1
+    case "$(tune_cpu_level)" in
+        1)   echo "linux-xanmod-lts-x64v1" ;;
+        2)   echo "linux-xanmod-x64v2" ;;
+        3|4) echo "linux-xanmod-x64v3" ;;
+        *)   return 1 ;;
+    esac
+}
+
+tune_install_xanmod() {
+    title "安装 XanMod 内核（BBRv3）"
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        warn "XanMod 仅支持 x86_64（当前 $(uname -m)），跳过内核安装"; return 1
+    fi
+    if uname -r | grep -qi xanmod; then
+        info "当前已在运行 XanMod 内核: $(uname -r)"; return 0
+    fi
+    if dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | grep -q '^linux-xanmod'; then
+        info "XanMod 内核已安装，重启后生效"; TUNE_NEED_REBOOT=1; return 0
+    fi
+
+    local pkg level codename free_mb cand
+    pkg=$(tune_xanmod_pkg)
+    if [[ -z "$pkg" ]]; then
+        warn "CPU 不满足 x86-64 要求，跳过内核安装"; return 1
+    fi
+    level=$(tune_cpu_level)
+    codename=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+    [[ -z "$codename" ]] && { warn "无法识别系统代号，跳过内核安装"; return 1; }
+    info "CPU 等级 x86-64-v${level} → 安装 ${pkg}"
+    [[ "$pkg" == *lts* ]] && warn "该 CPU 只能用 LTS 分支（官方主线不提供 v1）"
+
+    free_mb=$(df -Pm /boot | awk 'NR==2{print $4}')
+    if (( ${free_mb:-0} < 600 )); then
+        warn "/boot 所在分区剩余 ${free_mb}MB，不足 600MB，跳过内核安装"; return 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    info "准备依赖和软件源..."
+    apt-get update -qq >/dev/null 2>&1
+    if ! apt-get install -y -qq ca-certificates gpg curl >/dev/null 2>&1; then
+        error "依赖安装失败，跳过内核安装"; return 1
+    fi
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL --max-time 30 https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o "$TUNE_XAN_KEY" 2>/dev/null
+    if [[ ! -s "$TUNE_XAN_KEY" ]]; then
+        rm -f "$TUNE_XAN_KEY"
+        error "下载 XanMod 签名密钥失败（网络不通？），跳过内核安装"; return 1
+    fi
+    echo "deb [signed-by=${TUNE_XAN_KEY}] https://deb.xanmod.org ${codename} main" > "$TUNE_XAN_LIST"
+    if ! apt-get update -qq >/dev/null 2>&1; then
+        rm -f "$TUNE_XAN_LIST"
+        error "XanMod 软件源更新失败，已移除软件源"; return 1
+    fi
+    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')
+    if [[ -z "$cand" || "$cand" == "(none)" ]]; then
+        rm -f "$TUNE_XAN_LIST"; apt-get update -qq >/dev/null 2>&1
+        error "XanMod 源里没有 ${pkg}（${codename} 可能不受支持），已移除软件源"; return 1
+    fi
+
+    info "正在安装 ${pkg} ${cand}（约 100~200MB，请耐心等待）..."
+    if ! apt-get install -y -q "$pkg"; then
+        rm -f "$TUNE_XAN_LIST"
+        error "内核安装失败，原内核不受影响"; return 1
+    fi
+    update-grub >/dev/null 2>&1 || true
+    if ! ls /boot/vmlinuz-*xanmod* >/dev/null 2>&1; then
+        error "没有找到 XanMod 内核文件，请不要重启，检查 apt 输出"; return 1
+    fi
+    if [[ -f /boot/grub/grub.cfg ]] && ! grep -q xanmod /boot/grub/grub.cfg 2>/dev/null; then
+        warn "GRUB 配置里没找到 XanMod，重启前请确认引导项"
+    fi
+    tune_state_set XANMOD_PKG "$pkg"
+    TUNE_NEED_REBOOT=1
+    info "XanMod 内核安装完成（原内核保留，可从 GRUB 回退）"
+    return 0
+}
+
+tune_remove_xanmod() {
+    local pkgs others
+    pkgs=$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /xanmod/ {print $2}')
+    if [[ -z "$pkgs" ]]; then
+        info "未安装 XanMod 内核，无需卸载"; return 0
+    fi
+    others=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ && $2 ~ /^linux-image-[0-9]/ && $2 !~ /xanmod/ {c++} END{print c+0}')
+    if (( others == 0 )); then
+        error "系统里没有其他内核，卸载会导致无法启动，已取消"; return 1
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    info "正在卸载 XanMod 内核..."
+    # shellcheck disable=SC2086
+    if ! apt-get purge -y -q $pkgs; then
+        error "卸载失败。可重启后选择原内核启动，再执行 16 → 4 重试"
+        return 1
+    fi
+    rm -f "$TUNE_XAN_LIST" "$TUNE_XAN_KEY"
+    apt-get update -qq >/dev/null 2>&1
+    update-grub >/dev/null 2>&1 || true
+    uname -r | grep -qi xanmod && TUNE_NEED_REBOOT=1
+    info "XanMod 内核已卸载"
+    return 0
+}
+
+tune_ask_reboot() {
+    [[ "$TUNE_NEED_REBOOT" == "1" ]] || return 0
+    echo ""
+    warn "内核需要重启后才生效（重启后 BBR 自动变成 BBRv3，参数已保存，无需再设置）"
+    if tune_yes "现在重启服务器？[y/N]: " "N"; then
+        info "3 秒后重启..."
+        sleep 3
+        reboot
+        exit 0
+    fi
+    info "稍后请手动执行 reboot；重启后进菜单 16 → 3 可查看 BBR 版本"
+}
+
+# ---------- 状态 ----------
+tune_tcp_counters() {
+    awk '/^Tcp:/{ if(!h){for(i=1;i<=NF;i++)n[$i]=i; h=1} else {print $n["OutSegs"], $n["RetransSegs"]; exit} }' /proc/net/snmp
+}
+
+tune_retrans_pct() {  # 发出段数 重传段数
+    awk -v o="$1" -v r="$2" 'BEGIN{ if (o>0) printf "%.2f%%", r*100/o; else printf "-" }'
+}
+
+tune_status() {
+    title "网络优化状态"
+    local kv cc IF qd bbrv swap_total done_at c1 o1 r1 o2 r2
+    kv=$(uname -r)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    IF=$(tune_default_iface)
+    qd=$(tc qdisc show dev "$IF" 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ "$cc" != "bbr" ]]; then
+        bbrv="（未启用 BBR）"
+    elif [[ "$kv" == *xanmod* ]]; then
+        bbrv="${GREEN}BBRv3 (XanMod)${NC}"
+    else
+        bbrv="${YELLOW}BBRv1 (系统自带)${NC}"
+    fi
+    swap_total=$(free -m | awk '/^Swap:/{print $2}')
+
+    echo -e "  内核          ${CYAN}${kv}${NC}"
+    echo -e "  拥塞控制      ${CYAN}${cc:-未知}${NC}  ${bbrv}"
+    echo -e "  队列 ${IF:+(${IF})}    ${qd:-未知}"
+    echo -e "  发送上限      $(tune_mb "$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)") MB"
+    echo -e "  接收上限      $(tune_mb "$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)") MB"
+    echo -e "  tcp_wmem      $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
+    echo -e "  tcp_rmem      $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
+    echo -e "  swap          ${swap_total:-0} MB"
+    if [[ -f "$TUNE_CONF" ]]; then
+        echo -e "  优化参数      ${GREEN}已写入${NC}  延迟 $(tune_state_get RTT_MS)ms / 带宽 $(tune_state_get BW_MBPS)Mbps"
+    else
+        echo -e "  优化参数      ${YELLOW}未优化${NC}"
+    fi
+    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
+        done_at=$(cat "${TUNE_BACKUP}/.done")
+        echo -e "  原始备份      ${GREEN}已备份${NC}（${done_at}）"
+    else
+        echo -e "  原始备份      ${YELLOW}尚未备份${NC}"
+    fi
+
+    c1=$(tune_tcp_counters)
+    o1=${c1% *}; r1=${c1#* }
+    echo -e "  累计重传率    ${CYAN}$(tune_retrans_pct "$o1" "$r1")${NC}（开机以来）"
+    if tune_yes "  采样 10 秒实时重传率？[y/N]: " "N"; then
+        echo "  采样中..."
+        sleep 10
+        c1=$(tune_tcp_counters)
+        o2=${c1% *}; r2=${c1#* }
+        echo -e "  实时重传率    ${CYAN}$(tune_retrans_pct $(( o2 - o1 )) $(( r2 - r1 )))${NC}（10 秒内 发出 $(( o2 - o1 )) 段 / 重传 $(( r2 - r1 )) 段）"
+    fi
+}
+
+# ---------- 优化向导 ----------
+tune_wizard() {
+    title "服务器网络优化向导（BBR3）"
+    tune_check_env || return 1
+    tune_backup_once || return 1
+
+    local mem rtt bw pkg kernel_line want_kernel=0
+    mem=$(free -m | awk '/^Mem:/{print $2}')
+
+    echo ""
+    echo -e "${CYAN}[1/3] 服务器到你本地的延迟${NC}"
+    echo "  在你本地电脑执行 ping 服务器IP，取平均延迟（ms）"
+    tune_read_int "  延迟 ms [1~1000]" 1 1000 "$(tune_state_get RTT_MS)"
+    rtt=$TUNE_READ
+
+    echo ""
+    echo -e "${CYAN}[2/3] 服务器内存（自动读取）${NC}"
+    tune_swap_plan "$mem"
+    echo -e "  内存 ${GREEN}${mem}MB${NC}  →  swap: ${TUNE_SWAP_WHY}"
+
+    echo ""
+    echo -e "${CYAN}[3/3] 厂商标称带宽${NC}"
+    tune_read_int "  带宽 Mbps [1~100000]" 1 100000 "$(tune_state_get BW_MBPS)"
+    bw=$TUNE_READ
+
+    tune_calc "$rtt" "$bw" "$mem"
+
+    if uname -r | grep -qi xanmod; then
+        kernel_line="已在运行 XanMod，无需安装"
+    else
+        pkg=$(tune_xanmod_pkg)
+        if [[ -n "$pkg" ]]; then
+            kernel_line="安装 ${pkg}（BBRv3，需重启）"; want_kernel=1
+        else
+            kernel_line="跳过（仅支持 x86_64 且 CPU 满足 v1 以上）"
+        fi
+    fi
+
+    echo ""
+    echo -e "${BLUE}─────────── 参数确认 ───────────${NC}"
+    echo "  延迟          ${rtt} ms"
+    echo "  带宽          ${bw} Mbps"
+    echo "  内存          ${mem} MB"
+    echo "  BDP           $(tune_mb "$TUNE_BDP") MB"
+    echo "  发送缓冲上限  $(tune_mb "$TUNE_WMAX") MB"
+    echo "  接收缓冲上限  $(tune_mb "$TUNE_RMAX") MB（${TUNE_NOTE}）"
+    echo "  swap          ${TUNE_SWAP_WHY}"
+    echo "  内核          ${kernel_line}"
+    echo -e "${BLUE}────────────────────────────────${NC}"
+    tune_yes "确认开始优化？[Y/n]: " "Y" || { warn "已取消"; return 0; }
+
+    tune_state_set RTT_MS "$rtt"
+    tune_state_set BW_MBPS "$bw"
+
+    (( TUNE_SWAP_ADD > 0 )) && tune_create_swap "$TUNE_SWAP_ADD"
+
+    tune_write_conf "$rtt" "$bw" "$mem" "$TUNE_RMAX" "$TUNE_WMAX" "$want_kernel"
+    tune_neutralize_conflicts
+    tune_apply_runtime
+    tune_state_set TUNED_AT "$(date '+%F %T')"
+    info "优化参数已写入: ${TUNE_CONF}"
+
+    if (( want_kernel == 1 )); then
+        echo ""
+        if tune_yes "现在安装 XanMod 内核（BBRv3）？[Y/n]: " "Y"; then
+            tune_install_xanmod
+        else
+            warn "已跳过内核，当前使用系统自带 BBR；以后可再运行本向导安装"
+        fi
+    fi
+
+    echo ""
+    tune_status
+    tune_ask_reboot
+}
+
+# ---------- 仅重算缓冲区 ----------
+tune_retune() {
+    title "重新计算缓冲区"
+    tune_check_env || return 1
+    tune_backup_once || return 1
+    local mem rtt bw
+    mem=$(free -m | awk '/^Mem:/{print $2}')
+    tune_read_int "延迟 ms [1~1000]" 1 1000 "$(tune_state_get RTT_MS)"
+    rtt=$TUNE_READ
+    tune_read_int "带宽 Mbps [1~100000]" 1 100000 "$(tune_state_get BW_MBPS)"
+    bw=$TUNE_READ
+    tune_calc "$rtt" "$bw" "$mem"
+    echo "  发送上限 $(tune_mb "$TUNE_WMAX") MB / 接收上限 $(tune_mb "$TUNE_RMAX") MB（${TUNE_NOTE}）"
+    tune_yes "确认应用？[Y/n]: " "Y" || { warn "已取消"; return 0; }
+    tune_state_set RTT_MS "$rtt"
+    tune_state_set BW_MBPS "$bw"
+    local want_kernel=0
+    uname -r | grep -qi xanmod && want_kernel=1
+    [[ -n "$(tune_state_get XANMOD_PKG)" ]] && want_kernel=1
+    tune_write_conf "$rtt" "$bw" "$mem" "$TUNE_RMAX" "$TUNE_WMAX" "$want_kernel"
+    tune_neutralize_conflicts
+    tune_apply_runtime
+    tune_state_set TUNED_AT "$(date '+%F %T')"
+    info "缓冲区已更新"
+}
+
+# ---------- 恢复原始设置 ----------
+tune_restore() {
+    title "恢复原始设置"
+    if [[ ! -f "${TUNE_BACKUP}/.done" ]]; then
+        warn "没有找到原始备份（还没运行过优化向导），无需恢复"
+        return 0
+    fi
+    echo "将撤销：优化参数、本脚本新建的 swap、sing-box 句柄配置，并可选卸载 XanMod 内核。"
+    echo "原始备份会继续保留，不会被删除。"
+    tune_yes "确认恢复？[y/N]: " "N" || { warn "已取消"; return 0; }
+
+    local key val f swapf IFQ
+    # 1. 内核参数：按首次备份的值还原运行时
+    if [[ -f "$TUNE_CONF" ]]; then
+        while IFS= read -r key; do
+            val=$(awk -v k="$key" 'index($0, k " = ")==1 {print substr($0, length(k)+4); exit}' "${TUNE_BACKUP}/sysctl-all.txt")
+            [[ -n "$val" ]] && sysctl -w "${key}=${val}" >/dev/null 2>&1
+        done < <(awk -F' = ' '/^[a-z]/{print $1}' "$TUNE_CONF")
+        rm -f "$TUNE_CONF"
+        info "已移除优化参数并还原运行时数值"
+    fi
+    rm -f "$TUNE_MODLOAD"
+
+    # 2. 去掉我们加在其他 sysctl 文件里的注释前缀
+    for f in $(tune_state_get TOUCHED); do
+        [[ -f "$f" ]] && sed -i 's/^# \[sbox-tune\] //' "$f"
+    done
+
+    # 3. swap
+    swapf=$(tune_state_get SWAP_FILE)
+    if [[ -n "$swapf" ]]; then
+        swapoff "$swapf" 2>/dev/null
+        rm -f "$swapf"
+        sed -i "\|^${swapf}[[:space:]]|d" /etc/fstab
+        info "已删除脚本创建的 swap"
+    fi
+
+    # 4. sing-box 句柄配置
+    if [[ -f "$TUNE_LIMITS_CONF" ]]; then
+        rm -f "$TUNE_LIMITS_CONF"
+        rmdir "$TUNE_LIMITS_DIR" 2>/dev/null
+        systemctl daemon-reload 2>/dev/null
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && systemctl restart "$SERVICE_NAME" 2>/dev/null
+        info "已移除 sing-box 句柄配置并重启服务"
+    fi
+
+    # 5. 网卡队列
+    IFQ=$(tune_state_get QDISC_CHANGED)
+    if [[ -n "$IFQ" ]]; then
+        tc qdisc del dev "$IFQ" root 2>/dev/null
+        info "网卡 ${IFQ} 队列已还原为系统默认"
+    fi
+
+    # 6. 内核
+    if dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | grep -q xanmod; then
+        echo ""
+        if tune_yes "是否同时卸载 XanMod 内核并回到原内核？[y/N]: " "N"; then
+            tune_remove_xanmod
+        else
+            warn "已保留 XanMod 内核"
+        fi
+    fi
+
+    rm -f "$TUNE_STATE"
+    info "恢复完成（原始备份仍在 ${TUNE_BACKUP}）"
+    tune_ask_reboot
+}
+
+# ---------- 菜单 ----------
+tune_menu() {
+    title "服务器网络优化（BBR3 / 缓冲区 / swap）"
+    echo ""
+    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
+        echo -e "  原始备份：${GREEN}已备份（只读保护）${NC}"
+    else
+        echo -e "  原始备份：${YELLOW}首次运行向导时自动备份${NC}"
+    fi
+    if [[ -f "$TUNE_CONF" ]]; then
+        echo -e "  当前状态：${GREEN}已优化${NC}"
+    else
+        echo -e "  当前状态：${YELLOW}未优化${NC}"
+    fi
+    echo ""
+    echo -e "  ${GREEN}1.${NC} 优化向导（备份 → 参数 → swap → BBR3）"
+    echo -e "  ${GREEN}2.${NC} 仅重算缓冲区（换了延迟/带宽）"
+    echo -e "  ${GREEN}3.${NC} 查看当前状态"
+    echo -e "  ${RED}4.${NC} 恢复原始设置"
+    echo -e "  ${GREEN}0.${NC} 返回"
+    echo ""
+    local OPT
+    read -rp "选择: " OPT
+    case "$OPT" in
+        1) tune_wizard ;;
+        2) tune_retune ;;
+        3) tune_status ;;
+        4) tune_restore ;;
+        0) return ;;
+        *) warn "无效选项" ;;
+    esac
+}
+
+# ============================================================
 # 启动时自动探测 sing-box 实际路径（官方 deb 装在 /usr/bin）
 # ============================================================
 detect_sbox_bin >/dev/null 2>&1 || true
@@ -2268,7 +2995,7 @@ main_menu() {
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 更新 sing-box     ${GREEN}12.${NC} 更新管理脚本"
         echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
-        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box"
+        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box     ${GREEN}16.${NC} 网络优化(BBR3)"
         echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -2290,6 +3017,7 @@ main_menu() {
             13) update_hysteria_binary ;;
             14) ip_priority_menu ;;
             15) uninstall_sbox ;;
+            16) tune_menu ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项" ;;
         esac
