@@ -1,6 +1,6 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.8.6
-# Reality + SS + WS + Hysteria2 + 用户管理 + Telegram
+# VLESS 智能节点控制台 (sing-box) v1.9.0
+# Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -169,7 +169,7 @@ check_port()     { ss -tlnp | grep -q ":${1} " && return 1 || return 0; }
 check_port_udp() { ss -ulnp | grep -q ":${1} " && return 1 || return 0; }
 
 # ============== 用户数据库格式化 ==============
-# 格式: NAME:UUID:EXPIRE:STATUS:NODE
+# 格式: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS（旧版多出的流量字段会被自动丢弃）
 normalize_user_db() {
     [[ ! -f "$USER_DB" ]] && return 0
     python3 - <<PYEOF
@@ -177,7 +177,8 @@ from pathlib import Path
 import re
 
 p = Path("$USER_DB")
-lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+raw = p.read_text(encoding="utf-8", errors="ignore")
+lines = raw.splitlines()
 out = []
 changed = False
 
@@ -191,49 +192,24 @@ def normalize_expire(exp):
     if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", exp):
         d, t = exp.split(" ", 1)
         return d + "_" + t.replace(":", "-")
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}", exp):
-        return exp
     return exp
 
 for line in lines:
     if not line.strip():
+        changed = True
         continue
     parts = line.rstrip("\n").split(":")
-    if len(parts) == 4:
-        name, uuid, expire, status = parts
-        node = "both"
+    if len(parts) < 4:
         changed = True
-    elif len(parts) >= 5:
-        name = parts[0]
-        uuid = parts[1]
-        sspass, quota, used = "", "0", "0"
-        if len(parts) == 4:
-            expire, status, node = parts[2], parts[3], "both"
-            changed = True
-        elif len(parts) == 5:
-            expire, status, node = parts[2], parts[3], (parts[4] or "both")
-        elif len(parts) == 6:
-            # 6-segment legacy line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS
-            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
-            changed = True
-        elif len(parts) == 8:
-            # 8-segment v1.8 line: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS:QUOTA_GB:USED_GB
-            expire, status, node, sspass = parts[2], parts[3], (parts[4] or "both"), parts[5]
-            quota = parts[6] if parts[6] else "0"
-            used = parts[7] if len(parts) > 7 and parts[7] else "0"
-        else:
-            # corrupted line: best-effort, mark changed
-            status = parts[-2]
-            node = parts[-1] or "both"
-            expire = parts[2]
-            changed = True
-    else:
         continue
+    name, uuid, expire, status = parts[0], parts[1], parts[2], parts[3]
+    node = (parts[4] if len(parts) > 4 else "") or "both"
+    sspass = parts[5] if len(parts) > 5 else ""
     expire2 = normalize_expire(expire)
-    if expire2 != expire:
+    row = ":".join([name, uuid, expire2, status, node, sspass])
+    if row != line:
         changed = True
-    row = [name, uuid, expire2, status, node, sspass, quota, used]
-    out.append(":".join(row))
+    out.append(row)
 
 if changed:
     p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
@@ -477,15 +453,14 @@ uninstall_sbox() {
     read -rp "确认卸载？将删除所有配置和用户数据 [y/N]: " CONFIRM
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
 
-    # 1. 停全部相关服务（含独立服务与机器人）
-    for u in "$SERVICE_NAME" "hysteria-server" "sbox-tgbot"; do
+    # 1. 停全部相关服务（含独立服务）
+    for u in "$SERVICE_NAME" "hysteria-server"; do
         systemctl stop "$u" 2>/dev/null
         systemctl disable "$u" 2>/dev/null
     done
     # 2. 删 systemd 单元
     rm -f /etc/systemd/system/sing-box.service
     rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/sbox-tgbot.service
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null
     # 3. 删二进制与快捷命令
@@ -493,14 +468,13 @@ uninstall_sbox() {
     rm -f /usr/local/bin/hysteria
     rm -f /usr/local/bin/singbox_manager.sh
     rm -f /usr/local/bin/c
-    # 4. 删全部配置与元数据（含 sing-box / hysteria / 机器人 / SSL）
+    # 4. 删全部配置与元数据（含 sing-box / hysteria / SSL）
     rm -rf "$SBOX_DIR"
     rm -rf /etc/hysteria
-    rm -rf /etc/vless-manager
     rm -rf /etc/sing-box
     rm -f /etc/sing-box/ssl/ws.crt /etc/sing-box/ssl/ws.key
     # 5. 清 cron 与 logrotate（含过期检查与日志）
-    crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset" | crontab - 2>/dev/null
+    crontab -l 2>/dev/null | grep -v "check-expire" | crontab - 2>/dev/null
     rm -f /etc/logrotate.d/sbox-expire
     rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
     rm -rf /var/lib/sbox
@@ -508,11 +482,11 @@ uninstall_sbox() {
     echo ""
     echo "残留自检："
     local leftover=0
-    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/vless-manager /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/systemd/system/sbox-tgbot.service; do
+    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service; do
         if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
     done
     if crontab -l 2>/dev/null | grep -q "check-expire"; then echo "  残留: cron check-expire"; leftover=1; fi
-    if systemctl list-unit-files 2>/dev/null | grep -qE "sing-box|hysteria-server|sbox-tgbot"; then echo "  残留: systemd unit-file"; leftover=1; fi
+    if systemctl list-unit-files 2>/dev/null | grep -qE "sing-box|hysteria-server"; then echo "  残留: systemd unit-file"; leftover=1; fi
     [[ "$leftover" -eq 0 ]] && info "无残留，sing-box 已完全卸载" || warn "存在残留，请按上面路径手动处理"
     exit 0
 }
@@ -660,18 +634,7 @@ rebuild_config() {
     HAS_HY2=0; has_hy2 && HAS_HY2=1
     HAS_ANYTLS=0; has_anytls && HAS_ANYTLS=1
 
-    local CLASH_SECRET=""
-    [[ -f "$META" ]] && CLASH_SECRET=$(read_kv "$META" "CLASH_SECRET")
-    if [[ -z "$CLASH_SECRET" ]]; then
-        CLASH_SECRET=$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-')
-        mkdir -p "$(dirname "$META")"; touch "$META"
-        if grep -q "^CLASH_SECRET=" "$META" 2>/dev/null; then
-            sed -i "s|^CLASH_SECRET=.*|CLASH_SECRET=${CLASH_SECRET}|" "$META"
-        else
-            echo "CLASH_SECRET=${CLASH_SECRET}" >> "$META"
-        fi
-    fi
-    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO CLASH_SECRET
+    export SBOX_CONFIG HAS_REALITY HAS_SS HAS_WS HAS_HY2 HAS_ANYTLS IP_PRIO
     export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
@@ -682,8 +645,6 @@ rebuild_config() {
 import json, os
 
 cfg = {"log": {"level": "warn", "timestamp": True}, "inbounds": [], "outbounds": []}
-
-cfg["experimental"] = {"clash_api": {"external_controller": "127.0.0.1:19090", "secret": os.environ.get("CLASH_SECRET", "")}}
 
 if os.environ.get("HAS_REALITY") == "1":
     cfg["inbounds"].append({
@@ -838,7 +799,7 @@ PYEOF
 _inject_all_users() {
     [[ ! -f "$USER_DB" ]] && return
     normalize_user_db
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS _REST; do
         [[ "$STATUS" != "active" ]] && continue
         NODE=${NODE:-both}
         _inject_user "$UUID" "$NAME" "$EXPIRE" "$NODE" "$SSPASS"
@@ -1512,11 +1473,7 @@ add_user() {
     UUID=$(cat /proc/sys/kernel/random/uuid)
     # 单密码模式：SS 只用初始化时的主密码，不再给每个用户生成独立密码
     local SSPASS=""
-    local QUOTA="0"
-    read -rp "月流量限额 GB [0=不限，默认 0]: " QUOTA
-    QUOTA=${QUOTA:-0}
-    [[ "$QUOTA" =~ ^[0-9]+$ ]] || { error "限额必须是纯数字 GB"; return 1; }
-    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}:${QUOTA}:0" >> "$USER_DB"
+    echo "${USERNAME}:${UUID}:${EXPIRE}:active:${NODE}:${SSPASS}" >> "$USER_DB"
     _inject_user "$UUID" "$USERNAME" "$EXPIRE" "$NODE" "$SSPASS"
 
     validate_sbox_config || {
@@ -1702,16 +1659,6 @@ p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已禁用"
     else
-        # v1.8 流量超额的用户启用前提示：需先加限额或重置用量
-        {
-            local _Q _U
-            _Q=$(get_user_field "$USERNAME" 7); _U=$(get_user_field "$USERNAME" 8)
-            if [[ "$_Q" =~ ^[0-9]+$ ]] && (( _Q > 0 )) && [[ "$_U" =~ ^[0-9]+$ ]] && (( _U >= _Q )); then
-                warn "用户 $USERNAME 本月流量已用完 ($_U/$_Q GB)，启用后将继续超额计费/限速，建议先加限额或重置用量"
-                read -rp "仍要启用？[y/N]: " _C
-                [[ "$_C" != "y" && "$_C" != "Y" ]] && return
-            fi
-        }
         # 启用
         local EXPIRE
         EXPIRE=$(get_user_field "$USERNAME" 3)
@@ -1849,9 +1796,9 @@ list_users() {
     ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
     DISABLED=$((TOTAL - ACTIVE))
     echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
-    echo -e "  ${YELLOW}USER EXPIRE STATUS NODE QUOTA/USED(GB)${NC}"
+    echo -e "  ${YELLOW}USER EXPIRE STATUS NODE${NC}"
     echo -e "  ───────────────────────────────────────────────────────────────────────────────────────────────"
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS _REST; do
         NODE=${NODE:-both}
         local COLOR=$NC STATUS_ICON="○" EXPIRE_SHOW
         EXPIRE_SHOW=$(expire_display "$EXPIRE")
@@ -1860,8 +1807,8 @@ list_users() {
         elif [[ "$STATUS" == "disabled" ]]; then
             COLOR=$RED; STATUS_ICON="○"
         fi
-        printf "  ${COLOR}%-15s %-20s %-14s %-8s %s/%s GB${NC}\n" \
-            "$NAME" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE" "${QUOTA:-0}" "${USED:-0}"
+        printf "  ${COLOR}%-15s %-20s %-14s %s${NC}\n" \
+            "$NAME" "$EXPIRE_SHOW" "${STATUS_ICON} ${STATUS}" "$NODE"
     done < "$USER_DB"
     echo ""
 }
@@ -1873,7 +1820,7 @@ list_users_brief() {
     normalize_user_db
     echo ""
     [[ ! -s "$USER_DB" ]] && echo "  （暂无用户）" && echo "" && return
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS _REST; do
         NODE=${NODE:-both}
         printf "  %-15s %s  [%s | %s]\n" "$NAME" "$(expire_display "$EXPIRE")" "$STATUS" "$NODE"
     done < "$USER_DB"
@@ -1914,149 +1861,6 @@ show_user_link() {
 
 
 # ============================================================
-# 月流量统计 / 限额 (v1.8, Clash API)
-# ============================================================
-quota_collect() {
-    normalize_user_db
-    [[ -f "$META" ]] && CLASH_SECRET=$(read_kv "$META" "CLASH_SECRET") || CLASH_SECRET=""
-    [[ -z "$CLASH_SECRET" ]] && return 0
-    local PREV=/var/lib/sbox/quota_prev.json
-    mkdir -p "$(dirname "$PREV")"
-    [[ -f "$PREV" ]] || echo '{}' > "$PREV"
-    CLASH_SECRET="$CLASH_SECRET" DB_PATH="$USER_DB" PREV_PATH="$PREV" python3 - <<'PYEOF'
-import json, os, urllib.request
-secret = os.environ.get("CLASH_SECRET", "")
-db = os.environ["DB_PATH"]; prevf = os.environ["PREV_PATH"]
-def load(p):
-    try:
-        with open(p, encoding="utf-8") as f: return json.load(f)
-    except Exception: return {}
-prev = load(prevf)
-cur = {}
-try:
-    req = urllib.request.Request("http://127.0.0.1:19090/connections", headers={"Authorization": "Bearer " + secret})
-    data = json.load(urllib.request.urlopen(req, timeout=5))
-    for c in data.get("connections", []):
-        # metadata.user = uuid
-        md = c.get("metadata", {}) or {}
-        u = md.get("user") or c.get("user") or ""
-        up = int(c.get("uploadTotal", 0) or 0); down = int(c.get("downloadTotal", 0) or 0)
-        if u: cur[u] = cur.get(u, 0) + up + down
-except Exception as e:
-    print("quota_collect: clash api fail: %s" % e)
-    return
-# 累加增量
-try: lines = open(db, encoding="utf-8", errors="ignore").read().splitlines()
-except OSError: lines = []
-out = []
-for line in lines:
-    parts = line.split(":")
-    while len(parts) < 8: parts.append("" if len(parts) == 5 else "0")
-    name, uuid = parts[0], parts[1]
-    try: used_gb = float(parts[7] or 0)
-    except ValueError: used_gb = 0.0
-    c_now = cur.get(uuid, cur.get(name, 0))
-    p_old = int(prev.get(uuid, prev.get(name, 0)) or 0)
-    delta = c_now - p_old
-    if delta < 0: delta = c_now  # sing-box 重启计数清零
-    if delta > 0: used_gb += delta / 1073741824.0
-    parts[7] = "%.3f" % used_gb
-    out.append(":".join(parts[:8]))
-open(db, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
-json.dump({k: int(v) for k, v in cur.items()}, open(prevf, "w", encoding="utf-8"))
-PYEOF
-    quota_enforce
-}
-quota_enforce() {
-    normalize_user_db
-    local HIT=""
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
-        [[ "$STATUS" != "active" ]] && continue
-        [[ "$QUOTA" =~ ^[0-9]+$ ]] || continue
-        (( QUOTA > 0 )) || continue
-        over=$(awk -v u="$USED" -v q="$QUOTA" 'BEGIN{print (u+0>=q+0)?1:0}')
-        if [[ "$over" == "1" ]]; then HIT="${HIT} ${UUID}"; warn "用户 ${NAME} 流量超额 (${USED}/${QUOTA} GB)，自动禁用"; fi
-    done < "$USER_DB"
-    [[ -z "$HIT" ]] && return 0
-    BATCH_UUIDS="$HIT" DB_PATH="$USER_DB" python3 - <<'PYEOF'
-import os
-from pathlib import Path
-uuids = set(os.environ["BATCH_UUIDS"].split())
-p = Path(os.environ["DB_PATH"])
-lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-out = []
-for line in lines:
-    parts = line.split(":")
-    if len(parts) >= 2 and parts[1] in uuids:
-        while len(parts) < 8: parts.append("0")
-        parts[3] = "disabled"
-        out.append(":".join(parts[:8]))
-    else: out.append(line)
-p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-PYEOF
-    _inject_all_users && validate_sbox_config && systemctl restart "$SERVICE_NAME"
-}
-quota_reset_monthly() {
-    # 每月1日清零；只重开时间未到期且之前因超额被禁的用户需手动启用(保持disabled，由主页启用)
-    normalize_user_db
-    DB_PATH="$USER_DB" python3 - <<'PYEOF'
-import os
-p = os.environ["DB_PATH"]
-lines = open(p, encoding="utf-8", errors="ignore").read().splitlines()
-out = []
-for line in lines:
-    parts = line.split(":")
-    while len(parts) < 8: parts.append("0")
-    parts[7] = "0"
-    out.append(":".join(parts[:8]))
-open(p, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
-PYEOF
-    echo '{}' > /var/lib/sbox/quota_prev.json 2>/dev/null
-    info "已重置全部用户本月已用流量"
-}
-quota_set() {
-    title "设置用户月流量限额"
-    list_users_brief
-    read -rp "输入用户名: " U; read -rp "限额 GB [0=不限]: " Q
-    [[ "$Q" =~ ^[0-9]+$ ]] || { error "限额必须是纯数字"; return 1; }
-    DB_PATH="$USER_DB" U="$U" Q="$Q" python3 - <<'PYEOF'
-import os
-db, u, q = os.environ["DB_PATH"], os.environ["U"], os.environ["Q"]
-lines = open(db, encoding="utf-8", errors="ignore").read().splitlines()
-out, hit = [], False
-for line in lines:
-    parts = line.split(":")
-    while len(parts) < 8: parts.append("0")
-    if parts[0] == u: parts[6] = q; hit = True
-    out.append(":".join(parts[:8]))
-open(db, "w", encoding="utf-8").write("\n".join(out) + ("\n" if out else ""))
-print("OK" if hit else "NOTFOUND")
-PYEOF
-}
-quota_show() {
-    title "流量使用"
-    printf "  %-15s %-10s %-10s %s\n" 用户名 限额 已用 状态
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
-        q="${QUOTA:-0}"; [[ "$q" == "0" ]] && q="不限"
-        echo "  $NAME 限额${q}GB 已用${USED:-0}GB [$STATUS]"
-    done < "$USER_DB"
-}
-
-quota_menu() {
-    while true; do
-        quota_show
-        read -rp "pick 1-set 2-collect 3-enforce 4-reset 0-back: " Q
-        case $Q in
-            1) quota_set ;;
-            2) quota_collect; quota_show ;;
-            3) quota_enforce ;;
-            4) quota_reset_monthly ;;
-            0) return ;;
-        esac
-    done
-}
-
-# ============================================================
 # 到期检查（cron 调用）
 # ============================================================
 check_expire() {
@@ -2069,7 +1873,7 @@ check_expire() {
 
     [[ ! -f "$USER_DB" ]] && info "暂无用户" && return
 
-    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS QUOTA USED; do
+    while IFS=: read -r NAME UUID EXPIRE STATUS NODE SSPASS _REST; do
         [[ "$STATUS" != "active" ]] && continue
         local EXPIRE_TS
         EXPIRE_TS=$(expire_to_ts "$EXPIRE")
@@ -2181,7 +1985,7 @@ for i in d.get('inbounds',[]):
         if [[ -f "$USER_DB" ]]; then
             echo -e "${CYAN}分享链接:${NC}"
             local RNAME RUUID REXP RSTATUS RNODE
-            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS RQUOTA RUSED; do
+            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS _REST; do
                 [[ "$RSTATUS" != "active" ]] && continue
                 RNODE=${RNODE:-both}
                 [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
@@ -2205,7 +2009,7 @@ for i in d.get('inbounds',[]):
         # 单密码模式：不再展示各用户独立密码链接，只保留主密码
         if false; then
             local SNAME SUUID SEXP SSTATUS SNODE SSPW SS_UI SS_LK
-            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW SQUOTA SUSED; do
+            while IFS=: read -r SNAME SUUID SEXP SSTATUS SNODE SSPW _REST; do
                 [[ "$SSTATUS" != "active" ]] && continue
                 SNODE=${SNODE:-both}
                 [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
@@ -2341,168 +2145,6 @@ update_script() {
 }
 
 # ============================================================
-# Telegram 机器人内嵌脚本提取
-# ============================================================
-extract_telegram_runtime() {
-    mkdir -p "$SBOX_DIR" /etc/vless-manager
-    awk '
-        /^###__SBOX_TG_BOT_PY__###$/ {inside=1; next}
-        /^###__END_SBOX_TG_BOT_PY__###$/ {inside=0; exit}
-        inside {sub(/^#TG\|/, ""); print}
-    ' "$0" > /etc/vless-manager/sbox_tg_bot.py
-    [[ -s /etc/vless-manager/sbox_tg_bot.py ]] || { error "机器人程序提取失败"; return 1; }
-    chmod 700 /etc/vless-manager/sbox_tg_bot.py
-}
-
-# ============================================================
-# 安装 Telegram 机器人（精简版：仅管理+延迟，无流量统计）
-# ============================================================
-install_telegram_bot() {
-    title "安装 Telegram 管理机器人"
-    command -v python3 >/dev/null 2>&1 || { error "缺少 python3"; return 1; }
-    [[ -x "$SBOX_BIN" ]] || { error "请先安装 sing-box"; return 1; }
-
-    local BOT_TOKEN BOT_INFO BOT_USERNAME BIND_TOKEN BIND_URL
-    read -rsp "输入 Bot Token（不显示）: " BOT_TOKEN
-    echo ""
-    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || { error "Token 格式不正确"; return 1; }
-
-    BOT_INFO=$(curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null) || {
-        error "无法验证 Token，请检查网络"; return 1
-    }
-    BOT_USERNAME=$(BOT_INFO="$BOT_INFO" python3 -c "
-import json, os
-data = json.loads(os.environ['BOT_INFO'])
-print(data['result']['username'] if data.get('ok') else '')
-" 2>/dev/null)
-    [[ "$BOT_USERNAME" =~ ^[A-Za-z0-9_]{5,}$ ]] || { error "Token 验证失败"; return 1; }
-
-    # 注册命令菜单
-    curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
-        -d '{"commands":[{"command":"start","description":"帮助"},{"command":"users","description":"用户列表"},{"command":"user","description":"用户详情：/user 用户名"},{"command":"expiring","description":"7天内到期用户"},{"command":"ping","description":"延迟测试"},{"command":"status","description":"机器人状态"}]}' \
-        >/dev/null 2>&1 && info "已注册命令快捷键" || warn "命令快捷键注册失败"
-
-    BIND_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
-    BIND_URL="https://t.me/${BOT_USERNAME}?start=${BIND_TOKEN}"
-
-    extract_telegram_runtime || return 1
-
-    cat > /etc/vless-manager/bot.conf <<EOF
-BOT_TOKEN=${BOT_TOKEN}
-ADMIN_CHAT_IDS=
-BIND_TOKEN=${BIND_TOKEN}
-USER_DB=${USER_DB}
-PING_INTERVAL=600
-PING_HOST=1.1.1.1
-EOF
-    chmod 600 /etc/vless-manager/bot.conf
-
-    cat > /etc/systemd/system/sbox-tgbot.service <<EOF
-[Unit]
-Description=sing-box VLESS Telegram bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /etc/vless-manager/sbox_tg_bot.py --config /etc/vless-manager/bot.conf
-Restart=always
-RestartSec=5
-User=root
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/etc/sing-box /etc/vless-manager
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable sbox-tgbot.service >/dev/null 2>&1
-    systemctl restart sbox-tgbot.service
-    sleep 2
-
-    if systemctl is-active --quiet sbox-tgbot.service; then
-        info "Telegram 机器人已启动"
-        echo ""
-        title "扫码绑定 Telegram"
-        if command -v qrencode >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq qrencode >/dev/null 2>&1); then
-            qrencode -t ANSIUTF8 "$BIND_URL"
-        else
-            warn "请直接打开下方链接"
-        fi
-        echo -e "  ${CYAN}${BIND_URL}${NC}"
-        echo ""
-        info "用 Telegram 扫码或打开链接，点击"开始"完成绑定"
-        warn "绑定链接仅可使用一次"
-    else
-        error "服务启动失败，运行 journalctl -u sbox-tgbot -n 20 查看"
-        return 1
-    fi
-}
-
-# ============================================================
-# Telegram 服务状态 / 日志
-# ============================================================
-telegram_bot_status() {
-    title "Telegram 服务状态"
-    systemctl --no-pager --full status sbox-tgbot.service 2>/dev/null || true
-}
-
-telegram_bot_logs() {
-    title "Telegram 最近日志"
-    journalctl -u sbox-tgbot.service -n 40 --no-pager
-}
-
-# ============================================================
-# 卸载 Telegram 机器人
-# ============================================================
-uninstall_telegram_bot() {
-    read -rp "确认卸载机器人？[y/N]: " C
-    [[ "$C" != "y" && "$C" != "Y" ]] && return
-    systemctl disable --now sbox-tgbot.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/sbox-tgbot.service
-    rm -rf /etc/vless-manager
-    systemctl daemon-reload
-    info "机器人已卸载"
-}
-
-# ============================================================
-# Telegram 机器人子菜单
-# ============================================================
-telegram_bot_menu() {
-    while true; do
-        clear
-        title "Telegram 机器人"
-        echo -e "  ${GREEN}1.${NC} 安装 / 重新配置"
-        echo -e "  ${GREEN}2.${NC} 查看运行状态"
-        echo -e "  ${GREEN}3.${NC} 重启机器人"
-        echo -e "  ${GREEN}4.${NC} 查看最近日志"
-        echo -e "  ${RED}5.${NC} 卸载机器人"
-        echo -e "  ${GREEN}0.${NC} 返回主菜单"
-        echo ""
-        read -rp "请选择: " TG_OPT
-        case "$TG_OPT" in
-            1) install_telegram_bot ;;
-            2) telegram_bot_status ;;
-            3) systemctl restart sbox-tgbot.service && info "已重启" ;;
-            4) telegram_bot_logs ;;
-            5) uninstall_telegram_bot ;;
-            0) return ;;
-            *) warn "无效选项" ;;
-        esac
-        echo ""; read -rp "按 Enter 继续..." _
-    done
-}
-# ============================================================
 # 安装快捷命令 c
 # ============================================================
 install_shortcut() {
@@ -2525,9 +2167,7 @@ install_shortcut() {
 # ============================================================
 setup_cron() {
     local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
-    local QUOTA_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --quota-collect >> /var/log/sbox-expire.log 2>&1"
-    local RESET_CMD="0 0 1 * * /usr/local/bin/singbox_manager.sh --quota-reset >> /var/log/sbox-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD"; echo "$QUOTA_CMD"; echo "$RESET_CMD") | crontab -
+    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD") | crontab -
     info "已设置每 5 分钟自动检查到期用户"
 
     mkdir -p /var/log
@@ -2557,19 +2197,31 @@ if [[ "$1" == "--check-expire" ]]; then
     check_expire
     exit 0
 fi
-if [[ "$1" == "--quota-collect" ]]; then
-    normalize_user_db
-    quota_collect
-    exit 0
-fi
-if [[ "$1" == "--quota-reset" ]]; then
-    quota_reset_monthly
-    exit 0
-fi
-if [[ "$1" == "--quota-enforce" ]]; then
-    quota_enforce
-    exit 0
-fi
+# 旧版本遗留的 cron 参数：已不再支持，直接静默退出，避免进入交互菜单
+case "$1" in
+    --quota-collect|--quota-reset|--quota-enforce) exit 0 ;;
+esac
+
+# ============================================================
+# 清理旧版本遗留（Telegram 机器人 / 流量统计）
+# ============================================================
+cleanup_legacy() {
+    local touched=0
+    if [[ -f /etc/systemd/system/sbox-tgbot.service || -d /etc/vless-manager ]]; then
+        systemctl disable --now sbox-tgbot.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sbox-tgbot.service
+        rm -rf /etc/vless-manager
+        systemctl daemon-reload 2>/dev/null
+        touched=1
+    fi
+    if crontab -l 2>/dev/null | grep -qE "quota-collect|quota-reset"; then
+        crontab -l 2>/dev/null | grep -vE "quota-collect|quota-reset" | crontab - 2>/dev/null
+        touched=1
+    fi
+    rm -rf /var/lib/sbox 2>/dev/null
+    [[ $touched -eq 1 ]] && info "已清理旧版 Telegram 机器人 / 流量统计残留"
+    return 0
+}
 
 
 # ============================================================
@@ -2597,14 +2249,11 @@ main_menu() {
         local STATUS_COLOR=$RED STATUS_TEXT="● 已停止"
         [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
-        local TG_STATUS="未安装"
-        systemctl is-active --quiet sbox-tgbot.service 2>/dev/null && TG_STATUS="运行中"
-
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.8.6${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.9.0${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
-        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计   TG ${CYAN}${TG_STATUS}${NC}"
+        echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 节点中心${NC}"
         echo -e "${BLUE}║${NC}   ${GREEN}1.${NC}  安装 sing-box 并配置节点"
@@ -2614,15 +2263,11 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}3.${NC}  新建用户          ${GREEN}4.${NC}  删除用户"
         echo -e "${BLUE}║${NC}   ${GREEN}5.${NC}  禁用用户          ${GREEN}6.${NC}  启用用户"
         echo -e "${BLUE}║${NC}   ${GREEN}7.${NC}  用户续期          ${GREEN}8.${NC}  用户列表"
-        echo -e "${BLUE}║${NC}   ${GREEN}9.  查看分享链接      17. 流量管理"
-        echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}▣ Telegram${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}10.${NC} Telegram 机器人管理"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 节点运行信息"
+        echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接      ${GREEN}10.${NC} 节点运行信息"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}12.${NC} 更新 sing-box     ${GREEN}13.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}16.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 更新 sing-box     ${GREEN}12.${NC} 更新管理脚本"
+        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
         echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box"
         echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
@@ -2639,12 +2284,10 @@ main_menu() {
             7)  renew_user ;;
             8)  list_users ;;
             9)  show_user_link ;;
-            17) quota_menu ;;
-            10) telegram_bot_menu ;;
-            11) show_info ;;
-            12) update_sbox ;;
-            13) update_script ;;
-            16) update_hysteria_binary ;;
+            10) show_info ;;
+            11) update_sbox ;;
+            12) update_script ;;
+            13) update_hysteria_binary ;;
             14) ip_priority_menu ;;
             15) uninstall_sbox ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
@@ -2663,322 +2306,6 @@ main_menu() {
 # 先把快捷命令 c 装上，保证无论后面发生什么，c 都可用。
 # c 装好后，即使系统检查/初始化出错，用户也能直接敲 c 重进菜单排查。
 install_shortcut
+cleanup_legacy
 normalize_user_db
 main_menu
-
-
-###__SBOX_TG_BOT_PY__###
-#TG|#!/usr/bin/env python3
-#TG|"""Sing-box VLESS Telegram management bot (no traffic stats)."""
-#TG|from __future__ import annotations
-#TG|
-#TG|import argparse
-#TG|import html
-#TG|import json
-#TG|import os
-#TG|import re
-#TG|import secrets
-#TG|import socket
-#TG|import subprocess
-#TG|import threading
-#TG|import time
-#TG|import urllib.error
-#TG|import urllib.parse
-#TG|import urllib.request
-#TG|from datetime import datetime
-#TG|from pathlib import Path
-#TG|from typing import Optional
-#TG|
-#TG|DEFAULT_CONFIG = Path("/etc/vless-manager/bot.conf")
-#TG|DEFAULT_USERS = Path("/etc/sing-box/users.db")
-#TG|BIND_LOCK = threading.Lock()
-#TG|
-#TG|
-#TG|def parse_config(path: Path) -> dict:
-#TG|    result = {}
-#TG|    if not path.exists():
-#TG|        return result
-#TG|    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-#TG|        line = raw.strip()
-#TG|        if not line or line.startswith("#") or "=" not in line:
-#TG|            continue
-#TG|        key, value = line.split("=", 1)
-#TG|        result[key.strip()] = value.strip()
-#TG|    ids = set()
-#TG|    for item in result.get("ADMIN_CHAT_IDS", "").split(","):
-#TG|        item = item.strip()
-#TG|        if item.isdigit() and int(item) > 0:
-#TG|            ids.add(int(item))
-#TG|    result["ADMIN_CHAT_IDS"] = ids
-#TG|    return result
-#TG|
-#TG|
-#TG|def is_authorized(config: dict, chat_id: int) -> bool:
-#TG|    return int(chat_id) in config.get("ADMIN_CHAT_IDS", set())
-#TG|
-#TG|
-#TG|def is_authorized_message(config: dict, message: dict) -> bool:
-#TG|    sender_id = (message.get("from") or {}).get("id")
-#TG|    return sender_id is not None and is_authorized(config, int(sender_id))
-#TG|
-#TG|
-#TG|def validate_bot_config(config: dict) -> None:
-#TG|    if not config.get("BOT_TOKEN"):
-#TG|        raise ValueError("请先配置 BOT_TOKEN")
-#TG|    if not config.get("ADMIN_CHAT_IDS") and not config.get("BIND_TOKEN"):
-#TG|        raise ValueError("机器人尚未绑定")
-#TG|
-#TG|
-#TG|def update_config_values(path: Path, values: dict) -> None:
-#TG|    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
-#TG|    pending = dict(values)
-#TG|    output = []
-#TG|    for line in lines:
-#TG|        key = line.split("=", 1)[0].strip() if "=" in line else ""
-#TG|        if key in pending:
-#TG|            output.append(f"{key}={pending.pop(key)}")
-#TG|        else:
-#TG|            output.append(line)
-#TG|    output.extend(f"{k}={v}" for k, v in pending.items())
-#TG|    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
-#TG|    try:
-#TG|        tmp.write_text("\n".join(output) + "\n", encoding="utf-8")
-#TG|        tmp.chmod(0o600)
-#TG|        os.replace(tmp, path)
-#TG|    finally:
-#TG|        try:
-#TG|            tmp.unlink()
-#TG|        except FileNotFoundError:
-#TG|            pass
-#TG|
-#TG|
-#TG|def claim_binding(config_path: Path, config: dict, message: dict) -> bool:
-#TG|    chat = message.get("chat") or {}
-#TG|    sender_id = (message.get("from") or {}).get("id")
-#TG|    parts = message.get("text", "").strip().split(maxsplit=1)
-#TG|    if chat.get("type") != "private" or sender_id is None or len(parts) != 2:
-#TG|        return False
-#TG|    command = parts[0].split("@", 1)[0].lower()
-#TG|    supplied = parts[1].strip()
-#TG|    with BIND_LOCK:
-#TG|        expected = str(config.get("BIND_TOKEN", ""))
-#TG|        if command != "/start" or not expected or not secrets.compare_digest(supplied, expected):
-#TG|            return False
-#TG|        admin_id = int(sender_id)
-#TG|        update_config_values(config_path, {"ADMIN_CHAT_IDS": str(admin_id), "BIND_TOKEN": ""})
-#TG|        config["ADMIN_CHAT_IDS"] = {admin_id}
-#TG|        config["BIND_TOKEN"] = ""
-#TG|        return True
-#TG|
-#TG|
-#TG|def read_users(path: Path = DEFAULT_USERS) -> list[dict]:
-#TG|    users = []
-#TG|    if not path.exists():
-#TG|        return users
-#TG|    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-#TG|        parts = raw.strip().split(":")
-#TG|        if len(parts) < 5:
-#TG|            continue
-#TG|        users.append({
-#TG|            "name": parts[0], "uuid": parts[1], "expire": parts[2],
-#TG|            "status": parts[3], "node": parts[4] or "both",
-#TG|        })
-#TG|    return users
-#TG|
-#TG|
-#TG|def parse_expire(value: str) -> Optional[datetime]:
-#TG|    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-#TG|        try:
-#TG|            dt = datetime.strptime(value, fmt)
-#TG|            if fmt == "%Y-%m-%d":
-#TG|                dt = dt.replace(hour=12)
-#TG|            return dt
-#TG|        except ValueError:
-#TG|            pass
-#TG|    return None
-#TG|
-#TG|
-#TG|def remaining_days(expire: str, now: Optional[datetime] = None) -> Optional[int]:
-#TG|    dt = parse_expire(expire)
-#TG|    if not dt:
-#TG|        return None
-#TG|    now = now or datetime.now()
-#TG|    seconds = (dt - now).total_seconds()
-#TG|    return 0 if seconds <= 0 else int((seconds + 86399) // 86400)
-#TG|
-#TG|
-#TG|def tg_request(token: str, method: str, data: Optional[dict] = None) -> dict:
-#TG|    url = f"https://api.telegram.org/bot{token}/{method}"
-#TG|    encoded = urllib.parse.urlencode(data or {}).encode()
-#TG|    req = urllib.request.Request(url, data=encoded)
-#TG|    with urllib.request.urlopen(req, timeout=65) as resp:
-#TG|        result = json.loads(resp.read().decode("utf-8"))
-#TG|    if not result.get("ok"):
-#TG|        raise RuntimeError(result.get("description", "Telegram API 错误"))
-#TG|    return result
-#TG|
-#TG|
-#TG|def send_message(token: str, chat_id: int, text: str) -> None:
-#TG|    tg_request(token, "sendMessage", {
-#TG|        "chat_id": str(chat_id), "text": text, "parse_mode": "HTML",
-#TG|        "disable_web_page_preview": "true",
-#TG|    })
-#TG|
-#TG|
-#TG|def measure_ping_latency(host: str = "1.1.1.1") -> Optional[float]:
-#TG|    try:
-#TG|        res = subprocess.run(
-#TG|            ["ping", "-c", "4", "-W", "3", host],
-#TG|            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-#TG|            timeout=20, check=False,
-#TG|        )
-#TG|        out = res.stdout.decode("utf-8", errors="ignore") or ""
-#TG|    except Exception:
-#TG|        return None
-#TG|    m = re.search(r"min/avg/max/(?:mdev|stddev)\s*=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+", out)
-#TG|    return float(m.group(1)) if m else None
-#TG|
-#TG|
-#TG|def measure_tcp_latency(host: str, port: int = 80, timeout: float = 4.0) -> Optional[float]:
-#TG|    try:
-#TG|        ip = socket.gethostbyname(host)
-#TG|        t0 = time.monotonic()
-#TG|        with socket.create_connection((ip, port), timeout=timeout):
-#TG|            return (time.monotonic() - t0) * 1000.0
-#TG|    except Exception:
-#TG|        return None
-#TG|
-#TG|
-#TG|CARRIER_TARGETS = [
-#TG|    ("联通", "sc-cu-v4.ip.zstaticcdn.com", 80),
-#TG|    ("移动", "sc-cm-v4.ip.zstaticcdn.com", 80),
-#TG|    ("电信", "sc-ct-v4.ip.zstaticcdn.com", 80),
-#TG|]
-#TG|
-#TG|
-#TG|def ping_text(host: str = "1.1.1.1") -> str:
-#TG|    lines = ["📡 <b>延迟测试</b>", ""]
-#TG|    lat = measure_ping_latency(host)
-#TG|    if lat is None:
-#TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> <b>无响应</b>")
-#TG|    else:
-#TG|        level = "🟢" if lat < 100 else ("🟡" if lat < 250 else "🔴")
-#TG|        lines.append(f"🌐 <code>{html.escape(host)}</code> → {level} <b>{lat:.1f} ms</b>")
-#TG|    lines.append("")
-#TG|    for name, c_host, c_port in CARRIER_TARGETS:
-#TG|        c_lat = measure_tcp_latency(c_host, c_port)
-#TG|        label = f"{name} TCP"
-#TG|        if c_lat is None:
-#TG|            lines.append(f"{label} <b>无响应</b>")
-#TG|        else:
-#TG|            c_level = "🟢" if c_lat < 100 else ("🟡" if c_lat < 250 else "🔴")
-#TG|            lines.append(f"{label} → {c_level} <b>{c_lat:.1f} ms</b>")
-#TG|    return "\n".join(lines)
-#TG|
-#TG|
-#TG|def users_text(users: list[dict]) -> str:
-#TG|    rows = ["👥 <b>用户列表</b>", ""]
-#TG|    for user in users:
-#TG|        days = remaining_days(user["expire"])
-#TG|        left = "未知" if days is None else ("已到期" if days == 0 else f"{days}天")
-#TG|        icon = "🟢" if user["status"] == "active" else "🔴"
-#TG|        rows.append(f"{icon} <code>{html.escape(user['name'])}</code> · {left} · {html.escape(user['node'])}")
-#TG|    return "\n".join(rows) if len(rows) > 2 else "暂无用户"
-#TG|
-#TG|
-#TG|def user_text(user: dict) -> str:
-#TG|    days = remaining_days(user["expire"])
-#TG|    day_text = "未知" if days is None else ("已到期" if days == 0 else f"{days} 天")
-#TG|    expire = parse_expire(user["expire"])
-#TG|    expire_text = expire.strftime("%Y-%m-%d %H:%M") if expire else user["expire"]
-#TG|    state = "🟢 正常" if user["status"] == "active" else "🔴 已禁用"
-#TG|    return (
-#TG|        f"👤 <b>{html.escape(user['name'])}</b>\n"
-#TG|        f"状态：{state}\n节点：{html.escape(user['node'])}\n"
-#TG|        f"到期：{html.escape(expire_text)}\n剩余：<b>{day_text}</b>"
-#TG|    )
-#TG|
-#TG|
-#TG|def command_reply(text: str, users_path: Path) -> str:
-#TG|    parts = text.strip().split(maxsplit=1)
-#TG|    command = parts[0].split("@", 1)[0].lower() if parts else "/start"
-#TG|    users = read_users(users_path)
-#TG|    if command in ("/start", "/help"):
-#TG|        return (
-#TG|            "🤖 <b>VLESS 管理机器人</b>\n\n"
-#TG|            "/users — 用户列表\n"
-#TG|            "/user 用户名 — 用户详情\n"
-#TG|            "/expiring — 7天内到期用户\n"
-#TG|            "/ping — 延迟测试（三网 TCP）\n"
-#TG|            "/status — 机器人状态"
-#TG|        )
-#TG|    if command == "/users":
-#TG|        return users_text(users)
-#TG|    if command == "/user":
-#TG|        if len(parts) < 2:
-#TG|            return "用法：<code>/user 用户名</code>"
-#TG|        name = parts[1].strip()
-#TG|        user = next((u for u in users if u["name"] == name), None)
-#TG|        return user_text(user) if user else "未找到该用户"
-#TG|    if command == "/expiring":
-#TG|        selected = [u for u in users if (d := remaining_days(u["expire"])) is not None and d <= 7]
-#TG|        return "⏰ <b>7天内到期</b>\n\n" + (users_text(selected) if selected else "暂无")
-#TG|    if command == "/ping":
-#TG|        return ping_text()
-#TG|    if command == "/status":
-#TG|        return "✅ 机器人在线\n🕐 " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#TG|    return "未知命令，请发送 /help"
-#TG|
-#TG|
-#TG|def handle_message(token: str, config_path: Path, cfg: dict, message: dict, users_path: Path) -> None:
-#TG|    started = time.monotonic()
-#TG|    chat_id = (message.get("chat") or {}).get("id")
-#TG|    text = message.get("text", "")
-#TG|    if chat_id is None or not text:
-#TG|        return
-#TG|    if claim_binding(config_path, cfg, message):
-#TG|        send_message(token, int(chat_id), "✅ <b>绑定成功</b>\n\n发送 /start 查看可用命令。")
-#TG|        print(f"binding=success admin={chat_id}", flush=True)
-#TG|        return
-#TG|    if not is_authorized_message(cfg, message):
-#TG|        send_message(token, int(chat_id), "⛔ 未授权。请重新配置并扫描绑定二维码。")
-#TG|        return
-#TG|    send_message(token, int(chat_id), command_reply(text, users_path))
-#TG|    print(f"command={text.split(maxsplit=1)[0]} elapsed={time.monotonic() - started:.3f}s", flush=True)
-#TG|
-#TG|
-#TG|def run_bot(config_path: Path) -> None:
-#TG|    cfg = parse_config(config_path)
-#TG|    token = cfg.get("BOT_TOKEN", "")
-#TG|    try:
-#TG|        validate_bot_config(cfg)
-#TG|    except ValueError as exc:
-#TG|        raise SystemExit(str(exc)) from exc
-#TG|    users_path = Path(cfg.get("USER_DB", str(DEFAULT_USERS)))
-#TG|    offset = 0
-#TG|    import concurrent.futures
-#TG|    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-#TG|        while True:
-#TG|            try:
-#TG|                result = tg_request(token, "getUpdates", {"timeout": "50", "offset": str(offset), "limit": "20"})
-#TG|                updates = result.get("result", [])
-#TG|                if updates:
-#TG|                    offset = max(int(item["update_id"]) for item in updates) + 1
-#TG|                    tg_request(token, "getUpdates", {"timeout": "0", "offset": str(offset), "limit": "1"})
-#TG|                    for update in updates:
-#TG|                        pool.submit(handle_message, token, config_path, cfg, update.get("message") or {}, users_path)
-#TG|            except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
-#TG|                print(f"bot: {exc}", flush=True)
-#TG|                time.sleep(2)
-#TG|
-#TG|
-#TG|def main() -> None:
-#TG|    parser = argparse.ArgumentParser()
-#TG|    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-#TG|    args = parser.parse_args()
-#TG|    run_bot(args.config)
-#TG|
-#TG|
-#TG|if __name__ == "__main__":
-#TG|    main()
-###__END_SBOX_TG_BOT_PY__###
