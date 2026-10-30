@@ -1,5 +1,5 @@
 #!/bin/bash
-# VLESS / sing-box 轻量节点控制台 (Debian & Alpine 双支持版)
+# VLESS / sing-box 轻量节点控制台 (Debian & Alpine 深度双兼容版)
 # 支持协议: Reality + Shadowsocks + WS(CF) + AnyTLS
 # 支持功能: 节点搭建 / 增删协议 / 用户生命周期与到期管理
 
@@ -45,6 +45,8 @@ if [[ ! -f "$0" || "$0" == /proc/* || "$0" == /dev/fd/* ]]; then
     mkdir -p "$(dirname "$_SBOX_REAL")" 2>/dev/null
     if curl -fsSL "$_SBOX_SCRIPT_URL" -o "$_SBOX_REAL" 2>/dev/null && [[ -s "$_SBOX_REAL" ]]; then
         chmod +x "$_SBOX_REAL"
+        cp -f "$_SBOX_REAL" /usr/local/bin/c 2>/dev/null
+        chmod +x /usr/local/bin/c 2>/dev/null
         exec bash "$_SBOX_REAL" "$@"
     fi
 fi
@@ -72,10 +74,10 @@ sbox_service_ctrl() {
         case "$action" in
             start)   rc-service "$SERVICE_NAME" start ;;
             stop)    rc-service "$SERVICE_NAME" stop 2>/dev/null ;;
-            restart) rc-service "$SERVICE_NAME" restart ;;
+            restart) rc-service "$SERVICE_NAME" restart 2>/dev/null || rc-service "$SERVICE_NAME" start ;;
             enable)  rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 ;;
             disable) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 ;;
-            status)  rc-service "$SERVICE_NAME" status 2>/dev/null | grep -qi "started" ;;
+            status)  rc-service "$SERVICE_NAME" status 2>/dev/null | grep -qi "started" || pgrep -x "sing-box" >/dev/null 2>&1 ;;
         esac
     else
         case "$action" in
@@ -89,7 +91,7 @@ sbox_service_ctrl() {
     fi
 }
 
-# ============== 时区与时间工具（Python 跨平台处理） ==============
+# ============== 时区与时间工具 ==============
 set_shanghai_timezone() {
     title "设置系统时区"
     if [[ "$OS_TYPE" == "alpine" ]]; then
@@ -100,7 +102,7 @@ set_shanghai_timezone() {
         echo "Asia/Shanghai" > /etc/timezone
         info "时区已设置为 Asia/Shanghai"
     else
-        warn "未找到 tzdata，跳过时区强制变更"
+        warn "未找到 tzdata，保留默认时区"
     fi
 }
 
@@ -140,7 +142,7 @@ expire_display() {
     fi
 }
 
-# ============== 端口探测工具（基于 Python，不依赖系统工具） ==============
+# ============== 端口探测工具 ==============
 check_port() {
     python3 -c "
 import socket, sys
@@ -193,7 +195,6 @@ get_user_field() {
 }
 
 # ============== 用户数据库标准化 ==============
-# 格式: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS
 normalize_user_db() {
     [[ ! -f "$USER_DB" ]] && return 0
     python3 - <<PYEOF
@@ -295,7 +296,7 @@ validate_sbox_config() {
         error "config.json 格式有误"
         return 1
     }
-    detect_sbox_bin || { error "未找到 sing-box 可执行程序"; return 1; }
+    detect_sbox_bin || { error "未找到可执行的 sing-box 程序"; return 1; }
     local OUT
     OUT=$("$SBOX_BIN" check -c "$SBOX_CONFIG" 2>&1)
     if [[ $? -ne 0 ]]; then
@@ -311,7 +312,7 @@ _start_sbox() {
     sbox_service_ctrl restart
     sleep 1
     if sbox_service_ctrl status; then
-        info "sing-box 运行中"
+        info "sing-box 服务已启动"
         return 0
     else
         error "sing-box 启动失败"
@@ -324,19 +325,20 @@ install_deps() {
     title "安装基础依赖..."
     if [[ "$OS_TYPE" == "alpine" ]]; then
         apk update
-        apk add --no-cache curl openssl python3 bash tzdata ca-certificates
+        apk add --no-cache curl openssl python3 bash tzdata ca-certificates tar gzip
     else
         apt-get update -qq
-        apt-get install -y -qq curl openssl python3 tzdata ca-certificates
+        apt-get install -y -qq curl openssl python3 tzdata ca-certificates tar gzip
     fi
     info "依赖安装完成"
 }
 
-# ============== sing-box 安装与服务生成 ==============
+# ============== sing-box 下载与安装 (Alpine musl 静态版兼容) ==============
 install_sbox() {
     title "安装 sing-box..."
     if detect_sbox_bin; then
-        warn "sing-box 已安装，跳过下载"
+        warn "sing-box 已存在，跳过重复下载: $("$SBOX_BIN" version | head -n1)"
+        setup_service_daemon
         return 0
     fi
     install_deps || return 1
@@ -349,32 +351,72 @@ install_sbox() {
         *) error "不支持的 CPU 架构: $(uname -m)"; return 1 ;;
     esac
 
-    info "正在拉取最新静态编译二进制..."
+    info "正在拉取最新版本信息..."
     local VER
     VER=$(curl -fsSL --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
           | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name","").lstrip("v"))' 2>/dev/null)
+    [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && VER="1.14.4"
 
-    if [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-        VER="1.11.4" # 回退兜底稳定版本
+    # Alpine 采用专用的 musl 静态编译包，Debian 采用标准包
+    local SUFFIX=""
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        SUFFIX="-musl"
     fi
 
-    local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}.tar.gz"
-    info "下载: $URL"
-    curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败，请检查网络"; return 1; }
-    tar -xzf /tmp/sing-box.tar.gz -C /tmp/
-    mkdir -p /usr/local/bin "$SBOX_DIR"
-    cp "/tmp/sing-box-${VER}-linux-${ARCH}/sing-box" "$SBOX_BIN"
-    chmod +x "$SBOX_BIN"
-    rm -rf /tmp/sing-box.tar.gz "/tmp/sing-box-${VER}-linux-${ARCH}"
+    local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}${SUFFIX}.tar.gz"
+    info "下载目标: $URL"
+    rm -f /tmp/sing-box.tar.gz
+    if ! curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || [[ ! -s /tmp/sing-box.tar.gz ]]; then
+        # 兜底：若带 -musl 下载失败，尝试无 -musl
+        if [[ -n "$SUFFIX" ]]; then
+            warn "musl 包下载受阻，尝试回退通用包..."
+            URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}.tar.gz"
+            curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败，请检查服务器网络"; return 1; }
+        else
+            error "下载失败，请检查服务器网络"; return 1
+        fi
+    fi
 
-    # 安装系统守护服务
+    # 解压并定位二进制
+    rm -rf /tmp/sbox_extract
+    mkdir -p /tmp/sbox_extract
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp/sbox_extract/ || { error "解压失败"; return 1; }
+
+    local BIN_FOUND
+    BIN_FOUND=$(find /tmp/sbox_extract -type f -name "sing-box" | head -n 1)
+
+    if [[ -n "$BIN_FOUND" && -f "$BIN_FOUND" ]]; then
+        mkdir -p /usr/local/bin "$SBOX_DIR"
+        cp -f "$BIN_FOUND" /usr/local/bin/sing-box
+        chmod +x /usr/local/bin/sing-box
+        SBOX_BIN="/usr/local/bin/sing-box"
+    else
+        error "未在解压包中找到 sing-box 文件"
+        rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract
+        return 1
+    fi
+    rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract
+
+    setup_service_daemon
+
+    if ! detect_sbox_bin; then
+        error "安装校验失败，执行测试输出："
+        "$SBOX_BIN" version 2>&1
+        return 1
+    fi
+    info "sing-box 安装成功: $("$SBOX_BIN" version | head -n1)"
+    return 0
+}
+
+setup_service_daemon() {
+    mkdir -p "$SBOX_DIR"
     if [[ "$OS_TYPE" == "alpine" ]]; then
-        cat > /etc/init.d/sing-box <<'EOF'
+        cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
 name="sing-box"
 description="sing-box service"
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
+command="${SBOX_BIN}"
+command_args="run -c ${SBOX_CONFIG}"
 command_background="yes"
 pidfile="/run/sing-box.pid"
 output_log="/var/log/sing-box.log"
@@ -404,22 +446,19 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
     fi
-
-    detect_sbox_bin || { error "安装校验失败"; return 1; }
-    info "sing-box 安装成功: $("$SBOX_BIN" version | head -n1)"
 }
 
 # ============== 生成 Reality 密钥对 ==============
 gen_keypair() {
     PRIVATE_KEY=""
     PUBLIC_KEY=""
-    detect_sbox_bin || { error "未找到 sing-box 可执行文件"; return 1; }
+    detect_sbox_bin || { error "未找到 sing-box 程序，请先执行安装"; return 1; }
     local OUT
     OUT=$("$SBOX_BIN" generate reality-keypair 2>&1)
     PRIVATE_KEY=$(echo "$OUT" | awk -F': ' '/PrivateKey/I {print $2}' | tr -d ' \r\n')
     PUBLIC_KEY=$(echo "$OUT" | awk -F': ' '/PublicKey/I {print $2}' | tr -d ' \r\n')
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "Reality 密钥生成失败"
+        error "Reality 密钥生成失败: $OUT"
         return 1
     fi
 }
@@ -564,7 +603,7 @@ _inject_all_users() {
     done < "$USER_DB"
 }
 
-# ============== 协议配置模块 ==============
+# ============== 协议配置 ==============
 init_reality() {
     title "配置 VLESS + Reality"
     gen_keypair || return 1
@@ -668,8 +707,9 @@ EOF
     info "AnyTLS 配置完成！"
 }
 
-# ============== 节点管理总菜单 ==============
+# ============== 节点管理菜单 ==============
 init_config() {
+    detect_sbox_bin || { error "未检测到 sing-box，请先执行选项 1 进行安装"; return 1; }
     title "节点协议管理"
     mkdir -p "$SBOX_DIR"
     touch "$USER_DB" && chmod 600 "$USER_DB"
@@ -797,7 +837,6 @@ delete_user() {
     if ! user_exists "$USERNAME"; then error "用户不存在"; return; fi
 
     UUID=$(get_user_field "$USERNAME" 2)
-    # 从配置文件中删除
     python3 - <<PYEOF
 import json
 with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
@@ -808,7 +847,6 @@ for inbound in cfg.get("inbounds", []):
 with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
-    # 从数据库中剔除
     python3 - <<PYEOF
 from pathlib import Path
 p = Path("$USER_DB")
@@ -833,7 +871,6 @@ toggle_user() {
     NODE=$(get_user_field "$USERNAME" 5)
 
     if [[ "$ACTION" == "disable" ]]; then
-        # 从配置中摘掉
         python3 - <<PYEOF
 import json
 with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
@@ -853,7 +890,6 @@ PYEOF
         sbox_service_ctrl restart
         info "用户 ${USERNAME} 已禁用"
     else
-        # 启用
         local NOW_TS EXP_TS
         NOW_TS=$(now_shanghai_ts)
         EXP_TS=$(expire_to_ts "$EXPIRE")
@@ -942,7 +978,7 @@ show_user_link() {
     _print_link "$USERNAME" "$UUID" "$EXPIRE" "$NODE"
 }
 
-# ============== 到期检测（定时任务执行） ==============
+# ============== 到期检测 ==============
 check_expire() {
     normalize_user_db
     local NOW_TS
@@ -974,7 +1010,6 @@ out = []
 for l in lines:
     parts = l.split(":")
     if len(parts) >= 4 and parts[3] == "active":
-        # 解析时间
         import datetime
         exp = parts[2]
         ts = 0
@@ -1002,7 +1037,6 @@ PYEOF
     fi
 }
 
-# ============== 定时任务自动挂载 ==============
 setup_cron() {
     local CRON_CMD="*/10 * * * * /usr/local/bin/singbox_manager.sh --check-expire >/dev/null 2>&1"
     (crontab -l 2>/dev/null | grep -v "check-expire"; echo "$CRON_CMD") | crontab -
@@ -1013,18 +1047,18 @@ setup_cron() {
     info "到期自动检查计划已配置 (每10分钟自动扫描)"
 }
 
-# ============== 快捷命令 c 安装 ==============
 install_shortcut() {
     local TARGET="/usr/local/bin/singbox_manager.sh"
-    if [[ "$0" != "$TARGET" && "$0" != "/usr/local/bin/c" ]]; then
-        cat "$0" > "$TARGET" 2>/dev/null
+    if [[ -f "$0" && "$0" != /proc/* && "$0" != /dev/fd/* && "$0" != "$TARGET" ]]; then
+        cp -f "$0" "$TARGET" 2>/dev/null
         chmod +x "$TARGET"
     fi
-    cp -f "$TARGET" /usr/local/bin/c 2>/dev/null
-    chmod +x /usr/local/bin/c 2>/dev/null
+    if [[ -f "$TARGET" && "$TARGET" != "/usr/local/bin/c" ]]; then
+        cp -f "$TARGET" /usr/local/bin/c 2>/dev/null
+        chmod +x /usr/local/bin/c 2>/dev/null
+    fi
 }
 
-# ============== 节点运行状态 ==============
 show_info() {
     title "服务与节点状态"
     local S_STATUS
@@ -1050,7 +1084,6 @@ show_info() {
     echo ""
 }
 
-# ============== 在线更新管理脚本 ==============
 update_script() {
     title "更新控制台管理脚本"
     local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
@@ -1074,7 +1107,6 @@ update_script() {
     fi
 }
 
-# ============== 卸载清理 ==============
 uninstall_all() {
     title "卸载服务与清理"
     read -rp "确定彻底卸载 sing-box 及其所有用户配置？[y/N]: " CONFIRM
@@ -1093,13 +1125,11 @@ uninstall_all() {
     exit 0
 }
 
-# ============== 外部 CLI 参数调用 ==============
 if [[ "$1" == "--check-expire" ]]; then
     check_expire
     exit 0
 fi
 
-# ============== 主控制菜单 ==============
 main_menu() {
     install_shortcut
     while true; do
@@ -1146,7 +1176,7 @@ main_menu() {
         read -r CHOICE
 
         case $CHOICE in
-            1)  set_shanghai_timezone; install_sbox; init_config; setup_cron ;;
+            1)  set_shanghai_timezone && install_sbox && init_config && setup_cron ;;
             2)  init_config ;;
             3)  show_info ;;
             4)  add_user ;;
@@ -1168,5 +1198,4 @@ main_menu() {
     done
 }
 
-# 脚本入口
 main_menu
