@@ -1,7 +1,11 @@
 #!/bin/bash
-# VLESS / sing-box 轻量节点控制台 (Debian & Alpine 深度双兼容版)
-# 支持协议: Reality + Shadowsocks + WS(CF) + AnyTLS
-# 支持功能: 节点搭建 / 增删协议 / 用户生命周期与到期管理
+# ============================================================
+# VLESS / sing-box 智能控制台
+# 版本: v2.1.0 (Debian / Alpine 双支持)
+# 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b
+# ============================================================
+
+SCRIPT_VERSION="v2.1.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,12 +42,12 @@ read_kv() {
     awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file"
 }
 
-# ============== 自下载修复（保持管道与本地执行一致） ==============
-_SBOX_SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
+# ============== 自下载修复（带时间戳防止 GitHub CDN 缓存） ==============
+_SBOX_SCRIPT_BASE="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
 _SBOX_REAL="/usr/local/bin/singbox_manager.sh"
 if [[ ! -f "$0" || "$0" == /proc/* || "$0" == /dev/fd/* ]]; then
     mkdir -p "$(dirname "$_SBOX_REAL")" 2>/dev/null
-    if curl -fsSL "$_SBOX_SCRIPT_URL" -o "$_SBOX_REAL" 2>/dev/null && [[ -s "$_SBOX_REAL" ]]; then
+    if curl -fsSL "${_SBOX_SCRIPT_BASE}?t=$(date +%s)" -o "$_SBOX_REAL" 2>/dev/null && [[ -s "$_SBOX_REAL" ]]; then
         chmod +x "$_SBOX_REAL"
         cp -f "$_SBOX_REAL" /usr/local/bin/c 2>/dev/null
         chmod +x /usr/local/bin/c 2>/dev/null
@@ -333,9 +337,9 @@ install_deps() {
     info "依赖安装完成"
 }
 
-# ============== sing-box 下载与安装 (Alpine musl 静态版兼容) ==============
+# ============== sing-box 下载与安装 ==============
 install_sbox() {
-    title "安装 sing-box..."
+    title "安装 sing-box (${SCRIPT_VERSION})..."
     if detect_sbox_bin; then
         warn "sing-box 已存在，跳过重复下载: $("$SBOX_BIN" version | head -n1)"
         setup_service_daemon
@@ -357,17 +361,17 @@ install_sbox() {
           | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name","").lstrip("v"))' 2>/dev/null)
     [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && VER="1.14.4"
 
-    # Alpine 采用专用的 musl 静态编译包，Debian 采用标准包
+    # Alpine 系统强制使用 musl 纯静态编译版本
     local SUFFIX=""
     if [[ "$OS_TYPE" == "alpine" ]]; then
         SUFFIX="-musl"
+        info "检测到 Alpine Linux，自动使用专用静态 musl 版本"
     fi
 
     local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}${SUFFIX}.tar.gz"
-    info "下载目标: $URL"
+    info "下载地址: $URL"
     rm -f /tmp/sing-box.tar.gz
     if ! curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || [[ ! -s /tmp/sing-box.tar.gz ]]; then
-        # 兜底：若带 -musl 下载失败，尝试无 -musl
         if [[ -n "$SUFFIX" ]]; then
             warn "musl 包下载受阻，尝试回退通用包..."
             URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}.tar.gz"
@@ -377,7 +381,6 @@ install_sbox() {
         fi
     fi
 
-    # 解压并定位二进制
     rm -rf /tmp/sbox_extract
     mkdir -p /tmp/sbox_extract
     tar -xzf /tmp/sing-box.tar.gz -C /tmp/sbox_extract/ || { error "解压失败"; return 1; }
@@ -391,7 +394,7 @@ install_sbox() {
         chmod +x /usr/local/bin/sing-box
         SBOX_BIN="/usr/local/bin/sing-box"
     else
-        error "未在解压包中找到 sing-box 文件"
+        error "未在解压包中找到 sing-box 二进制文件"
         rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract
         return 1
     fi
@@ -400,7 +403,7 @@ install_sbox() {
     setup_service_daemon
 
     if ! detect_sbox_bin; then
-        error "安装校验失败，执行测试输出："
+        error "安装校验失败，运行测试输出："
         "$SBOX_BIN" version 2>&1
         return 1
     fi
@@ -452,7 +455,7 @@ EOF
 gen_keypair() {
     PRIVATE_KEY=""
     PUBLIC_KEY=""
-    detect_sbox_bin || { error "未找到 sing-box 程序，请先执行安装"; return 1; }
+    detect_sbox_bin || { error "未找到 sing-box 程序，请先执行选项 1 安装"; return 1; }
     local OUT
     OUT=$("$SBOX_BIN" generate reality-keypair 2>&1)
     PRIVATE_KEY=$(echo "$OUT" | awk -F': ' '/PrivateKey/I {print $2}' | tr -d ' \r\n')
@@ -1071,10 +1074,11 @@ show_info() {
     [[ -f "$USER_DB" ]] && U_COUNT=$(wc -l < "$USER_DB")
     [[ -f "$USER_DB" ]] && A_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
-    echo -e "  系统环境 : ${CYAN}${OS_TYPE}${NC}"
-    echo -e "  服务状态 : ${S_STATUS}"
-    echo -e "  用户统计 : 共 ${U_COUNT} 个 (活跃: ${A_COUNT})"
-    echo -e "  公网 IP  : $(get_public_ip)"
+    echo -e "  控制台版本: ${CYAN}${SCRIPT_VERSION}${NC}"
+    echo -e "  系统环境  : ${CYAN}${OS_TYPE}${NC}"
+    echo -e "  服务状态  : ${S_STATUS}"
+    echo -e "  用户统计  : 共 ${U_COUNT} 个 (活跃: ${A_COUNT})"
+    echo -e "  公网 IP   : $(get_public_ip)"
     echo ""
     load_meta
     has_reality     && echo -e "  ${GREEN}✓${NC} Reality 端口: ${REALITY_PORT} | SNI: ${REALITY_SNI}"
@@ -1086,12 +1090,12 @@ show_info() {
 
 update_script() {
     title "更新控制台管理脚本"
-    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b"
+    local SCRIPT_URL="https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b?t=$(date +%s)"
     info "正在从 GitHub 下载最新版本..."
     local TMP_F="/tmp/sbox_mgr_new.sh"
     rm -f "$TMP_F"
     if curl -fsSL "$SCRIPT_URL" -o "$TMP_F" && [[ -s "$TMP_F" ]]; then
-        if ! head -n 5 "$TMP_F" | grep -q "sing-box"; then
+        if ! head -n 10 "$TMP_F" | grep -q "sing-box"; then
             error "拉取的内容非合法脚本，更新取消"
             rm -f "$TMP_F"; return
         fi
@@ -1151,7 +1155,7 @@ main_menu() {
         [[ -f "$USER_DB" ]] && U_ACT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}   ${CYAN}sing-box 极简控制台 (Debian/Alpine)${NC}        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}   ${CYAN}sing-box 极简控制台 (Debian/Alpine) ${GREEN}${SCRIPT_VERSION}${NC} ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}   系统: ${GREEN}${OS_TYPE}${NC}  状态: ${S_STATUS}               ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}   节点: ${YELLOW}${PROTO_LIST}${NC}                          ${BLUE}║${NC}"
