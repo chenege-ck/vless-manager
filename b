@@ -1,11 +1,17 @@
 #!/bin/bash
 # ============================================================
 # VLESS / sing-box 智能控制台
-# 版本: v2.2.0 (Debian / Alpine 双支持)
+# 版本: v2.2.1 (Debian / Alpine 双支持)
 # 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/b
+# v2.2.1 修复: init_ws_cf() 中 `local PATH` 覆盖了系统 $PATH，
+#   导致 check_port() 里 command -v ss/netstat/python3 全部找不到，
+#   兜底分支永远返回 1，任何端口都被误报“已被占用”。
+#   修复：WS 路径变量改名 PATH -> WS_PATH；check_port 改用
+#   Python 绑定测试（内核级，不依赖 ss 文本解析）为主，
+#   并用绝对路径兜底，不再依赖 $PATH。
 # ============================================================
 
-SCRIPT_VERSION="v2.2.0"
+SCRIPT_VERSION="v2.2.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -146,24 +152,73 @@ expire_display() {
     fi
 }
 
-# ============== 端口探测工具（原生 ss / netstat 优先，无缩进隐患） ==============
+# ============== 端口探测工具 ==============
+# 返回值: 0 = 端口空闲可用, 1 = 已被占用或无效
+# v2.2.1: 不再只依赖 ss 文本 grep。优先用 Python 绑定测试（内核级判定，
+#   不解析 ss 输出，不怕 ss 格式/列数差异）；ss 只做兜底，且用绝对路径
+#   查找，不依赖 $PATH（防止再次被 local PATH 之类的问题破坏）。
 check_port() {
     local port="$1"
     # 基础格式校验
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
 
-    # 1. 优先使用 ss
-    if command -v ss >/dev/null 2>&1; then
-        ss -tln 2>/dev/null | grep -qE "[:.]${port}([[:space:]]|$)" && return 1 || return 0
+    # 1. 优先：Python 绑定测试（IPv4 + IPv6 各试一次）
+    #    只有 EADDRINUSE 才算占用；协议栈不可用等错误忽略该协议族。
+    #    SO_REUSEADDR 只忽略 TIME_WAIT，不会抢走已 LISTEN 的端口。
+    local py_bin=""
+    for py_bin in "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3; do
+        [[ -n "$py_bin" && -x "$py_bin" ]] && break
+        py_bin=""
+    done
+    if [[ -n "$py_bin" ]]; then
+        "$py_bin" - "$port" <<'PYEOF' 2>/dev/null
+import errno, socket, sys
+port = int(sys.argv[1])
+occupied = False
+for family, addr in ((socket.AF_INET, ("0.0.0.0", port)),
+                      (socket.AF_INET6, ("::", port))):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        s.close()
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            occupied = True
+        # EADDRNOTAVAIL / EAFNOSUPPORT 等：该协议栈不可用，忽略
+        pass
+sys.exit(1 if occupied else 0)
+PYEOF
+        return $?
     fi
 
-    # 2. Alpine 默认自带的 Busybox netstat
-    if command -v netstat >/dev/null 2>&1; then
-        netstat -tln 2>/dev/null | grep -qE "[:.]${port}([[:space:]]|$)" && return 1 || return 0
+    # 2. 兜底：ss 精确匹配（-H 去表头，awk 取最后一个冒号后的端口做数值比较，
+    #    避免 grep 子串误判，例如 2151 不应匹配 21510）
+    local ss_bin=""
+    for ss_bin in "$(command -v ss 2>/dev/null)" /usr/bin/ss /bin/ss /usr/sbin/ss /sbin/ss; do
+        [[ -n "$ss_bin" && -x "$ss_bin" ]] && break
+        ss_bin=""
+    done
+    if [[ -n "$ss_bin" ]]; then
+        "$ss_bin" -tlnH 2>/dev/null | awk -v p="$port" '
+            { for (i=1; i<=NF; i++) { n=split($i, a, ":"); if (n>1 && a[n]==p) found=1 } }
+            END { exit !found }' && return 1 || return 0
     fi
 
-    # 3. 兜底方案：纯单行 Python 绑定测试
-    python3 -c "import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('',int(sys.argv[1]))); s.close()" "$port" 2>/dev/null && return 0 || return 1
+    # 3. 兜底：netstat 精确匹配
+    local ns_bin=""
+    for ns_bin in "$(command -v netstat 2>/dev/null)" /usr/bin/netstat /bin/netstat; do
+        [[ -n "$ns_bin" && -x "$ns_bin" ]] && break
+        ns_bin=""
+    done
+    if [[ -n "$ns_bin" ]]; then
+        "$ns_bin" -tln 2>/dev/null | awk -v p="$port" '
+            { for (i=1; i<=NF; i++) { n=split($i, a, ":"); if (n>1 && a[n]==p) found=1 } }
+            END { exit !found }' && return 1 || return 0
+    fi
+
+    # 没有任何可用探测手段：按占用处理，避免撞端口导致 sing-box 起不来
+    return 1
 }
 
 # ============== 公网 IP 获取 ==============
@@ -667,7 +722,12 @@ EOF
 
 init_ws_cf() {
     title "配置 VLESS + WS + TLS"
-    local PORT PATH DOMAIN
+    # v2.2.1 修复：这里原来是 `local PORT PATH DOMAIN`，
+    # `local PATH` 会把系统 $PATH 清空（见复现测试），导致
+    # check_port() 找不到 ss/netstat/python3，任何端口都误报占用，
+    # 而且后面的 openssl / mkdir 也会因 $PATH 为空而失败。
+    # WS 路径变量改名 WS_PATH，与 load_meta / rebuild_config 保持一致。
+    local PORT WS_PATH DOMAIN
     while true; do
         read -rp "监听端口 [默认 8445]: " PORT
         PORT=${PORT:-8445}
@@ -677,8 +737,8 @@ init_ws_cf() {
             warn "端口 ${PORT} 已被占用或无效，请更换"
         fi
     done
-    read -rp "WS 路径 [默认 /vless]: " PATH
-    PATH=${PATH:-/vless}
+    read -rp "WS 路径 [默认 /vless]: " WS_PATH
+    WS_PATH=${WS_PATH:-/vless}
     read -rp "已解析到本机的域名: " DOMAIN
     [[ -z "$DOMAIN" ]] && error "域名不能为空" && return 1
 
@@ -692,7 +752,7 @@ init_ws_cf() {
 
     cat > "$META_WS" <<EOF
 WS_PORT=${PORT}
-WS_PATH=${PATH}
+WS_PATH=${WS_PATH}
 WS_DOMAIN=${DOMAIN}
 WS_CF_PORT=${PORT}
 CERT_DIR=${CERT_DIR}
