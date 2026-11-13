@@ -1,5 +1,10 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v1.9.0
+# VLESS 智能节点控制台 (sing-box) v2.0.1
+# 更新: v2.0.1 删除菜单 11 更新 sing-box、菜单 13 更新 Hysteria；
+#   发现新版本请卸载后重装脚本（重装即拉取最新版），不再在脚本内原地更新
+# 更新: v2.0.0 (Debian 11/12/13 + Alpine 双支持；移除菜单 16 网络优化；
+#   服务控制/安装/时间/端口检查全部按系统分支；卸载改为真卸载)
+# 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a
 # Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
 RED='\033[0;31m'
@@ -46,8 +51,13 @@ validate_username() {
     [[ -z "$value" ]] && { error "用户名不能为空"; return 1; }
     [[ "$value" == *:* ]] && { error "用户名不能包含冒号"; return 1; }
     [[ "$value" == *[[:space:]]* ]] && { error "用户名不能包含空格或换行"; return 1; }
+    if [[ "$value" == *\"* || "$value" == *\'* || "$value" == *\$* || "$value" == *\`* || "$value" == *\\* || "$value" == */* || "$value" == *\;* || "$value" == *\|* || "$value" == *\&* || "$value" == *\<* || "$value" == *\>* || "$value" == *\(* || "$value" == *\)* ]]; then
+        error '用户名不能包含特殊字符'
+        return 1
+    fi
     local N
-    N=$(printf '%s' "$value" | python3 -c 'import sys; sys.stdout.write(str(len(sys.stdin.read())))')
+    N=$(printf '%s' "$value" | python3 -c 'import sys; sys.stdout.write(str(len(sys.stdin.read())))' 2>/dev/null || echo "${#value}")
+    [[ "$N" =~ ^[0-9]+$ ]] || N="${#value}"
     if (( N > 20 )); then
         error "用户名过长（最多 20 个字符，约 10 个汉字）"
         return 1
@@ -86,56 +96,154 @@ fi
 # ============== 权限检查 ==============
 [[ $EUID -ne 0 ]] && error "请用 root 运行此脚本" && exit 1
 
-# ============== 系统检查（仅 Debian） ==============
-check_system() {
-    local OS_ID CODENAME
-    OS_ID=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
-    CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
-    if [[ "$OS_ID" != "debian" ]]; then
-        error "本脚本仅支持 Debian 11/12/13，不支持当前系统"
+# ============== 系统检测（Debian / Alpine） ==============
+OS_TYPE=""
+detect_os() {
+    if [[ -f /etc/alpine-release ]] || grep -qi "alpine" /etc/os-release 2>/dev/null; then
+        OS_TYPE="alpine"
+    elif grep -qiE "ID=(debian|ubuntu)" /etc/os-release 2>/dev/null; then
+        OS_TYPE="debian"
+    else
+        error "仅支持 Debian 11/12/13 或 Alpine Linux，不支持当前系统"
         exit 1
     fi
-    case "$CODENAME" in
-        bullseye|bookworm|trixie) ;;
-        *) error "仅支持 Debian 11/12/13，当前: ${CODENAME:-unknown}"; exit 1 ;;
-    esac
 }
+
+check_system() {
+    detect_os
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        local CODENAME
+        CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+        case "$CODENAME" in
+            bullseye|bookworm|trixie) ;;
+            *) error "仅支持 Debian 11/12/13，当前: ${CODENAME:-unknown}"; exit 1 ;;
+        esac
+    else
+        info "Alpine Linux 已识别"
+    fi
+}
+
+# ============== 服务控制抽象（systemd / OpenRC） ==============
+# svc_ctrl <服务名> <start|stop|restart|enable|disable>
+svc_ctrl() {
+    local svc="$1" action="$2"
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        case "$action" in
+            start)   rc-service "$svc" start ;;
+            stop)    rc-service "$svc" stop 2>/dev/null ;;
+            restart) rc-service "$svc" restart 2>/dev/null || rc-service "$svc" start ;;
+            enable)  rc-update add "$svc" default >/dev/null 2>&1 ;;
+            disable) rc-update del "$svc" default >/dev/null 2>&1 ;;
+        esac
+    else
+        case "$action" in
+            start)   systemctl start "$svc" ;;
+            stop)    systemctl stop "$svc" 2>/dev/null ;;
+            restart) systemctl restart "$svc" ;;
+            enable)  systemctl enable "$svc" >/dev/null 2>&1 ;;
+            disable) systemctl disable "$svc" >/dev/null 2>&1 ;;
+        esac
+    fi
+}
+# svc_active <服务名> : 0=运行中
+svc_active() {
+    local svc="$1" proc="$svc"
+    [[ "$svc" == "hysteria-server" ]] && proc="hysteria"
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        rc-service "$svc" status 2>/dev/null | grep -qi "started" && return 0
+        pgrep -x "$proc" >/dev/null 2>&1
+    else
+        systemctl is-active --quiet "$svc"
+    fi
+}
+svc_reload_daemon() {
+    [[ "$OS_TYPE" == "alpine" ]] && return 0
+    systemctl daemon-reload 2>/dev/null
+}
+# 供 Alpine / 回退安装路径写服务文件，ExecStart 用当前实际二进制路径
+setup_service_daemon() {
+    mkdir -p "$SBOX_DIR"
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        cat > /etc/init.d/sing-box <<EOF
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box service"
+command="${SBOX_BIN}"
+command_args="run -c ${SBOX_CONFIG}"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.err"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod +x /etc/init.d/sing-box
+    else
+        cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=${SBOX_BIN} run -c ${SBOX_CONFIG}
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+detect_os
 
 # ============== 设置上海时区 ==============
 set_shanghai_timezone() {
     title "设置系统时区"
-    if command -v timedatectl >/dev/null 2>&1; then
-        timedatectl set-timezone Asia/Shanghai 2>/dev/null
-    else
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        apk add --no-cache tzdata >/dev/null 2>&1
+    fi
+    if [[ -f /usr/share/zoneinfo/Asia/Shanghai ]]; then
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
         echo "Asia/Shanghai" > /etc/timezone
-    fi
-    if [[ "$(readlink -f /etc/localtime 2>/dev/null)" == "/usr/share/zoneinfo/Asia/Shanghai" ]]; then
         info "系统时区已设置为 Asia/Shanghai"
     else
-        warn "时区设置可能未生效，请手动执行: timedatectl set-timezone Asia/Shanghai"
+        warn "未找到 tzdata（/usr/share/zoneinfo/Asia/Shanghai），保留默认时区"
     fi
 }
 
 # ============== 上海时间工具 ==============
-now_shanghai_ts() { TZ=Asia/Shanghai date +%s; }
+# 时间一律用 Python 算，不依赖 GNU date -d（BusyBox date 语法不同）
+now_shanghai_ts() { python3 -c 'import time; print(int(time.time()))' 2>/dev/null || date +%s; }
 
 expire_noon_str() {
     local days="$1"
-    TZ=Asia/Shanghai date -d "+${days} days 12:00:00" "+%Y-%m-%d_%H-%M-%S" 2>/dev/null
+    python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))) + datetime.timedelta(days=int('$days'))).strftime('%Y-%m-%d_12-00-00'))" 2>/dev/null
 }
 
 expire_to_ts() {
     local expire="$1"
-    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
-        local d="${expire%%_*}" t="${expire#*_}"
-        TZ=Asia/Shanghai date -d "${d} ${t//-/:}" +%s 2>/dev/null; return
-    fi
-    if [[ "$expire" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        TZ=Asia/Shanghai date -d "${expire} 12:00:00" +%s 2>/dev/null; return
-    fi
-    local normalized="${expire/T/ }"
-    TZ=Asia/Shanghai date -d "$normalized" +%s 2>/dev/null
+    python3 - "$expire" <<'PYEOF' 2>/dev/null
+import datetime, sys
+exp = sys.argv[1].strip()
+tz = datetime.timezone(datetime.timedelta(hours=8))
+for fmt in ('%Y-%m-%d_%H-%M-%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+    try:
+        dt = datetime.datetime.strptime(exp, fmt)
+        if fmt == '%Y-%m-%d':
+            dt = dt.replace(hour=12, minute=0, second=0)
+        print(int(dt.replace(tzinfo=tz).timestamp()))
+        sys.exit(0)
+    except Exception:
+        pass
+print(0)
+PYEOF
 }
 
 expire_display() {
@@ -154,19 +262,98 @@ expire_display() {
 # ============== 获取公网 IP ==============
 get_public_ip() {
     local ip=""
-    ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
-    [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)
-    [[ -z "$ip" ]] && ip=$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)
+    local cand=""
+    for cand in "$(curl -s4 --max-time 5 ip.sb 2>/dev/null)" "$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null)" "$(curl -s4 --max-time 5 api.ipify.org 2>/dev/null)"; do
+        if [[ "$cand" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then ip="$cand"; break; fi
+    done
     if [[ -z "$ip" ]]; then
-        ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
-        [[ -z "$ip" ]] && ip=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)
+        for cand in "$(curl -s6 --max-time 5 ip.sb 2>/dev/null)" "$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null)"; do
+            if [[ "$cand" == *:* ]]; then ip="$cand"; break; fi
+        done
     fi
     echo "${ip:-<请手动填写服务器IP>}"
 }
 
 # ============== 端口检查 ==============
-check_port()     { ss -tlnp | grep -q ":${1} " && return 1 || return 0; }
-check_port_udp() { ss -ulnp | grep -q ":${1} " && return 1 || return 0; }
+# 端口检查：优先 Python 绑定测试（内核级，不解析 ss 文本；只有 EADDRINUSE 算占用）
+# 兜底 ss 精确匹配（awk 数值比较，2151 不会匹配 21510）；无任何手段时按占用处理
+check_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
+    local py_bin=""
+    for py_bin in "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3; do
+        [[ -n "$py_bin" && -x "$py_bin" ]] && break
+        py_bin=""
+    done
+    if [[ -n "$py_bin" ]]; then
+        "$py_bin" - "$port" <<'PYEOF' 2>/dev/null
+import errno, socket, sys
+port = int(sys.argv[1])
+occupied = False
+for family, addr in ((socket.AF_INET, ("0.0.0.0", port)),
+                      (socket.AF_INET6, ("::", port))):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        s.close()
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            occupied = True
+        pass
+sys.exit(1 if occupied else 0)
+PYEOF
+        return $?
+    fi
+    local ss_bin=""
+    for ss_bin in "$(command -v ss 2>/dev/null)" /usr/bin/ss /bin/ss /usr/sbin/ss /sbin/ss; do
+        [[ -n "$ss_bin" && -x "$ss_bin" ]] && break
+        ss_bin=""
+    done
+    if [[ -n "$ss_bin" ]]; then
+        "$ss_bin" -tlnH 2>/dev/null | awk -v p="$port" '{ for (i=1; i<=NF; i++) { n=split($i, a, ":"); if (n>1 && a[n]==p) found=1 } } END { exit !found }' && return 1 || return 0
+    fi
+    return 1
+}
+check_port_udp() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
+    local py_bin=""
+    for py_bin in "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3; do
+        [[ -n "$py_bin" && -x "$py_bin" ]] && break
+        py_bin=""
+    done
+    if [[ -n "$py_bin" ]]; then
+        "$py_bin" - "$port" <<'PYEOF' 2>/dev/null
+import errno, socket, sys
+port = int(sys.argv[1])
+occupied = False
+for family, addr in ((socket.AF_INET, ("0.0.0.0", port)),
+                      (socket.AF_INET6, ("::", port))):
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.bind(addr)
+        s.close()
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            occupied = True
+        pass
+sys.exit(1 if occupied else 0)
+PYEOF
+        return $?
+    fi
+    local ss_bin=""
+    for ss_bin in "$(command -v ss 2>/dev/null)" /usr/bin/ss /bin/ss /usr/sbin/ss /sbin/ss; do
+        [[ -n "$ss_bin" && -x "$ss_bin" ]] && break
+        ss_bin=""
+    done
+    if [[ -n "$ss_bin" ]]; then
+        "$ss_bin" -ulnH 2>/dev/null | awk -v p="$port" '{ for (i=1; i<=NF; i++) { n=split($i, a, ":"); if (n>1 && a[n]==p) found=1 } } END { exit !found }' && return 1 || return 0
+    fi
+    return 1
+}
+# 统一的 base64 单行编码（BusyBox base64 没有 -w 参数）
+b64_nw() { base64 | tr -d '\r\n'; }
 
 # ============== 用户数据库格式化 ==============
 # 格式: NAME:UUID:EXPIRE:STATUS:NODE:SSPASS（旧版多出的流量字段会被自动丢弃）
@@ -273,15 +460,17 @@ has_anytls()      { [[ -f "$META_ANYTLS" ]]; }
 validate_sbox_config() {
     [[ ! -f "$SBOX_CONFIG" ]] && error "配置文件不存在: $SBOX_CONFIG" && return 1
     python3 -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$SBOX_CONFIG" >/dev/null 2>&1
-    if [[ $? -ne 0 ]]; then
+    local _json_rc=$?
+    if [[ $_json_rc -ne 0 ]]; then
         error "config.json 不是合法 JSON"; return 1
     fi
     if [[ ! -x "$SBOX_BIN" ]]; then
         detect_sbox_bin || { error "未找到 sing-box 可执行文件（已查找 /usr/local/bin、/usr/bin、PATH）"; return 1; }
     fi
-    local VALIDATE_OUTPUT
+    local VALIDATE_OUTPUT VALIDATE_RC
     VALIDATE_OUTPUT=$("$SBOX_BIN" check -c "$SBOX_CONFIG" 2>&1)
-    if [[ $? -ne 0 ]]; then
+    VALIDATE_RC=$?
+    if [[ $VALIDATE_RC -ne 0 ]]; then
         error "sing-box 配置校验失败:"
         echo "$VALIDATE_OUTPUT" | while IFS= read -r line; do
             echo -e "  ${RED}${line}${NC}"
@@ -294,13 +483,17 @@ validate_sbox_config() {
 # ============== 启动 sing-box ==============
 _start_sbox() {
     validate_sbox_config || return 1
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl restart "$SERVICE_NAME"
+    svc_ctrl "$SERVICE_NAME" enable
+    svc_ctrl "$SERVICE_NAME" restart
     sleep 1
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if svc_active "$SERVICE_NAME"; then
         info "sing-box 已启动"; return 0
     else
-        error "sing-box 启动失败，运行 journalctl -u $SERVICE_NAME -n 20 查看日志"
+        if [[ "$OS_TYPE" == "alpine" ]]; then
+            error "sing-box 启动失败，查看: rc-service $SERVICE_NAME status; tail /var/log/sing-box.err"
+        else
+            error "sing-box 启动失败，运行 journalctl -u $SERVICE_NAME -n 20 查看日志"
+        fi
         return 1
     fi
 }
@@ -311,13 +504,19 @@ _start_sbox() {
 # ============================================================
 install_deps() {
     title "安装依赖..."
-    info "正在更新 apt 索引..."
-    if ! apt-get update -qq; then
-        warn "apt 更新失败，尝试自动修复软件源..."
-        fix_apt || return 1
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        apk update >/dev/null 2>&1
+        apk add --no-cache curl openssl python3 bash tzdata ca-certificates tar gzip iproute2 >/dev/null 2>&1
+        [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
+    else
+        info "正在更新 apt 索引..."
+        if ! apt-get update -qq; then
+            warn "apt 更新失败，尝试自动修复软件源..."
+            fix_apt || return 1
+        fi
+        apt-get install -y -qq curl openssl python3 tzdata ca-certificates tar gzip iproute2
+        [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
     fi
-    apt-get install -y -qq curl openssl python3
-    [[ $? -ne 0 ]] && error "依赖安装失败" && return 1
     info "依赖安装完成"
 }
 
@@ -325,6 +524,10 @@ install_deps() {
 # 修复 apt 源（仅 Debian 11/12/13）
 # ============================================================
 fix_apt() {
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        error "fix_apt 仅适用于 Debian，Alpine 请用 apk"
+        return 1
+    fi
     local CODENAME
     CODENAME=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
     [[ -z "$CODENAME" ]] && error "无法识别 Debian 版本" && return 1
@@ -390,63 +593,62 @@ install_sbox() {
     title "安装 sing-box..."
     if detect_sbox_bin; then
         warn "sing-box 已安装，跳过安装步骤"
+        setup_service_daemon
         return 0
     fi
     install_deps || return 1
 
-    info "正在下载 sing-box..."
-    bash <(curl -fsSL https://sing-box.app/deb-install.sh)
-    if ! detect_sbox_bin; then
-        # 备用：从 GitHub releases 手动安装
-        info "官方脚本安装失败，尝试从 GitHub releases 安装..."
-        local ARCH
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64)  ARCH="amd64" ;;
-            aarch64) ARCH="arm64" ;;
-            armv7l)  ARCH="armv7" ;;
-            *) error "不支持的架构: $ARCH"; return 1 ;;
-        esac
-        local VER URL RELEASE_PAGE="https://github.com/SagerNet/sing-box/releases/latest"
-        VER=$(curl -fsSL -L --max-time 15 -o /dev/null -w '%{url_effective}' "$RELEASE_PAGE" 2>/dev/null \
-              | sed -nE 's#^.*/tag/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | head -n 1)
-        [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && error "无法获取 sing-box 最新版本" && return 1
-        URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}.tar.gz"
-        curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败"; return 1; }
-        tar -xzf /tmp/sing-box.tar.gz -C /tmp/
-        local DIR_NAME="sing-box-${VER}-linux-${ARCH}"
-        mkdir -p "$(dirname "$SBOX_BIN")"
-        cp "/tmp/${DIR_NAME}/sing-box" "$SBOX_BIN"
-        chmod +x "$SBOX_BIN"
-        rm -rf /tmp/sing-box.tar.gz "/tmp/${DIR_NAME}"
+    local ARCH
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l)  ARCH="armv7" ;;
+        *) error "不支持的架构: $ARCH"; return 1 ;;
+    esac
 
-        # 创建 systemd 服务
-        printf '%s\n' \
-            "[Unit]" \
-            "Description=sing-box service" \
-            "Documentation=https://sing-box.sagernet.org" \
-            "After=network.target nss-lookup.target" \
-            "" \
-            "[Service]" \
-            "Type=simple" \
-            "ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json" \
-            "Restart=on-failure" \
-            "RestartSec=10" \
-            "LimitNOFILE=infinity" \
-            "" \
-            "[Install]" \
-            "WantedBy=multi-user.target" \
-            > /etc/systemd/system/sing-box.service
-        systemctl daemon-reload
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        info "正在下载 sing-box（Debian 官方 deb）..."
+        bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+        if detect_sbox_bin; then
+            mkdir -p "$SBOX_DIR"
+            info "sing-box 安装成功: $($SBOX_BIN version 2>/dev/null | head -1)"
+            return 0
+        fi
+        warn "官方 deb 脚本安装失败，改用 GitHub releases 手动安装..."
     fi
 
+    # 通用回退 / Alpine 主路径：GitHub releases tar.gz（Alpine 用 musl 静态版）
+    local VER URL RELEASE_PAGE="https://github.com/SagerNet/sing-box/releases/latest"
+    VER=$(curl -fsSL -L --max-time 15 -o /dev/null -w '%{url_effective}' "$RELEASE_PAGE" 2>/dev/null \
+          | sed -nE 's#^.*/tag/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | head -n 1)
+    [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && error "无法获取 sing-box 最新版本" && return 1
+    local SUFFIX=""
+    [[ "$OS_TYPE" == "alpine" ]] && SUFFIX="-musl" && info "Alpine：使用 musl 静态版 sing-box-${VER}-linux-${ARCH}-musl"
+    URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${ARCH}${SUFFIX}.tar.gz"
+    rm -f /tmp/sing-box.tar.gz
+    curl -fsSL "$URL" -o /tmp/sing-box.tar.gz || { error "下载失败"; return 1; }
+    rm -rf /tmp/sbox_extract
+    mkdir -p /tmp/sbox_extract
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp/sbox_extract/ || { error "解压失败"; rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract; return 1; }
+    local BIN_FOUND
+    BIN_FOUND=$(find /tmp/sbox_extract -type f -name "sing-box" | head -n 1)
+    [[ -n "$BIN_FOUND" && -f "$BIN_FOUND" ]] || { error "未在解压包中找到 sing-box 二进制"; rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract; return 1; }
+    mkdir -p "$(dirname "$SBOX_BIN")" "$SBOX_DIR"
+    cp -f "$BIN_FOUND" "$SBOX_BIN"
+    chmod +x "$SBOX_BIN"
+    rm -rf /tmp/sing-box.tar.gz /tmp/sbox_extract
+    setup_service_daemon
     detect_sbox_bin || { error "sing-box 安装失败"; return 1; }
-    mkdir -p "$SBOX_DIR"
     info "sing-box 安装成功: $($SBOX_BIN version 2>/dev/null | head -1)"
 }
 
 # ============================================================
-# 卸载 sing-box
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.1 生成的内容）
+# 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
+#     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
+#     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
+# 不删：curl/python3/openssl 等共享依赖、系统时区
 # ============================================================
 uninstall_sbox() {
     title "卸载 sing-box..."
@@ -454,39 +656,63 @@ uninstall_sbox() {
     [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && warn "已取消" && return
 
     # 1. 停全部相关服务（含独立服务）
-    for u in "$SERVICE_NAME" "hysteria-server"; do
-        systemctl stop "$u" 2>/dev/null
-        systemctl disable "$u" 2>/dev/null
-    done
-    # 2. 删 systemd 单元
+    svc_ctrl "$SERVICE_NAME" stop
+    svc_ctrl "$SERVICE_NAME" disable
+    svc_ctrl "hysteria-server" stop
+    svc_ctrl "hysteria-server" disable
+    # 2. 删服务文件（systemd + OpenRC 两边都清）
     rm -f /etc/systemd/system/sing-box.service
     rm -f /etc/systemd/system/hysteria-server.service
-    systemctl daemon-reload
-    systemctl reset-failed 2>/dev/null
-    # 3. 删二进制与快捷命令
-    rm -f "$SBOX_BIN"
-    rm -f /usr/local/bin/hysteria
+    rm -f /etc/init.d/sing-box
+    rm -f /etc/init.d/hysteria-server
+    svc_reload_daemon
+    [[ "$OS_TYPE" != "alpine" ]] && systemctl reset-failed 2>/dev/null
+    # Debian deb 包：只删二进制会留下 dpkg 记录和 /lib 下的 unit，改为 purge
+    if [[ "$OS_TYPE" == "debian" ]] && command -v dpkg >/dev/null 2>&1 && dpkg -l sing-box 2>/dev/null | grep -q '^ii'; then
+        info "正在 apt purge sing-box（deb 包）..."
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq sing-box 2>/dev/null || warn "apt purge sing-box 失败，继续删除文件"
+    fi
+    # 3. 删二进制与快捷命令（含更新残留）
+    rm -f "$SBOX_BIN" /usr/local/bin/sing-box /usr/bin/sing-box
+    rm -f /usr/local/bin/hysteria /usr/local/bin/hysteria.bak /usr/local/bin/hysteria.new
     rm -f /usr/local/bin/singbox_manager.sh
     rm -f /usr/local/bin/c
     # 4. 删全部配置与元数据（含 sing-box / hysteria / SSL）
     rm -rf "$SBOX_DIR"
     rm -rf /etc/hysteria
-    rm -rf /etc/sing-box
-    rm -f /etc/sing-box/ssl/ws.crt /etc/sing-box/ssl/ws.key
     # 5. 清 cron 与 logrotate（含过期检查与日志）
-    crontab -l 2>/dev/null | grep -v "check-expire" | crontab - 2>/dev/null
+    if crontab -l 2>/dev/null | grep -q "check-expire"; then
+        crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset" > /tmp/sbox-cron.tmp
+        crontab /tmp/sbox-cron.tmp 2>/dev/null || crontab -r 2>/dev/null
+        rm -f /tmp/sbox-cron.tmp
+    fi
     rm -f /etc/logrotate.d/sbox-expire
     rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
+    rm -f /var/log/sing-box.log /var/log/sing-box.err
     rm -rf /var/lib/sbox
-    # 6. 打印残留自检
+    # 6. 删脚本生成的其他文件
+    rm -rf /var/www/masq
+    rm -f /tmp/sing-box.tar.gz /tmp/singbox_new.sh
+    rm -rf /tmp/sbox_extract
+    # fix_apt 备份：从最新备份恢复 sources.list，再删备份（不恢复会丢源，不删会留尾巴）
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        local _bak
+        _bak=$(ls -t /etc/apt/sources.list.bak.* 2>/dev/null | head -n 1)
+        if [[ -n "$_bak" && -s "$_bak" ]]; then
+            cp -f "$_bak" /etc/apt/sources.list && info "apt 源已从备份恢复: $_bak"
+        fi
+        rm -f /etc/apt/sources.list.bak.*
+    fi
+    # 7. 打印残留自检（v2.0 生成的全部路径）
     echo ""
     echo "残留自检："
     local leftover=0
-    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service; do
+    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/init.d/sing-box /etc/init.d/hysteria-server /var/www/masq /var/log/sing-box.log; do
         if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
     done
     if crontab -l 2>/dev/null | grep -q "check-expire"; then echo "  残留: cron check-expire"; leftover=1; fi
-    if systemctl list-unit-files 2>/dev/null | grep -qE "sing-box|hysteria-server"; then echo "  残留: systemd unit-file"; leftover=1; fi
+    if [[ "$OS_TYPE" == "debian" ]] && systemctl list-unit-files 2>/dev/null | grep -qE "sing-box|hysteria-server"; then echo "  残留: systemd unit-file"; leftover=1; fi
+    if [[ "$OS_TYPE" == "alpine" ]] && rc-update show 2>/dev/null | grep -qE "sing-box|hysteria-server"; then echo "  残留: OpenRC 服务"; leftover=1; fi
     [[ "$leftover" -eq 0 ]] && info "无残留，sing-box 已完全卸载" || warn "存在残留，请按上面路径手动处理"
     exit 0
 }
@@ -638,8 +864,12 @@ rebuild_config() {
     export REALITY_PORT REALITY_SNI REALITY_PRIVATE_KEY REALITY_SHORTID
     export SS_PORT SS_METHOD SS_PASSWORD
     export WS_PORT WS_PATH CERT_DIR
-    export HY2_PORT HY2_PASSWORD HY2_CERT HY2_KEY
     export ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_SNI ANYTLS_PRIVATE_KEY ANYTLS_SHORTID
+    # 端口先校验：空/非数字会在下面 int() 抛错，提前拦住，避免 config.json 写一半
+    for _p in "$REALITY_PORT" "$SS_PORT" "$WS_PORT" "$ANYTLS_PORT"; do
+        [[ -z "$_p" ]] && continue
+        [[ "$_p" =~ ^[0-9]+$ ]] && (( _p >= 1 && _p <= 65535 )) || { error "端口无效: ${_p}"; return 1; }
+    done
 
     python3 - <<PYEOF
 import json, os
@@ -816,6 +1046,7 @@ init_reality() {
     while true; do
         read -rp "监听端口 [默认 8443]: " REALITY_PORT
         REALITY_PORT=${REALITY_PORT:-8443}
+        [[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || { warn "端口必须是 1-65535"; continue; }
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用"
     done
 
@@ -833,9 +1064,9 @@ REALITY_SHORTID=${REALITY_SHORTID}
 EOF
     chmod 600 "$META_REALITY"
 
-    rebuild_config
+    rebuild_config || return 1
     _inject_all_users
-    _start_sbox
+    _start_sbox || return 1
     info "Reality 节点配置完成"
     info "公钥: ${PUBLIC_KEY}"
 }
@@ -854,6 +1085,7 @@ init_shadowsocks() {
     while true; do
         read -rp "监听端口 [默认 ${PORT}]: " PORT
         PORT=${PORT:-$SS_PORT_DEFAULT}
+        [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || { warn "端口必须是 1-65535"; continue; }
         check_port "$PORT" && break || warn "端口 ${PORT} 已被占用"
     done
 
@@ -881,7 +1113,7 @@ _print_ss_link() {
     local SERVER_IP
     SERVER_IP=$(get_public_ip)
     local USERINFO
-    USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+    USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | b64_nw)
     echo ""
     echo -e "${GREEN}===== Shadowsocks 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
@@ -901,15 +1133,25 @@ init_ws_cf() {
     while true; do
         read -rp "监听端口 [默认 8445]: " WS_PORT
         WS_PORT=${WS_PORT:-8445}
+        [[ "$WS_PORT" =~ ^[0-9]+$ ]] && (( WS_PORT >= 1 && WS_PORT <= 65535 )) || { warn "端口必须是 1-65535"; continue; }
         check_port "$WS_PORT" && break || warn "端口 ${WS_PORT} 已被占用"
     done
     read -rp "WS 路径 [默认 /vless]: " WS_PATH
     WS_PATH=${WS_PATH:-/vless}
+    [[ "$WS_PATH" == /* ]] || { error "WS 路径必须以 / 开头"; return 1; }
     read -rp "你的域名（已在 CF 解析）: " WS_DOMAIN
     [[ -z "$WS_DOMAIN" ]] && error "域名不能为空" && return 1
+    [[ "$WS_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || { error "域名格式异常"; return 1; }
 
     CERT_DIR="/etc/sing-box/ssl"
     mkdir -p "$CERT_DIR"
+    if [[ -s "${CERT_DIR}/ws.crt" || -s "${CERT_DIR}/ws.key" ]]; then
+        local _ts
+        _ts=$(date +%s)
+        cp -f "${CERT_DIR}/ws.crt" "${CERT_DIR}/ws.crt.bak.${_ts}" 2>/dev/null
+        cp -f "${CERT_DIR}/ws.key" "${CERT_DIR}/ws.key.bak.${_ts}" 2>/dev/null
+        info "已有证书已备份为 ws.crt.bak.${_ts} / ws.key.bak.${_ts}"
+    fi
     openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout "${CERT_DIR}/ws.key" -out "${CERT_DIR}/ws.crt" \
         -days 3650 -subj "/CN=${WS_DOMAIN}" \
@@ -963,14 +1205,11 @@ hy_installed_ver(){
     [[ -x "$HY_BIN" ]] || return 1
     "$HY_BIN" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
 }
-hy_latest_ver(){
-    curl -fsSL --max-time 15 https://api.github.com/repos/HyNetworks/hysteria/releases/latest 2>/dev/null \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name","").lstrip("app/v"))' 2>/dev/null
-}
-
 install_hysteria(){
     title "安装官方 Hysteria"
-    command -v curl >/dev/null 2>&1 || apt-get install -y -qq curl >/dev/null 2>&1
+    if ! command -v curl >/dev/null 2>&1; then
+        if [[ "$OS_TYPE" == "alpine" ]]; then apk add --no-cache curl >/dev/null 2>&1; else apt-get install -y -qq curl >/dev/null 2>&1; fi
+    fi
     if [[ -x "$HY_BIN" ]]; then
         info "已安装 Hysteria: $(hy_installed_ver || echo 未知)"
         return 0
@@ -985,32 +1224,16 @@ install_hysteria(){
     info "hysteria 安装成功: $("$HY_BIN" version | head -1)"
 }
 
-update_hysteria_binary(){
-    title "更新 Hysteria 官方二进制"
-    [[ -x "$HY_BIN" ]] || { error "hysteria 未安装，请先安装"; return 1; }
-    local FN NEW BAK OLD_VER NEW_VER
-    FN=$(detect_hyst_arch) || { error "不支持的架构"; return 1; }
-    NEW="${HY_BIN}.new"; BAK="${HY_BIN}.bak"
-    curl -fsSL --max-time 120 "https://download.hysteria.network/app/latest/${FN}" -o "$NEW" \
-      || { error "下载新版本失败"; return 1; }
-    chmod +x "$NEW"
-    "$NEW" version >/dev/null 2>&1 || { error "下载的不是有效二进制"; rm -f "$NEW"; return 1; }
-    OLD_VER=$(hy_installed_ver)
-    NEW_VER=$("$NEW" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
-    if [[ "$OLD_VER" == "$NEW_VER" ]]; then
-        info "已是最新版本: ${NEW_VER}"; rm -f "$NEW"; return 0
-    fi
-    mv "$HY_BIN" "$BAK"; mv "$NEW" "$HY_BIN"; chmod +x "$HY_BIN"; rm -f "$BAK"
-    info "更新完成: ${OLD_VER:-旧} → ${NEW_VER:-新}"
-    systemctl restart "$HY_SERVICE" 2>/dev/null && info "hysteria 服务已重启"
-}
-
 _gen_hy2_cert(){
     local SNI="$1"
     mkdir -p "$HY_DIR"
     if [[ -s "$HY_CERT_F" && -s "$HY_KEY_F" ]]; then
-        warn "证书已存在，保留现有证书"
-        return 0
+        if openssl x509 -noout -subject -in "$HY_CERT_F" 2>/dev/null | grep -q "$SNI"; then
+            warn "证书已存在且 SNI 一致，保留现有证书"
+            return 0
+        fi
+        warn "已有证书 SNI 与 ${SNI} 不一致，重新生成证书"
+        rm -f "$HY_CERT_F" "$HY_KEY_F"
     fi
     openssl req -x509 -nodes -newkey rsa:2048 \
         -keyout "$HY_KEY_F" -out "$HY_CERT_F" \
@@ -1022,7 +1245,26 @@ _gen_hy2_cert(){
 }
 
 _setup_hy2_service(){
-    cat > /etc/systemd/system/hysteria-server.service <<EOF
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        cat > /etc/init.d/hysteria-server <<EOF
+#!/sbin/openrc-run
+name="hysteria-server"
+description="Hysteria2 server (official)"
+command="${HY_BIN}"
+command_args="server -c ${HY_CONF}"
+command_background="yes"
+pidfile="/run/hysteria-server.pid"
+output_log="/var/log/hysteria-server.log"
+error_log="/var/log/hysteria-server.err"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod +x /etc/init.d/hysteria-server
+    else
+        cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria2 server (official)
 After=network.target nss-lookup.target
@@ -1035,19 +1277,24 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+        systemctl daemon-reload
+    fi
 }
 
 _start_hy2_service(){
-    systemctl enable "$HY_SERVICE" >/dev/null 2>&1
-    systemctl restart "$HY_SERVICE"
+    svc_ctrl "$HY_SERVICE" enable
+    svc_ctrl "$HY_SERVICE" restart
     sleep 2
-    if systemctl is-active --quiet "$HY_SERVICE"; then
+    if svc_active "$HY_SERVICE"; then
         info "hysteria 服务运行中"
         return 0
     else
         error "hysteria 启动失败:"
-        journalctl -u "$HY_SERVICE" -n 15 --no-pager 2>&1 | tail -15
+        if [[ "$OS_TYPE" == "alpine" ]]; then
+            tail -15 /var/log/hysteria-server.err 2>/dev/null || tail -15 /var/log/hysteria-server.log 2>/dev/null
+        else
+            journalctl -u "$HY_SERVICE" -n 15 --no-pager 2>&1 | tail -15
+        fi
         return 1
     fi
 }
@@ -1067,6 +1314,7 @@ init_hy2() {
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
         error "端口必须是 1-65535"; return 1
     fi
+    check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
     check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
 
     read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
@@ -1078,6 +1326,12 @@ init_hy2() {
     if [[ "$HOP_ASK" == "y" || "$HOP_ASK" == "Y" ]]; then
         HOP_START=$((RANDOM % 40000 + 10000))
         HOP_END=$((HOP_START + 999))
+        # 跳端口范围不能撞主端口，也不能超出 65535
+        if (( HOP_START <= PORT && PORT <= HOP_END )) || (( HOP_END > 65535 )); then
+            HOP_START=$(( (PORT + 1000) % 40000 + 10000 ))
+            (( HOP_START <= PORT && PORT <= HOP_START + 999 )) && HOP_START=$(( (PORT + 5000) % 40000 + 10000 ))
+            HOP_END=$((HOP_START + 999))
+        fi
         HOP_RANGE="${HOP_START}-${HOP_END}"
         info "Port-hop range ${HOP_START}-${HOP_END}"
     fi
@@ -1085,10 +1339,12 @@ init_hy2() {
     PASS=$(openssl rand -hex 16)
     [[ -n "$PASS" ]] || { error "密码生成失败"; return 1; }
 
-    command -v openssl >/dev/null 2>&1 || apt-get install -y -qq openssl >/dev/null 2>&1
+    if ! command -v openssl >/dev/null 2>&1; then
+        if [[ "$OS_TYPE" == "alpine" ]]; then apk add --no-cache openssl >/dev/null 2>&1; else apt-get install -y -qq openssl >/dev/null 2>&1; fi
+    fi
     _gen_hy2_cert "$SNI" || return 1
 
-    mkdir -p "$HY_DIR" /var/www/masq
+    mkdir -p "$HY_DIR"
     local LISTEN_VALUE=":${PORT}"
     [[ -n "$HOP_RANGE" ]] && LISTEN_VALUE=":${PORT},${HOP_RANGE}"
     cat > "$HY_CONF" <<'EOF'
@@ -1138,13 +1394,15 @@ remove_hy2() {
     has_hy2 || { error "Hysteria2 未启用"; return 1; }
     read -rp "确认移除 Hysteria2（停止并删除服务/配置/证书）？[y/N]: " C
     [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
-    systemctl stop "$HY_SERVICE" 2>/dev/null
-    systemctl disable "$HY_SERVICE" 2>/dev/null
+    svc_ctrl "$HY_SERVICE" stop
+    svc_ctrl "$HY_SERVICE" disable
     rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /etc/init.d/hysteria-server
     rm -rf "$HY_DIR"
     rm -f "$META_HY2"
-    systemctl daemon-reload
-    info "Hysteria2 已移除（二进制保留，可用菜单更新/重装）"
+    rm -f /var/log/hysteria-server.log /var/log/hysteria-server.err
+    svc_reload_daemon
+    info "Hysteria2 已移除（二进制保留；重装脚本会拉取最新版）"
 }
 
 hy2_share_link() {
@@ -1379,7 +1637,7 @@ for i in d.get('inbounds',[]):
     if false; then # 单密码模式：不再展示 SS 个人节点，只用主密码
         if [[ -n "$SSPASS" ]]; then
             local SS_USERINFO SS_LINK
-            SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | base64 -w0)
+            SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | b64_nw)
             SS_LINK="ss://${SS_USERINFO}@${SERVER_IP:-$(get_public_ip)}:${SS_PORT}#${USERNAME}-ss"
             echo ""
             echo -e "${CYAN}── Shadowsocks 个人节点 ──${NC}"
@@ -1394,8 +1652,8 @@ for i in d.get('inbounds',[]):
 
     if [[ "$NODE" == "ws" || "$NODE" == "both" ]] && has_ws; then
         local ENCODED_PATH ENCODED_NAME
-        ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WS_PATH}'))")
-        ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${USERNAME}-ws'))")
+        ENCODED_PATH=$(WS_PATH="$WS_PATH" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["WS_PATH"]))')
+        ENCODED_NAME=$(USERNAME="$USERNAME" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["USERNAME"] + "-ws"))')
         echo ""
         echo -e "${CYAN}── WS+CF 节点 ──${NC}"
         echo -e "域名   : ${WS_DOMAIN}"
@@ -1453,8 +1711,11 @@ add_user() {
         has_reality && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Reality"; OPT_R=$IDX; IDX=$((IDX+1)); }
         has_ws && { echo -e "  ${GREEN}${IDX}.${NC} 仅 WS"; OPT_W=$IDX; IDX=$((IDX+1)); }
         has_shadowsocks && { echo -e "  ${GREEN}${IDX}.${NC} 仅 Shadowsocks（独立密码）"; OPT_S=$IDX; IDX=$((IDX+1)); }
-        read -rp "选择 [默认${OPT_ALL:-$OPT_R}]: " NODE_SEL
-        NODE_SEL=${NODE_SEL:-${OPT_ALL:-$OPT_R}}
+        local _def="${OPT_ALL:-$OPT_R}"
+        [[ "$_def" == "0" || -z "$_def" ]] && _def="${OPT_R:-$OPT_W}"
+        [[ "$_def" == "0" || -z "$_def" ]] && _def="$OPT_S"
+        read -rp "选择 [默认${_def}]: " NODE_SEL
+        NODE_SEL=${NODE_SEL:-${_def}}
         if [[ "$NODE_SEL" == "$OPT_R" && "$OPT_R" != "0" ]]; then NODE="reality"
         elif [[ "$NODE_SEL" == "$OPT_W" && "$OPT_W" != "0" ]]; then NODE="ws"
         elif [[ "$NODE_SEL" == "$OPT_S" && "$OPT_S" != "0" ]]; then NODE="ss"
@@ -1537,13 +1798,13 @@ delete_user() {
         DEL_NODE="$USER_NODE"
     fi
 
-    # 从 config.json 移除（SS 按用户名 name 删，VLESS 按 uuid 删）
-    USER_SSPASS="$USER_SSPASS" python3 - <<PYEOF
+    # 从 config.json 移除（SS 按用户名 name 删，VLESS 按 uuid 删；变量走环境，不拼进 Python）
+    DEL_USER="$USERNAME" DEL_UUID="$UUID" DEL_NODE="$DEL_NODE" USER_SSPASS="$USER_SSPASS" SBOX_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
 import json, os
-del_node = "$DEL_NODE"
-ss_name = "$USERNAME"
+del_node = os.environ["DEL_NODE"]
+ss_name = os.environ["DEL_USER"]
 ss_nodes = {"ss", "both"}
-with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
+with open(os.environ["SBOX_CONFIG"], "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
@@ -1554,18 +1815,19 @@ for inbound in cfg.get("inbounds", []):
         if del_node in ss_nodes:
             inbound["users"] = [u for u in users if u.get("name") != ss_name]
     elif del_node == "both" or (del_node == "reality" and tag == "inbound-reality") or (del_node == "ws" and tag == "inbound-ws"):
-        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
-with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
+        inbound["users"] = [u for u in users if u.get("uuid") != os.environ["DEL_UUID"]]
+with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
     if [[ "$DEL_NODE" == "both" || "$DEL_NODE" == "$USER_NODE" ]]; then
         # 彻底删除
-        python3 - <<PYEOF
+        DEL_USER="$USERNAME" USER_DB="$USER_DB" python3 - <<'PYEOF'
+import os
 from pathlib import Path
-p = Path("$USER_DB")
+p = Path(os.environ["USER_DB"])
 lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()
-out = [l for l in lines if not (l.startswith("$USERNAME:") and l.split(":")[0] == "$USERNAME")]
+out = [l for l in lines if not (l.startswith(os.environ.get("DEL_USER", "") + ":") and l.split(":")[0] == os.environ.get("DEL_USER", ""))]
 p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
         info "用户 ${USERNAME} 已彻底删除"
@@ -1589,8 +1851,8 @@ PYEOF
         info "用户 ${USERNAME} 已移除 ${DEL_NODE} 权限，保留 ${NEW_NODE}"
     fi
 
-    validate_sbox_config || { rebuild_config; _inject_all_users; }
-    systemctl restart "$SERVICE_NAME"
+    if ! validate_sbox_config; then rebuild_config; _inject_all_users; validate_sbox_config || return 1; fi
+    svc_ctrl "$SERVICE_NAME" restart
 }
 
 # ============================================================
@@ -1619,13 +1881,13 @@ toggle_user() {
     USER_SSPASS=$(get_user_field "$USERNAME" 6)
 
     if [[ "$ACTION" == "disable" ]]; then
-        # 从 config.json 移除（SS 按名删，VLESS 按 uuid 删）
-        python3 - <<PYEOF
-import json
-op_node = "$OP_NODE"
-ss_name = "$USERNAME"
+        # 从 config.json 移除（SS 按名删，VLESS 按 uuid 删；变量走环境，不拼进 Python）
+        OP_USER="$USERNAME" OP_UUID="$UUID" OP_NODE="$OP_NODE" SBOX_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
+import json, os
+op_node = os.environ["OP_NODE"]
+ss_name = os.environ["OP_USER"]
 ss_nodes = {"ss", "both"}
-with open("$SBOX_CONFIG", "r", encoding="utf-8") as f:
+with open(os.environ["SBOX_CONFIG"], "r", encoding="utf-8") as f:
     cfg = json.load(f)
 for inbound in cfg.get("inbounds", []):
     tag = inbound.get("tag", "")
@@ -1636,8 +1898,8 @@ for inbound in cfg.get("inbounds", []):
         if op_node in ss_nodes:
             inbound["users"] = [u for u in users if u.get("name") != ss_name]
     elif op_node == "both" or (op_node == "reality" and tag == "inbound-reality") or (op_node == "ws" and tag == "inbound-ws"):
-        inbound["users"] = [u for u in users if u.get("uuid") != "$UUID"]
-with open("$SBOX_CONFIG", "w", encoding="utf-8") as f:
+        inbound["users"] = [u for u in users if u.get("uuid") != os.environ["OP_UUID"]]
+with open(os.environ["SBOX_CONFIG"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
@@ -1716,8 +1978,8 @@ PYEOF
         info "用户 ${USERNAME} 已启用"
     fi
 
-    validate_sbox_config || { rebuild_config; _inject_all_users; return 1; }
-    systemctl restart "$SERVICE_NAME"
+    if ! validate_sbox_config; then rebuild_config; _inject_all_users; validate_sbox_config || return 1; fi
+    svc_ctrl "$SERVICE_NAME" restart
 }
 
 # ============================================================
@@ -1774,7 +2036,7 @@ p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
 PYEOF
 
     _inject_user "$UUID" "$USERNAME" "$NEW_EXPIRE" "$NODE" "$SSPASS"
-    validate_sbox_config && systemctl restart "$SERVICE_NAME"
+    validate_sbox_config && svc_ctrl "$SERVICE_NAME" restart
 
     if [[ "$STATUS" == "disabled" ]]; then
         info "用户 ${USERNAME} 到期已更新为 ${NEW_EXPIRE}，已自动恢复启用"
@@ -1792,8 +2054,8 @@ list_users() {
     [[ ! -s "$USER_DB" ]] && warn "暂无用户" && return
 
     local TOTAL ACTIVE DISABLED
-    TOTAL=$(wc -l < "$USER_DB")
-    ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+    TOTAL=$(awk 'END{print NR+0}' "$USER_DB")
+    ACTIVE=$(grep -c ":active:" "$USER_DB" 2>/dev/null || true)
     DISABLED=$((TOTAL - ACTIVE))
     echo -e "  总计 ${CYAN}${TOTAL}${NC} 个  ${GREEN}活跃 ${ACTIVE}${NC}  ${RED}禁用 ${DISABLED}${NC}\n"
     echo -e "  ${YELLOW}USER EXPIRE STATUS NODE${NC}"
@@ -1932,7 +2194,7 @@ with open(os.environ["CFG_PATH"], "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
 PYEOF
 
-        validate_sbox_config && systemctl restart "$SERVICE_NAME"
+        validate_sbox_config && svc_ctrl "$SERVICE_NAME" restart
         info "已重启 sing-box"
     else
         info "没有到期用户"
@@ -1949,15 +2211,18 @@ show_info() {
     local SBOX_STATUS USER_COUNT ACTIVE_COUNT
     local PUBLIC_IP LOAD_INFO MEM_INFO SWAP_INFO UPTIME_INFO
 
-    SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
-    USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-    ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+    SBOX_STATUS="inactive"; svc_active "$SERVICE_NAME" && SBOX_STATUS="active"
+    USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(awk 'END{print NR+0}' "$USER_DB")
+    ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || true)
 
     PUBLIC_IP=$(get_public_ip)
     LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
     SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
     UPTIME_INFO=$(uptime -p 2>/dev/null | sed 's/^up //')
+    if [[ -z "$UPTIME_INFO" ]]; then
+        UPTIME_INFO=$(awk '{d=int($1/86400); h=int($1%86400/3600); m=int($1%3600/60); printf "%d天 %d小时 %d分钟", d, h, m}' /proc/uptime 2>/dev/null)
+    fi
 
     echo -e "状态   : $( [[ "$SBOX_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
     echo -e "用户数 : 共 ${USER_COUNT} 个，活跃 ${ACTIVE_COUNT} 个"
@@ -1997,7 +2262,7 @@ for i in d.get('inbounds',[]):
 
     if has_shadowsocks; then
         local SS_USERINFO_SHOW SS_LINK_SHOW
-        SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | base64 -w0)
+        SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | b64_nw)
         SS_LINK_SHOW="ss://${SS_USERINFO_SHOW}@${PUBLIC_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
         echo -e "${CYAN}── Shadowsocks 节点 ──${NC}"
         echo -e "地址   : ${PUBLIC_IP}"
@@ -2014,7 +2279,7 @@ for i in d.get('inbounds',[]):
                 SNODE=${SNODE:-both}
                 [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
                 [[ -z "$SSPW" ]] && continue
-                SS_UI=$(printf '%s' "${SS_METHOD}:${SSPW}" | base64 -w0)
+                SS_UI=$(printf '%s' "${SS_METHOD}:${SSPW}" | b64_nw)
                 SS_LK="ss://${SS_UI}@${PUBLIC_IP}:${SS_PORT}#${SNAME}-ss"
                 echo "[${SNAME}] ${SS_LK}"
             done < "$USER_DB"
@@ -2033,7 +2298,7 @@ for i in d.get('inbounds',[]):
 
     if has_hy2; then
         local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_PORT_RANGE_SHOW HY2_LINK_SHOW
-        HY2_STATUS=$(systemctl is-active "$HY_SERVICE" 2>/dev/null)
+        HY2_STATUS="inactive"; svc_active "$HY_SERVICE" && HY2_STATUS="active"
         HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
@@ -2058,7 +2323,7 @@ for i in d.get('inbounds',[]):
         AT_SNI_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SNI")
         AT_PUBKEY_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
         AT_SHORTID_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
-        AT_STATUS_SHOW=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
+        AT_STATUS_SHOW="inactive"; svc_active "$SERVICE_NAME" && AT_STATUS_SHOW="active"
         AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&pbk=${AT_PUBKEY_SHOW}&sid=${AT_SHORTID_SHOW}&fp=chrome&security=reality#AnyTLS-${AT_PORT_SHOW}"
         echo -e "${CYAN}── AnyTLS 节点 ──${NC}"
         echo -e "状态   : $( [[ "$AT_STATUS_SHOW" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
@@ -2077,30 +2342,6 @@ for i in d.get('inbounds',[]):
     if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2 && ! has_anytls; then
         warn "尚未配置任何节点"
     fi
-}
-
-# ============================================================
-# 更新 sing-box
-# ============================================================
-update_sbox() {
-    title "更新 sing-box..."
-    local CURRENT_VER
-    detect_sbox_bin >/dev/null 2>&1 || true
-    CURRENT_VER=$("$SBOX_BIN" version 2>/dev/null | awk '{print $NF}')
-    info "当前版本: ${CURRENT_VER:-未知}"
-    info "正在更新..."
-
-    bash <(curl -fsSL https://sing-box.app/deb-install.sh) 2>/dev/null
-    local NEW_VER
-    detect_sbox_bin >/dev/null 2>&1 || true
-    NEW_VER=$("$SBOX_BIN" version 2>/dev/null | awk '{print $NF}')
-    if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
-        info "已是最新版本: ${NEW_VER:-未知}"
-    else
-        info "更新完成: ${CURRENT_VER:-未知} → ${NEW_VER:-未知}"
-    fi
-    systemctl restart "$SERVICE_NAME"
-    info "sing-box 已重启"
 }
 
 # ============================================================
@@ -2137,6 +2378,8 @@ update_script() {
     fi
     cp "$TMP_SCRIPT" /usr/local/bin/singbox_manager.sh
     chmod +x /usr/local/bin/singbox_manager.sh
+    cp /usr/local/bin/singbox_manager.sh /usr/local/bin/c 2>/dev/null
+    chmod +x /usr/local/bin/c 2>/dev/null
     rm -f "$TMP_SCRIPT"
     info "脚本已更新"
     info "正在重新启动新版本..."
@@ -2167,11 +2410,16 @@ install_shortcut() {
 # ============================================================
 setup_cron() {
     local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
-    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD") | crontab -
+    # 用临时文件装 crontab：BusyBox crontab 不支持 `crontab -` 读 stdin
+    (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD") > /tmp/sbox-cron.tmp
+    crontab /tmp/sbox-cron.tmp && rm -f /tmp/sbox-cron.tmp
     info "已设置每 5 分钟自动检查到期用户"
-
-    mkdir -p /var/log
-    cat > /etc/logrotate.d/sbox-expire <<'EOF'
+    if [[ "$OS_TYPE" == "alpine" ]]; then
+        rc-service crond start >/dev/null 2>&1
+        rc-update add crond default >/dev/null 2>&1
+    else
+        mkdir -p /var/log
+        cat > /etc/logrotate.d/sbox-expire <<'EOF'
 /var/log/sbox-expire.log {
     weekly
     rotate 4
@@ -2181,734 +2429,8 @@ setup_cron() {
     create 0640 root root
 }
 EOF
-    info "已配置日志轮转"
-}
-
-# ============================================================
-# 服务器网络优化（BBR3 / 缓冲区 / swap）—— 独立功能，菜单 16
-# 备份与状态放在 /etc/sbox-tune，卸载 sing-box 不会删除它
-# ============================================================
-TUNE_BASE="${TUNE_BASE:-/etc/sbox-tune}"
-TUNE_BACKUP="${TUNE_BASE}/backup-orig"
-TUNE_STATE="${TUNE_BASE}/tune.state"
-TUNE_CONF="${TUNE_CONF:-/etc/sysctl.d/99-sbox-tune.conf}"
-TUNE_SYSCTL_MAIN="${TUNE_SYSCTL_MAIN:-/etc/sysctl.conf}"
-TUNE_SYSCTL_DIR="${TUNE_SYSCTL_DIR:-/etc/sysctl.d}"
-TUNE_SWAPFILE="/swapfile.sbox"
-TUNE_LIMITS_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
-TUNE_LIMITS_CONF="${TUNE_LIMITS_DIR}/99-sbox-tune.conf"
-TUNE_MODLOAD="/etc/modules-load.d/sbox-bbr.conf"
-TUNE_XAN_LIST="/etc/apt/sources.list.d/xanmod-release.list"
-TUNE_XAN_KEY="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
-TUNE_NEED_REBOOT=0
-
-# ---------- 状态文件 ----------
-tune_state_get() { read_kv "$TUNE_STATE" "$1"; }
-
-tune_state_set() {
-    local k="$1" v="$2" tmp
-    mkdir -p "$TUNE_BASE"
-    touch "$TUNE_STATE"
-    tmp=$(mktemp)
-    awk -F= -v k="$k" '$1!=k' "$TUNE_STATE" > "$tmp"
-    echo "${k}=${v}" >> "$tmp"
-    cat "$tmp" > "$TUNE_STATE"
-    rm -f "$tmp"
-}
-
-# ---------- 小工具 ----------
-tune_mb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1048576}'; }
-
-tune_yes() {  # tune_yes "提示" 默认(Y/N)
-    local a
-    read -rp "$1" a
-    a="${a:-$2}"
-    [[ "$a" =~ ^[Yy]$ ]]
-}
-
-tune_read_int() {  # tune_read_int "提示" 最小 最大 默认值 → 结果在 TUNE_READ
-    local prompt="$1" min="$2" max="$3" def="$4" val
-    while true; do
-        if [[ -n "$def" ]]; then
-            read -rp "${prompt} [回车=${def}]: " val
-            val="${val:-$def}"
-        else
-            read -rp "${prompt}: " val
-        fi
-        val="${val// /}"
-        if [[ "$val" =~ ^[0-9]{1,7}$ ]] && (( 10#$val >= min && 10#$val <= max )); then
-            TUNE_READ=$((10#$val))
-            return 0
-        fi
-        warn "请输入 ${min} ~ ${max} 之间的整数"
-    done
-}
-
-tune_default_iface() {
-    local d
-    d=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    [[ -z "$d" ]] && d=$(ip -o -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    echo "$d"
-}
-
-# ---------- 环境检查 ----------
-tune_check_env() {
-    local virt
-    virt=$(systemd-detect-virt 2>/dev/null)
-    [[ -z "$virt" ]] && virt="none"
-    case "$virt" in
-        lxc|lxc-libvirt|openvz|docker|podman|systemd-nspawn|wsl)
-            error "检测到容器环境（${virt}），与宿主机共用内核，无法在此优化"
-            warn "请在宿主机上执行，容器会自动继承"
-            return 1 ;;
-    esac
-    if [[ -f /proc/1/environ ]] && grep -a -q "container=lxc" /proc/1/environ 2>/dev/null; then
-        error "检测到 LXC 容器环境，无法在此优化"
-        return 1
+        info "已配置日志轮转"
     fi
-    if [[ ! -w /proc/sys/net/ipv4/tcp_rmem ]]; then
-        error "无法写入内核参数（/proc/sys 只读），当前环境不支持"
-        return 1
-    fi
-    return 0
-}
-
-# ---------- 首次备份（只做一次，之后只读，仅用于恢复） ----------
-tune_backup_once() {
-    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
-        info "原始备份已存在（只读保护），不会被覆盖"
-        return 0
-    fi
-    title "首次运行：备份原始系统设置"
-    # 上次中断留下的半成品备份，清掉重来
-    chattr -R -i "$TUNE_BACKUP" 2>/dev/null
-    rm -rf "$TUNE_BACKUP"
-    mkdir -p "${TUNE_BACKUP}/files" || { error "无法创建备份目录"; return 1; }
-
-    local f
-    for f in /etc/sysctl.conf /etc/security/limits.conf /etc/fstab /etc/default/grub; do
-        [[ -e "$f" ]] && cp -a "$f" "${TUNE_BACKUP}/files/$(echo "$f" | tr '/' '_')"
-    done
-    [[ -d /etc/sysctl.d ]] && cp -a /etc/sysctl.d "${TUNE_BACKUP}/files/_etc_sysctl.d"
-    [[ -d "$TUNE_LIMITS_DIR" ]] && cp -a "$TUNE_LIMITS_DIR" "${TUNE_BACKUP}/files/_sbox_service.d"
-
-    # 全部内核参数的当前值（恢复时按这个还原）
-    sysctl -a 2>/dev/null | tr '\t' ' ' > "${TUNE_BACKUP}/sysctl-all.txt"
-    uname -r > "${TUNE_BACKUP}/kernel.txt"
-    dpkg -l 'linux-image*' 2>/dev/null | awk '/^ii/{print $2}' > "${TUNE_BACKUP}/kernels.txt"
-    free -m > "${TUNE_BACKUP}/mem.txt" 2>/dev/null
-    swapon --show > "${TUNE_BACKUP}/swap.txt" 2>&1
-    tc qdisc show > "${TUNE_BACKUP}/qdisc.txt" 2>/dev/null
-    systemd-detect-virt > "${TUNE_BACKUP}/virt.txt" 2>/dev/null
-    (cd "$TUNE_BACKUP" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + > SHA256SUMS 2>/dev/null)
-
-    if [[ ! -s "${TUNE_BACKUP}/sysctl-all.txt" ]]; then
-        error "备份失败（读取不到内核参数）"
-        return 1
-    fi
-    date '+%Y-%m-%d %H:%M:%S' > "${TUNE_BACKUP}/.done"
-
-    # 跳过符号链接（chattr 不支持），再以 .done 的实际属性判断是否锁定成功
-    find "$TUNE_BACKUP" ! -type l -exec chattr +i {} + 2>/dev/null
-    if lsattr -d "${TUNE_BACKUP}/.done" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-        info "原始设置已备份并锁定（chattr +i）: ${TUNE_BACKUP}"
-    else
-        chmod -R a-w "$TUNE_BACKUP" 2>/dev/null
-        warn "文件系统不支持锁定，已改为只读权限: ${TUNE_BACKUP}"
-    fi
-    return 0
-}
-
-# ---------- 计算缓冲区 ----------
-# 输入: RTT(ms) 带宽(Mbps) 内存(MB)
-# 输出: TUNE_BDP TUNE_RMAX TUNE_WMAX TUNE_NOTE
-tune_calc() {
-    local rtt="$1" bw="$2" mem="$3"
-    local memcap=$(( mem * 1024 * 1024 * 4 / 100 ))   # 单连接最多占物理内存 4%
-    local min=$(( 8 * 1024 * 1024 )) max=$(( 256 * 1024 * 1024 ))
-    local r w
-    TUNE_BDP=$(( bw * rtt * 125 ))                      # Mbps*1e6/8 * ms/1000
-    r=$(( TUNE_BDP * 15 / 10 ))                         # 接收：1.5 × BDP（有效窗口只有缓冲的一部分）
-    w=$(( TUNE_BDP * 18 / 10 ))                         # 发送：1.8 × BDP
-    TUNE_NOTE="按 带宽×延迟 计算"
-    (( r > memcap )) && { r=$memcap; TUNE_NOTE="受内存 4% 单连接上限限制"; }
-    (( w > memcap )) && { w=$memcap; TUNE_NOTE="受内存 4% 单连接上限限制"; }
-    (( r < min )) && r=$min
-    (( w < min )) && w=$min
-    (( r > max )) && { r=$max; TUNE_NOTE="已达 256MB 上限"; }
-    (( w > max )) && { w=$max; TUNE_NOTE="已达 256MB 上限"; }
-    TUNE_RMAX=$r
-    TUNE_WMAX=$w
-}
-
-# ---------- swap ----------
-tune_swap_target_mb() {
-    local m="$1"
-    if   (( m <= 600 ));  then echo 1024
-    elif (( m <= 1200 )); then echo 1536
-    elif (( m <= 4400 )); then echo 2048
-    else echo 0
-    fi
-}
-
-# 输出: TUNE_SWAP_ADD(MB, 0=不创建) TUNE_SWAP_WHY
-tune_swap_plan() {
-    local mem="$1" cur target add free_mb fstype
-    cur=$(free -m | awk '/^Swap:/{print $2}')
-    cur=${cur:-0}
-    target=$(tune_swap_target_mb "$mem")
-    TUNE_SWAP_ADD=0
-    if (( target == 0 )); then
-        TUNE_SWAP_WHY="内存充足，无需 swap"; return 0
-    fi
-    add=$(( target - cur ))
-    if (( add < 256 )); then
-        TUNE_SWAP_WHY="已有 swap ${cur}MB，足够"; return 0
-    fi
-    fstype=$(findmnt -no FSTYPE / 2>/dev/null)
-    case "$fstype" in
-        btrfs|zfs|overlay) TUNE_SWAP_WHY="根分区为 ${fstype}，跳过"; return 0 ;;
-    esac
-    free_mb=$(df -Pm / | awk 'NR==2{print $4}')
-    if (( free_mb < add + 500 )); then
-        TUNE_SWAP_WHY="磁盘剩余 ${free_mb}MB 不足，跳过"; return 0
-    fi
-    TUNE_SWAP_ADD=$add
-    TUNE_SWAP_WHY="新增 ${add}MB（现有 ${cur}MB）"
-}
-
-tune_create_swap() {
-    local mb="$1"
-    swapoff "$TUNE_SWAPFILE" 2>/dev/null
-    rm -f "$TUNE_SWAPFILE"
-    info "正在创建 ${mb}MB swap，请稍候..."
-    if ! dd if=/dev/zero of="$TUNE_SWAPFILE" bs=1M count="$mb" status=none 2>/dev/null; then
-        rm -f "$TUNE_SWAPFILE"; error "swap 文件创建失败（磁盘空间不足？）"; return 1
-    fi
-    chmod 600 "$TUNE_SWAPFILE"
-    if ! mkswap "$TUNE_SWAPFILE" >/dev/null 2>&1 || ! swapon "$TUNE_SWAPFILE" 2>/dev/null; then
-        rm -f "$TUNE_SWAPFILE"; error "swap 挂载失败，已清理"; return 1
-    fi
-    sed -i "\|^${TUNE_SWAPFILE}[[:space:]]|d" /etc/fstab
-    echo "${TUNE_SWAPFILE} none swap sw 0 0" >> /etc/fstab
-    tune_state_set SWAP_FILE "$TUNE_SWAPFILE"
-    tune_state_set SWAP_MB "$mb"
-    info "swap ${mb}MB 已启用并写入开机挂载"
-}
-
-# ---------- 写入 sysctl 配置 ----------
-tune_emit() {  # 仅当内核有这个参数才写入，避免老内核报错
-    local key="$1" val="$2" p
-    p=$(echo "$key" | tr '.' '/')
-    [[ -e "/proc/sys/${p}" ]] && printf '%s = %s\n' "$key" "$val"
-}
-
-tune_bbr_available() {
-    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr && return 0
-    modprobe tcp_bbr 2>/dev/null
-    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
-}
-
-# 参数: RTT BW MEM RMAX WMAX WANT_KERNEL(0/1)
-tune_write_conf() {
-    local rtt="$1" bw="$2" mem="$3" rmax="$4" wmax="$5" want_kernel="$6"
-    local page=4096 mem_bytes=$(( mem * 1024 * 1024 ))
-    local tm_low=$(( mem_bytes * 12 / 100 / page ))
-    local tm_mid=$(( mem_bytes * 18 / 100 / page ))
-    local tm_high=$(( mem_bytes * 25 / 100 / page ))
-    local backlog=32768 orphans=32768 swap_now
-    (( mem <= 1200 )) && { backlog=16384; orphans=16384; }
-    swap_now=$(free -m | awk '/^Swap:/{print $2}')
-
-    mkdir -p "$(dirname "$TUNE_CONF")"
-    {
-        echo "# sing-box 管理脚本 - 网络优化（自动生成，请勿手改，恢复请用菜单 16）"
-        echo "# 生成时间: $(date '+%F %T')  延迟=${rtt}ms  带宽=${bw}Mbps  内存=${mem}MB"
-        tune_emit net.core.default_qdisc fq
-        if tune_bbr_available || [[ "$want_kernel" == "1" ]]; then
-            echo "net.ipv4.tcp_congestion_control = bbr"
-        fi
-        tune_emit net.core.rmem_max "$rmax"
-        tune_emit net.core.wmem_max "$wmax"
-        tune_emit net.ipv4.tcp_rmem "4096 131072 ${rmax}"
-        tune_emit net.ipv4.tcp_wmem "4096 16384 ${wmax}"
-        tune_emit net.ipv4.tcp_mem "${tm_low} ${tm_mid} ${tm_high}"
-        tune_emit net.ipv4.tcp_window_scaling 1
-        tune_emit net.ipv4.tcp_sack 1
-        tune_emit net.ipv4.tcp_dsack 1
-        tune_emit net.ipv4.tcp_recovery 1
-        tune_emit net.ipv4.tcp_mtu_probing 1
-        tune_emit net.ipv4.tcp_slow_start_after_idle 0
-        tune_emit net.ipv4.tcp_notsent_lowat 131072
-        tune_emit net.ipv4.tcp_tw_reuse 1
-        tune_emit net.ipv4.tcp_fin_timeout 20
-        tune_emit net.core.somaxconn "$backlog"
-        tune_emit net.core.netdev_max_backlog "$backlog"
-        tune_emit net.ipv4.tcp_max_syn_backlog "$backlog"
-        tune_emit net.ipv4.tcp_max_orphans "$orphans"
-        tune_emit net.ipv4.ip_local_port_range "10000 65535"
-        tune_emit fs.file-max 1048576
-        tune_emit fs.nr_open 1048576
-        (( ${swap_now:-0} > 0 )) && tune_emit vm.swappiness 10
-    } > "$TUNE_CONF"
-}
-
-# 其他 sysctl 文件里如果有同名参数，开机时可能覆盖我们（/etc/sysctl.conf 最后加载）。
-# 做法：把冲突行加前缀注释（可逆），恢复时去掉前缀。原始文件另有备份。
-tune_neutralize_conflicts() {
-    local keys f tmp prev newlist=""
-    keys=$(awk -F' = ' '/^[a-z]/{print $1}' "$TUNE_CONF")
-    [[ -z "$keys" ]] && return 0
-    prev=$(tune_state_get TOUCHED)
-    for f in "$TUNE_SYSCTL_MAIN" "$TUNE_SYSCTL_DIR"/*.conf; do
-        [[ -f "$f" && ! -L "$f" && "$f" != "$TUNE_CONF" ]] || continue
-        tmp=$(mktemp)
-        if awk -v K="$keys" '
-            BEGIN { n=split(K,a,"\n"); for(i=1;i<=n;i++) s[a[i]]=1 }
-            {
-                l=$0; sub(/^[ \t]+/,"",l)
-                if (l !~ /^[#;]/ && index(l,"=")>0) {
-                    k=substr(l,1,index(l,"=")-1); gsub(/[ \t]/,"",k); sub(/^-/,"",k)
-                    if (k in s) { print "# [sbox-tune] " $0; changed=1; next }
-                }
-                print
-            }
-            END { exit changed ? 0 : 1 }' "$f" > "$tmp"; then
-            cat "$tmp" > "$f"
-            warn "已注释 ${f} 中与优化冲突的同名参数（可恢复）"
-            [[ " $prev $newlist " == *" $f "* ]] || newlist="${newlist}${f} "
-        fi
-        rm -f "$tmp"
-    done
-    [[ -n "$newlist" ]] && tune_state_set TOUCHED "${prev:+$prev }${newlist% }"
-    return 0
-}
-
-# ---------- 立即生效 ----------
-tune_apply_runtime() {
-    local out line IF
-    out=$(sysctl -p "$TUNE_CONF" 2>&1 >/dev/null)
-    if [[ -n "$out" ]]; then
-        while IFS= read -r line; do warn "sysctl: $line"; done <<< "$out"
-    fi
-    info "内核参数已热生效（无需重启）"
-
-    # default_qdisc 只对新建网卡生效，这里让当前网卡立刻用上 fq
-    IF=$(tune_default_iface)
-    if [[ -n "$IF" ]] && command -v tc >/dev/null 2>&1; then
-        if ! tc qdisc show dev "$IF" 2>/dev/null | grep -qw fq; then
-            if tc qdisc replace dev "$IF" root fq 2>/dev/null; then
-                tune_state_set QDISC_CHANGED "$IF"
-                info "网卡 ${IF} 队列已切换为 fq"
-            else
-                warn "网卡队列切换失败，重启后会按 default_qdisc 生效"
-            fi
-        fi
-    fi
-
-    # 开机加载 bbr 模块
-    echo "tcp_bbr" > "$TUNE_MODLOAD" 2>/dev/null
-
-    # sing-box 文件句柄
-    mkdir -p "$TUNE_LIMITS_DIR"
-    printf '[Service]\nLimitNOFILE=1048576\n' > "$TUNE_LIMITS_CONF"
-    systemctl daemon-reload 2>/dev/null
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        if systemctl restart "$SERVICE_NAME" 2>/dev/null; then
-            info "sing-box 已重启，新参数对新连接生效"
-        else
-            warn "sing-box 重启失败，请检查: systemctl status $SERVICE_NAME"
-        fi
-    fi
-}
-
-# ---------- XanMod 内核（BBRv3） ----------
-tune_cpu_level() {
-    awk 'BEGIN { level = 0
-        while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
-        if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
-        if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
-        if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
-        if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
-        print level }'
-}
-
-# 官方主线分支只有 v2/v3，v1 只能用 LTS 分支；v4 机器装 v3
-tune_xanmod_pkg() {
-    [[ "$(uname -m)" == "x86_64" ]] || return 1
-    case "$(tune_cpu_level)" in
-        1)   echo "linux-xanmod-lts-x64v1" ;;
-        2)   echo "linux-xanmod-x64v2" ;;
-        3|4) echo "linux-xanmod-x64v3" ;;
-        *)   return 1 ;;
-    esac
-}
-
-tune_install_xanmod() {
-    title "安装 XanMod 内核（BBRv3）"
-    if [[ "$(uname -m)" != "x86_64" ]]; then
-        warn "XanMod 仅支持 x86_64（当前 $(uname -m)），跳过内核安装"; return 1
-    fi
-    if uname -r | grep -qi xanmod; then
-        info "当前已在运行 XanMod 内核: $(uname -r)"; return 0
-    fi
-    if dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | grep -q '^linux-xanmod'; then
-        info "XanMod 内核已安装，重启后生效"; TUNE_NEED_REBOOT=1; return 0
-    fi
-
-    local pkg level codename free_mb cand
-    pkg=$(tune_xanmod_pkg)
-    if [[ -z "$pkg" ]]; then
-        warn "CPU 不满足 x86-64 要求，跳过内核安装"; return 1
-    fi
-    level=$(tune_cpu_level)
-    codename=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
-    [[ -z "$codename" ]] && { warn "无法识别系统代号，跳过内核安装"; return 1; }
-    info "CPU 等级 x86-64-v${level} → 安装 ${pkg}"
-    [[ "$pkg" == *lts* ]] && warn "该 CPU 只能用 LTS 分支（官方主线不提供 v1）"
-
-    free_mb=$(df -Pm /boot | awk 'NR==2{print $4}')
-    if (( ${free_mb:-0} < 600 )); then
-        warn "/boot 所在分区剩余 ${free_mb}MB，不足 600MB，跳过内核安装"; return 1
-    fi
-
-    export DEBIAN_FRONTEND=noninteractive
-    info "准备依赖和软件源..."
-    apt-get update -qq >/dev/null 2>&1
-    if ! apt-get install -y -qq ca-certificates gpg curl >/dev/null 2>&1; then
-        error "依赖安装失败，跳过内核安装"; return 1
-    fi
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL --max-time 30 https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o "$TUNE_XAN_KEY" 2>/dev/null
-    if [[ ! -s "$TUNE_XAN_KEY" ]]; then
-        rm -f "$TUNE_XAN_KEY"
-        error "下载 XanMod 签名密钥失败（网络不通？），跳过内核安装"; return 1
-    fi
-    echo "deb [signed-by=${TUNE_XAN_KEY}] https://deb.xanmod.org ${codename} main" > "$TUNE_XAN_LIST"
-    if ! apt-get update -qq >/dev/null 2>&1; then
-        rm -f "$TUNE_XAN_LIST"
-        error "XanMod 软件源更新失败，已移除软件源"; return 1
-    fi
-    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')
-    if [[ -z "$cand" || "$cand" == "(none)" ]]; then
-        rm -f "$TUNE_XAN_LIST"; apt-get update -qq >/dev/null 2>&1
-        error "XanMod 源里没有 ${pkg}（${codename} 可能不受支持），已移除软件源"; return 1
-    fi
-
-    info "正在安装 ${pkg} ${cand}（约 100~200MB，请耐心等待）..."
-    if ! apt-get install -y -q "$pkg"; then
-        rm -f "$TUNE_XAN_LIST"
-        error "内核安装失败，原内核不受影响"; return 1
-    fi
-    update-grub >/dev/null 2>&1 || true
-    if ! ls /boot/vmlinuz-*xanmod* >/dev/null 2>&1; then
-        error "没有找到 XanMod 内核文件，请不要重启，检查 apt 输出"; return 1
-    fi
-    if [[ -f /boot/grub/grub.cfg ]] && ! grep -q xanmod /boot/grub/grub.cfg 2>/dev/null; then
-        warn "GRUB 配置里没找到 XanMod，重启前请确认引导项"
-    fi
-    tune_state_set XANMOD_PKG "$pkg"
-    TUNE_NEED_REBOOT=1
-    info "XanMod 内核安装完成（原内核保留，可从 GRUB 回退）"
-    return 0
-}
-
-tune_remove_xanmod() {
-    local pkgs others
-    pkgs=$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /xanmod/ {print $2}')
-    if [[ -z "$pkgs" ]]; then
-        info "未安装 XanMod 内核，无需卸载"; return 0
-    fi
-    others=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ && $2 ~ /^linux-image-[0-9]/ && $2 !~ /xanmod/ {c++} END{print c+0}')
-    if (( others == 0 )); then
-        error "系统里没有其他内核，卸载会导致无法启动，已取消"; return 1
-    fi
-    export DEBIAN_FRONTEND=noninteractive
-    info "正在卸载 XanMod 内核..."
-    # shellcheck disable=SC2086
-    if ! apt-get purge -y -q $pkgs; then
-        error "卸载失败。可重启后选择原内核启动，再执行 16 → 4 重试"
-        return 1
-    fi
-    rm -f "$TUNE_XAN_LIST" "$TUNE_XAN_KEY"
-    apt-get update -qq >/dev/null 2>&1
-    update-grub >/dev/null 2>&1 || true
-    uname -r | grep -qi xanmod && TUNE_NEED_REBOOT=1
-    info "XanMod 内核已卸载"
-    return 0
-}
-
-tune_ask_reboot() {
-    [[ "$TUNE_NEED_REBOOT" == "1" ]] || return 0
-    echo ""
-    warn "内核需要重启后才生效（重启后 BBR 自动变成 BBRv3，参数已保存，无需再设置）"
-    if tune_yes "现在重启服务器？[y/N]: " "N"; then
-        info "3 秒后重启..."
-        sleep 3
-        reboot
-        exit 0
-    fi
-    info "稍后请手动执行 reboot；重启后进菜单 16 → 3 可查看 BBR 版本"
-}
-
-# ---------- 状态 ----------
-tune_tcp_counters() {
-    awk '/^Tcp:/{ if(!h){for(i=1;i<=NF;i++)n[$i]=i; h=1} else {print $n["OutSegs"], $n["RetransSegs"]; exit} }' /proc/net/snmp
-}
-
-tune_retrans_pct() {  # 发出段数 重传段数
-    awk -v o="$1" -v r="$2" 'BEGIN{ if (o>0) printf "%.2f%%", r*100/o; else printf "-" }'
-}
-
-tune_status() {
-    title "网络优化状态"
-    local kv cc IF qd bbrv swap_total done_at c1 o1 r1 o2 r2
-    kv=$(uname -r)
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    IF=$(tune_default_iface)
-    qd=$(tc qdisc show dev "$IF" 2>/dev/null | head -1 | awk '{print $2}')
-    if [[ "$cc" != "bbr" ]]; then
-        bbrv="（未启用 BBR）"
-    elif [[ "$kv" == *xanmod* ]]; then
-        bbrv="${GREEN}BBRv3 (XanMod)${NC}"
-    else
-        bbrv="${YELLOW}BBRv1 (系统自带)${NC}"
-    fi
-    swap_total=$(free -m | awk '/^Swap:/{print $2}')
-
-    echo -e "  内核          ${CYAN}${kv}${NC}"
-    echo -e "  拥塞控制      ${CYAN}${cc:-未知}${NC}  ${bbrv}"
-    echo -e "  队列 ${IF:+(${IF})}    ${qd:-未知}"
-    echo -e "  发送上限      $(tune_mb "$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)") MB"
-    echo -e "  接收上限      $(tune_mb "$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)") MB"
-    echo -e "  tcp_wmem      $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
-    echo -e "  tcp_rmem      $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
-    echo -e "  swap          ${swap_total:-0} MB"
-    if [[ -f "$TUNE_CONF" ]]; then
-        echo -e "  优化参数      ${GREEN}已写入${NC}  延迟 $(tune_state_get RTT_MS)ms / 带宽 $(tune_state_get BW_MBPS)Mbps"
-    else
-        echo -e "  优化参数      ${YELLOW}未优化${NC}"
-    fi
-    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
-        done_at=$(cat "${TUNE_BACKUP}/.done")
-        echo -e "  原始备份      ${GREEN}已备份${NC}（${done_at}）"
-    else
-        echo -e "  原始备份      ${YELLOW}尚未备份${NC}"
-    fi
-
-    c1=$(tune_tcp_counters)
-    o1=${c1% *}; r1=${c1#* }
-    echo -e "  累计重传率    ${CYAN}$(tune_retrans_pct "$o1" "$r1")${NC}（开机以来）"
-    if tune_yes "  采样 10 秒实时重传率？[y/N]: " "N"; then
-        echo "  采样中..."
-        sleep 10
-        c1=$(tune_tcp_counters)
-        o2=${c1% *}; r2=${c1#* }
-        echo -e "  实时重传率    ${CYAN}$(tune_retrans_pct $(( o2 - o1 )) $(( r2 - r1 )))${NC}（10 秒内 发出 $(( o2 - o1 )) 段 / 重传 $(( r2 - r1 )) 段）"
-    fi
-}
-
-# ---------- 优化向导 ----------
-tune_wizard() {
-    title "服务器网络优化向导（BBR3）"
-    tune_check_env || return 1
-    tune_backup_once || return 1
-
-    local mem rtt bw pkg kernel_line want_kernel=0
-    mem=$(free -m | awk '/^Mem:/{print $2}')
-
-    echo ""
-    echo -e "${CYAN}[1/3] 服务器到你本地的延迟${NC}"
-    echo "  在你本地电脑执行 ping 服务器IP，取平均延迟（ms）"
-    tune_read_int "  延迟 ms [1~1000]" 1 1000 "$(tune_state_get RTT_MS)"
-    rtt=$TUNE_READ
-
-    echo ""
-    echo -e "${CYAN}[2/3] 服务器内存（自动读取）${NC}"
-    tune_swap_plan "$mem"
-    echo -e "  内存 ${GREEN}${mem}MB${NC}  →  swap: ${TUNE_SWAP_WHY}"
-
-    echo ""
-    echo -e "${CYAN}[3/3] 厂商标称带宽${NC}"
-    tune_read_int "  带宽 Mbps [1~100000]" 1 100000 "$(tune_state_get BW_MBPS)"
-    bw=$TUNE_READ
-
-    tune_calc "$rtt" "$bw" "$mem"
-
-    if uname -r | grep -qi xanmod; then
-        kernel_line="已在运行 XanMod，无需安装"
-    else
-        pkg=$(tune_xanmod_pkg)
-        if [[ -n "$pkg" ]]; then
-            kernel_line="安装 ${pkg}（BBRv3，需重启）"; want_kernel=1
-        else
-            kernel_line="跳过（仅支持 x86_64 且 CPU 满足 v1 以上）"
-        fi
-    fi
-
-    echo ""
-    echo -e "${BLUE}─────────── 参数确认 ───────────${NC}"
-    echo "  延迟          ${rtt} ms"
-    echo "  带宽          ${bw} Mbps"
-    echo "  内存          ${mem} MB"
-    echo "  BDP           $(tune_mb "$TUNE_BDP") MB"
-    echo "  发送缓冲上限  $(tune_mb "$TUNE_WMAX") MB"
-    echo "  接收缓冲上限  $(tune_mb "$TUNE_RMAX") MB（${TUNE_NOTE}）"
-    echo "  swap          ${TUNE_SWAP_WHY}"
-    echo "  内核          ${kernel_line}"
-    echo -e "${BLUE}────────────────────────────────${NC}"
-    tune_yes "确认开始优化？[Y/n]: " "Y" || { warn "已取消"; return 0; }
-
-    tune_state_set RTT_MS "$rtt"
-    tune_state_set BW_MBPS "$bw"
-
-    (( TUNE_SWAP_ADD > 0 )) && tune_create_swap "$TUNE_SWAP_ADD"
-
-    tune_write_conf "$rtt" "$bw" "$mem" "$TUNE_RMAX" "$TUNE_WMAX" "$want_kernel"
-    tune_neutralize_conflicts
-    tune_apply_runtime
-    tune_state_set TUNED_AT "$(date '+%F %T')"
-    info "优化参数已写入: ${TUNE_CONF}"
-
-    if (( want_kernel == 1 )); then
-        echo ""
-        if tune_yes "现在安装 XanMod 内核（BBRv3）？[Y/n]: " "Y"; then
-            tune_install_xanmod
-        else
-            warn "已跳过内核，当前使用系统自带 BBR；以后可再运行本向导安装"
-        fi
-    fi
-
-    echo ""
-    tune_status
-    tune_ask_reboot
-}
-
-# ---------- 仅重算缓冲区 ----------
-tune_retune() {
-    title "重新计算缓冲区"
-    tune_check_env || return 1
-    tune_backup_once || return 1
-    local mem rtt bw
-    mem=$(free -m | awk '/^Mem:/{print $2}')
-    tune_read_int "延迟 ms [1~1000]" 1 1000 "$(tune_state_get RTT_MS)"
-    rtt=$TUNE_READ
-    tune_read_int "带宽 Mbps [1~100000]" 1 100000 "$(tune_state_get BW_MBPS)"
-    bw=$TUNE_READ
-    tune_calc "$rtt" "$bw" "$mem"
-    echo "  发送上限 $(tune_mb "$TUNE_WMAX") MB / 接收上限 $(tune_mb "$TUNE_RMAX") MB（${TUNE_NOTE}）"
-    tune_yes "确认应用？[Y/n]: " "Y" || { warn "已取消"; return 0; }
-    tune_state_set RTT_MS "$rtt"
-    tune_state_set BW_MBPS "$bw"
-    local want_kernel=0
-    uname -r | grep -qi xanmod && want_kernel=1
-    [[ -n "$(tune_state_get XANMOD_PKG)" ]] && want_kernel=1
-    tune_write_conf "$rtt" "$bw" "$mem" "$TUNE_RMAX" "$TUNE_WMAX" "$want_kernel"
-    tune_neutralize_conflicts
-    tune_apply_runtime
-    tune_state_set TUNED_AT "$(date '+%F %T')"
-    info "缓冲区已更新"
-}
-
-# ---------- 恢复原始设置 ----------
-tune_restore() {
-    title "恢复原始设置"
-    if [[ ! -f "${TUNE_BACKUP}/.done" ]]; then
-        warn "没有找到原始备份（还没运行过优化向导），无需恢复"
-        return 0
-    fi
-    echo "将撤销：优化参数、本脚本新建的 swap、sing-box 句柄配置，并可选卸载 XanMod 内核。"
-    echo "原始备份会继续保留，不会被删除。"
-    tune_yes "确认恢复？[y/N]: " "N" || { warn "已取消"; return 0; }
-
-    local key val f swapf IFQ
-    # 1. 内核参数：按首次备份的值还原运行时
-    if [[ -f "$TUNE_CONF" ]]; then
-        while IFS= read -r key; do
-            val=$(awk -v k="$key" 'index($0, k " = ")==1 {print substr($0, length(k)+4); exit}' "${TUNE_BACKUP}/sysctl-all.txt")
-            [[ -n "$val" ]] && sysctl -w "${key}=${val}" >/dev/null 2>&1
-        done < <(awk -F' = ' '/^[a-z]/{print $1}' "$TUNE_CONF")
-        rm -f "$TUNE_CONF"
-        info "已移除优化参数并还原运行时数值"
-    fi
-    rm -f "$TUNE_MODLOAD"
-
-    # 2. 去掉我们加在其他 sysctl 文件里的注释前缀
-    for f in $(tune_state_get TOUCHED); do
-        [[ -f "$f" ]] && sed -i 's/^# \[sbox-tune\] //' "$f"
-    done
-
-    # 3. swap
-    swapf=$(tune_state_get SWAP_FILE)
-    if [[ -n "$swapf" ]]; then
-        swapoff "$swapf" 2>/dev/null
-        rm -f "$swapf"
-        sed -i "\|^${swapf}[[:space:]]|d" /etc/fstab
-        info "已删除脚本创建的 swap"
-    fi
-
-    # 4. sing-box 句柄配置
-    if [[ -f "$TUNE_LIMITS_CONF" ]]; then
-        rm -f "$TUNE_LIMITS_CONF"
-        rmdir "$TUNE_LIMITS_DIR" 2>/dev/null
-        systemctl daemon-reload 2>/dev/null
-        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && systemctl restart "$SERVICE_NAME" 2>/dev/null
-        info "已移除 sing-box 句柄配置并重启服务"
-    fi
-
-    # 5. 网卡队列
-    IFQ=$(tune_state_get QDISC_CHANGED)
-    if [[ -n "$IFQ" ]]; then
-        tc qdisc del dev "$IFQ" root 2>/dev/null
-        info "网卡 ${IFQ} 队列已还原为系统默认"
-    fi
-
-    # 6. 内核
-    if dpkg -l 2>/dev/null | awk '/^ii/{print $2}' | grep -q xanmod; then
-        echo ""
-        if tune_yes "是否同时卸载 XanMod 内核并回到原内核？[y/N]: " "N"; then
-            tune_remove_xanmod
-        else
-            warn "已保留 XanMod 内核"
-        fi
-    fi
-
-    rm -f "$TUNE_STATE"
-    info "恢复完成（原始备份仍在 ${TUNE_BACKUP}）"
-    tune_ask_reboot
-}
-
-# ---------- 菜单 ----------
-tune_menu() {
-    title "服务器网络优化（BBR3 / 缓冲区 / swap）"
-    echo ""
-    if [[ -f "${TUNE_BACKUP}/.done" ]]; then
-        echo -e "  原始备份：${GREEN}已备份（只读保护）${NC}"
-    else
-        echo -e "  原始备份：${YELLOW}首次运行向导时自动备份${NC}"
-    fi
-    if [[ -f "$TUNE_CONF" ]]; then
-        echo -e "  当前状态：${GREEN}已优化${NC}"
-    else
-        echo -e "  当前状态：${YELLOW}未优化${NC}"
-    fi
-    echo ""
-    echo -e "  ${GREEN}1.${NC} 优化向导（备份 → 参数 → swap → BBR3）"
-    echo -e "  ${GREEN}2.${NC} 仅重算缓冲区（换了延迟/带宽）"
-    echo -e "  ${GREEN}3.${NC} 查看当前状态"
-    echo -e "  ${RED}4.${NC} 恢复原始设置"
-    echo -e "  ${GREEN}0.${NC} 返回"
-    echo ""
-    local OPT
-    read -rp "选择: " OPT
-    case "$OPT" in
-        1) tune_wizard ;;
-        2) tune_retune ;;
-        3) tune_status ;;
-        4) tune_restore ;;
-        0) return ;;
-        *) warn "无效选项" ;;
-    esac
 }
 
 # ============================================================
@@ -2935,10 +2457,14 @@ esac
 cleanup_legacy() {
     local touched=0
     if [[ -f /etc/systemd/system/sbox-tgbot.service || -d /etc/vless-manager ]]; then
-        systemctl disable --now sbox-tgbot.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/sbox-tgbot.service
+        if [[ "$OS_TYPE" == "alpine" ]]; then
+            rc-service sbox-tgbot stop 2>/dev/null; rc-update del sbox-tgbot default 2>/dev/null; rm -f /etc/init.d/sbox-tgbot
+        else
+            systemctl disable --now sbox-tgbot.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/sbox-tgbot.service
+            systemctl daemon-reload 2>/dev/null
+        fi
         rm -rf /etc/vless-manager
-        systemctl daemon-reload 2>/dev/null
         touched=1
     fi
     if crontab -l 2>/dev/null | grep -qE "quota-collect|quota-reset"; then
@@ -2961,9 +2487,9 @@ main_menu() {
         load_meta
 
         local SBOX_STATUS USER_COUNT ACTIVE_COUNT
-        SBOX_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
-        USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(wc -l < "$USER_DB")
-        ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || echo 0)
+        SBOX_STATUS="inactive"; svc_active "$SERVICE_NAME" && SBOX_STATUS="active"
+        USER_COUNT=0; [[ -f "$USER_DB" ]] && USER_COUNT=$(awk 'END{print NR+0}' "$USER_DB")
+        ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || true)
 
         local MODE_STR=""
         has_reality     && MODE_STR="Reality"
@@ -2977,7 +2503,7 @@ main_menu() {
         [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v1.9.0${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v2.0.1${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
@@ -2993,9 +2519,8 @@ main_menu() {
         echo -e "${BLUE}║${NC}   ${GREEN}9.${NC}  查看分享链接      ${GREEN}10.${NC} 节点运行信息"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  ${CYAN}▣ 系统维护${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 更新 sing-box     ${GREEN}12.${NC} 更新管理脚本"
-        echo -e "${BLUE}║${NC}   ${GREEN}13.${NC} 更新 Hysteria     ${GREEN}14.${NC} IPv4/IPv6 优先级"
-        echo -e "${BLUE}║${NC}   ${RED}15.${NC} 卸载 sing-box     ${GREEN}16.${NC} 网络优化(BBR3)"
+        echo -e "${BLUE}║${NC}   ${GREEN}11.${NC} 更新管理脚本     ${GREEN}12.${NC} IPv4/IPv6 优先级"
+        echo -e "${BLUE}║${NC}   ${RED}13.${NC} 卸载 sing-box"
         echo -e "${BLUE}║${NC}   ${GREEN}0.${NC}   退出"
         echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo -ne " 请选择 » "
@@ -3012,12 +2537,9 @@ main_menu() {
             8)  list_users ;;
             9)  show_user_link ;;
             10) show_info ;;
-            11) update_sbox ;;
-            12) update_script ;;
-            13) update_hysteria_binary ;;
-            14) ip_priority_menu ;;
-            15) uninstall_sbox ;;
-            16) tune_menu ;;
+            11) update_script ;;
+            12) ip_priority_menu ;;
+            13) uninstall_sbox ;;
             0)  echo -e "${GREEN}再见！${NC}"; exit 0 ;;
             *)  warn "无效选项" ;;
         esac
