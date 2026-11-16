@@ -1,5 +1,6 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v2.0.2
+# VLESS 智能节点控制台 (sing-box) v2.0.3
+# 更新: v2.0.3 修复 VLESS/WS 到期控制：注入时跳过已到期用户、Debian 下自动安装并启动 cron；
 # 更新: v2.0.2 修复 IPv6 下分享链接、Reality 备注 URL 编码；
 # 更新: v2.0.1 删除菜单 11 更新 sing-box、菜单 13 更新 Hysteria；
 #   发现新版本请卸载后重装脚本（重装即拉取最新版），不再在脚本内原地更新
@@ -654,7 +655,7 @@ install_sbox() {
 }
 
 # ============================================================
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.2 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.3 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -983,6 +984,20 @@ PYEOF
 # ============================================================
 _inject_user() {
     local UUID=$1 NAME=$2 EXPIRE=$3 NODE=$4 SSPASS=${5:-}
+
+    # 到期即不注入（只针对 VLESS Reality/WS，本函数只写这两个入站）：
+    # 堵住“cron 还没跑到就重建配置把过期用户复活”的窗口。状态翻 disabled 仍由
+    # check_expire 负责，这里只跳过注入、不改 users.db。
+    # EXPIRE 解析失败或为空（或 python3 缺失）时不拦截，沿用旧行为，避免误伤全部用户。
+    local _EXPIRE_TS _NOW_TS
+    _EXPIRE_TS=$(expire_to_ts "$EXPIRE")
+    if [[ -n "$_EXPIRE_TS" && "$_EXPIRE_TS" != "0" ]]; then
+        _NOW_TS=$(now_shanghai_ts)
+        if (( _NOW_TS >= _EXPIRE_TS )); then
+            warn "用户 ${NAME} 已到期（$(expire_display "$EXPIRE")），跳过注入"
+            return 0
+        fi
+    fi
 
     INJECT_UUID="$UUID" INJECT_NAME="$NAME" INJECT_NODE="$NODE" INJECT_SSPASS="$SSPASS" \
     INJECT_CONFIG="$SBOX_CONFIG" python3 - <<'PYEOF'
@@ -2434,9 +2449,35 @@ install_shortcut() {
 # ============================================================
 setup_cron() {
     local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
+    # Debian：先保证 cron 装好、服务在跑，否则下面写 crontab 只是写了张永远没人执行的表
+    if [[ "$OS_TYPE" != "alpine" ]]; then
+        if ! command -v crontab >/dev/null 2>&1; then
+            info "正在安装 cron..."
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq cron || warn "cron 安装失败，请手动执行 apt-get install -y cron"
+        fi
+        if ! command -v crontab >/dev/null 2>&1; then
+            error "cron 安装失败（crontab 仍不存在），到期检查未设置，请手动执行 apt-get install -y cron"
+            return 1
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now cron >/dev/null 2>&1 || service cron start >/dev/null 2>&1 || cron >/dev/null 2>&1 || true
+        else
+            service cron start >/dev/null 2>&1 || cron >/dev/null 2>&1 || true
+        fi
+    fi
     # 用临时文件装 crontab：BusyBox crontab 不支持 `crontab -` 读 stdin
     (crontab -l 2>/dev/null | grep -v "check-expire" | grep -v "quota-collect" | grep -v "quota-reset"; echo "$EXPIRE_CMD") > /tmp/sbox-cron.tmp
-    crontab /tmp/sbox-cron.tmp && rm -f /tmp/sbox-cron.tmp
+    if ! crontab /tmp/sbox-cron.tmp; then
+        error "crontab 写入失败，到期检查未设置"
+        rm -f /tmp/sbox-cron.tmp
+        return 1
+    fi
+    rm -f /tmp/sbox-cron.tmp
+    if ! crontab -l 2>/dev/null | grep -q "check-expire"; then
+        error "crontab 校验失败，未找到 check-expire，到期检查未设置"
+        return 1
+    fi
     info "已设置每 5 分钟自动检查到期用户"
     if [[ "$OS_TYPE" == "alpine" ]]; then
         rc-service crond start >/dev/null 2>&1
@@ -2527,7 +2568,7 @@ main_menu() {
         [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v2.0.2${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v2.0.3${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
@@ -2552,7 +2593,7 @@ main_menu() {
 
         case $OPT in
             1)  check_system; set_shanghai_timezone; install_sbox; init_config; setup_cron ;;
-            2)  init_config ;;
+            2)  init_config; setup_cron ;;
             3)  add_user ;;
             4)  delete_user ;;
             5)  toggle_user disable ;;
