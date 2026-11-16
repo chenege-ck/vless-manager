@@ -1,5 +1,6 @@
 #!/bin/bash
-# VLESS 智能节点控制台 (sing-box) v2.0.1
+# VLESS 智能节点控制台 (sing-box) v2.0.2
+# 更新: v2.0.2 修复 IPv6 下分享链接、Reality 备注 URL 编码；
 # 更新: v2.0.1 删除菜单 11 更新 sing-box、菜单 13 更新 Hysteria；
 #   发现新版本请卸载后重装脚本（重装即拉取最新版），不再在脚本内原地更新
 # 更新: v2.0.0 (Debian 11/12/13 + Alpine 双支持；移除菜单 16 网络优化；
@@ -272,6 +273,15 @@ get_public_ip() {
         done
     fi
     echo "${ip:-<请手动填写服务器IP>}"
+}
+
+# ============== IPv6 地址加方括号（分享链接用） ==============
+# Hy2 的 hy2_share_link 里已有同款内联处理，这里抽成共用函数：
+# IPv4 / 占位符原样返回，裸 IPv6 加 []，已带 [] 的不再重复加
+bracket_host() {
+    local h="$1"
+    [[ "$h" == *:* && "$h" != \[*\] ]] && h="[${h}]"
+    printf '%s' "$h"
 }
 
 # ============== 端口检查 ==============
@@ -644,7 +654,7 @@ install_sbox() {
 }
 
 # ============================================================
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.1 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.2 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1112,6 +1122,8 @@ _print_ss_link() {
     [[ -z "$SS_PASSWORD" ]] && return
     local SERVER_IP
     SERVER_IP=$(get_public_ip)
+    local HOST
+    HOST=$(bracket_host "$SERVER_IP")
     local USERINFO
     USERINFO=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | b64_nw)
     echo ""
@@ -1121,7 +1133,7 @@ _print_ss_link() {
     echo -e "加密   : ${SS_METHOD}"
     echo -e "密码   : ${SS_PASSWORD}"
     echo -e "${CYAN}分享链接:${NC}"
-    echo "ss://${USERINFO}@${SERVER_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
+    echo "ss://${USERINFO}@${HOST}:${SS_PORT}#Shadowsocks-${SS_PORT}"
     echo ""
 }
 
@@ -1505,6 +1517,8 @@ _print_anytls_link() {
     AT_PUBKEY=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
     AT_SHORTID=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
     SERVER_IP=$(get_public_ip)
+    local AT_HOST
+    AT_HOST=$(bracket_host "$SERVER_IP")
     echo ""
     echo -e "${GREEN}===== AnyTLS 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
@@ -1516,7 +1530,7 @@ _print_anytls_link() {
     echo -e "伪装   : Reality"
     echo ""
     echo -e "${CYAN}客户端配置示例:${NC}"
-    echo "anytls://${AT_PASSWORD}@${SERVER_IP}:${AT_PORT}/?sni=${AT_SNI}&pbk=${AT_PUBKEY}&sid=${AT_SHORTID}&fp=chrome&security=reality#AnyTLS-${AT_PORT}"
+    echo "anytls://${AT_PASSWORD}@${AT_HOST}:${AT_PORT}/?sni=${AT_SNI}&pbk=${AT_PUBKEY}&sid=${AT_SHORTID}&fp=chrome&security=reality#AnyTLS-${AT_PORT}"
     echo ""
 }
 
@@ -1629,7 +1643,11 @@ for i in d.get('inbounds',[]):
         echo -e "SNI    : ${REALITY_SNI}"
         echo -e "ShortID: ${SHORTID}"
 
-        local LINK="vless://${UUID}@${SERVER_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${USERNAME}-reality"
+        local HOST
+        HOST=$(bracket_host "$SERVER_IP")
+        local ENCODED_REALITY_NAME
+        ENCODED_REALITY_NAME=$(USERNAME="$USERNAME" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["USERNAME"] + "-reality"))')
+        local LINK="vless://${UUID}@${HOST}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${ENCODED_REALITY_NAME}"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$LINK"
     fi
@@ -1638,7 +1656,9 @@ for i in d.get('inbounds',[]):
         if [[ -n "$SSPASS" ]]; then
             local SS_USERINFO SS_LINK
             SS_USERINFO=$(printf '%s' "${SS_METHOD}:${SSPASS}" | b64_nw)
-            SS_LINK="ss://${SS_USERINFO}@${SERVER_IP:-$(get_public_ip)}:${SS_PORT}#${USERNAME}-ss"
+            local SS_HOST
+            SS_HOST=$(bracket_host "${SERVER_IP:-$(get_public_ip)}")
+            SS_LINK="ss://${SS_USERINFO}@${SS_HOST}:${SS_PORT}#${USERNAME}-ss"
             echo ""
             echo -e "${CYAN}── Shadowsocks 个人节点 ──${NC}"
             echo -e "地址   : ${SERVER_IP:-$(get_public_ip)}"
@@ -2216,6 +2236,8 @@ show_info() {
     ACTIVE_COUNT=0; [[ -f "$USER_DB" ]] && ACTIVE_COUNT=$(grep -c ":active:" "$USER_DB" 2>/dev/null || true)
 
     PUBLIC_IP=$(get_public_ip)
+    local PUBLIC_HOST
+    PUBLIC_HOST=$(bracket_host "$PUBLIC_IP")
     LOAD_INFO=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     MEM_INFO=$(free -m | awk '/^Mem:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
     SWAP_INFO=$(free -m | awk '/^Swap:/ {printf "%d/%dMB", $3, $2}' 2>/dev/null)
@@ -2254,7 +2276,9 @@ for i in d.get('inbounds',[]):
                 [[ "$RSTATUS" != "active" ]] && continue
                 RNODE=${RNODE:-both}
                 [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
-                echo "[${RNAME}] vless://${RUUID}@${PUBLIC_IP}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${RNAME}-reality"
+                local ENCODED_RNAME
+                ENCODED_RNAME=$(RNAME="$RNAME" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["RNAME"] + "-reality"))')
+                echo "[${RNAME}] vless://${RUUID}@${PUBLIC_HOST}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${ENCODED_RNAME}"
             done < "$USER_DB"
         fi
         echo ""
@@ -2263,7 +2287,7 @@ for i in d.get('inbounds',[]):
     if has_shadowsocks; then
         local SS_USERINFO_SHOW SS_LINK_SHOW
         SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | b64_nw)
-        SS_LINK_SHOW="ss://${SS_USERINFO_SHOW}@${PUBLIC_IP}:${SS_PORT}#Shadowsocks-${SS_PORT}"
+        SS_LINK_SHOW="ss://${SS_USERINFO_SHOW}@${PUBLIC_HOST}:${SS_PORT}#Shadowsocks-${SS_PORT}"
         echo -e "${CYAN}── Shadowsocks 节点 ──${NC}"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${SS_PORT}"
@@ -2280,7 +2304,7 @@ for i in d.get('inbounds',[]):
                 [[ "$SNODE" != "ss" && "$SNODE" != "both" ]] && continue
                 [[ -z "$SSPW" ]] && continue
                 SS_UI=$(printf '%s' "${SS_METHOD}:${SSPW}" | b64_nw)
-                SS_LK="ss://${SS_UI}@${PUBLIC_IP}:${SS_PORT}#${SNAME}-ss"
+                SS_LK="ss://${SS_UI}@${PUBLIC_HOST}:${SS_PORT}#${SNAME}-ss"
                 echo "[${SNAME}] ${SS_LK}"
             done < "$USER_DB"
         fi
@@ -2324,7 +2348,7 @@ for i in d.get('inbounds',[]):
         AT_PUBKEY_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_PUBLIC_KEY")
         AT_SHORTID_SHOW=$(read_kv "$META_ANYTLS" "ANYTLS_SHORTID")
         AT_STATUS_SHOW="inactive"; svc_active "$SERVICE_NAME" && AT_STATUS_SHOW="active"
-        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_IP}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&pbk=${AT_PUBKEY_SHOW}&sid=${AT_SHORTID_SHOW}&fp=chrome&security=reality#AnyTLS-${AT_PORT_SHOW}"
+        AT_LINK_SHOW="anytls://${AT_PASSWORD_SHOW}@${PUBLIC_HOST}:${AT_PORT_SHOW}/?sni=${AT_SNI_SHOW}&pbk=${AT_PUBKEY_SHOW}&sid=${AT_SHORTID_SHOW}&fp=chrome&security=reality#AnyTLS-${AT_PORT_SHOW}"
         echo -e "${CYAN}── AnyTLS 节点 ──${NC}"
         echo -e "状态   : $( [[ "$AT_STATUS_SHOW" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
@@ -2503,7 +2527,7 @@ main_menu() {
         [[ "$SBOX_STATUS" == "active" ]] && STATUS_COLOR=$GREEN && STATUS_TEXT="● 运行中"
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v2.0.1${NC}           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${CYAN}智能节点控制台 (sing-box)  v2.0.2${NC}           ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC}  sing-box ${STATUS_COLOR}${STATUS_TEXT}${NC}   模式 ${YELLOW}${MODE_STR}${NC}"
         echo -e "${BLUE}║${NC}  用户 ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
