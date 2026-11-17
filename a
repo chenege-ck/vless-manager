@@ -2,7 +2,8 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.11
+# VLESS 智能节点控制台 (sing-box) v2.0.12
+# 更新: v2.0.12 AnyTLS 节点信息按模板出 sing-box 出站 JSON（tag 按 VLESS 的办法生成：AnyTLS-端口；端口/密码/SNI/公钥/short_id 填真实值）；
 # 更新: v2.0.11 修 Alpine 上 Hy2 启动失败：HY_SERVICE 去掉 .service 后缀（rc-service 只认裸名）；
 # 更新: v2.0.10 装 Hy2 时自动调 UDP 缓冲（按内存 1/16，上限 25MB、下限 4MB，只升不降；卸载时删 sysctl 文件）；
 # 更新: v2.0.9 卸载补缺口：删 Hy2 日志 /var/log/hysteria-server.log(.err)，残留自检清单补全（hysteria.bak/.new、logrotate、/var/lib/sbox、sbox-expire 日志）；
@@ -689,7 +690,7 @@ install_sbox() {
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
 # v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.11 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.12 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1643,6 +1644,37 @@ remove_anytls() {
     info "AnyTLS 已移除"
 }
 
+# 按模板打印 AnyTLS sing-box 出站 JSON（tag 按 VLESS 的办法生成：AnyTLS-端口）
+_print_anytls_json(){
+    local SERVER="$1" PORT="$2" PASSWORD="$3" SNI="$4" PUBKEY="$5" SHORTID="$6"
+    cat <<EOF
+{
+  "type": "anytls",
+  "tag": "AnyTLS-${PORT}",
+  "server": "${SERVER}",
+  "server_port": ${PORT},
+  "password": "${PASSWORD}",
+  "idle_session_check_interval": "30s",
+  "idle_session_timeout": "30s",
+  "min_idle_session": 5,
+  "tls": {
+    "enabled": true,
+    "server_name": "${SNI}",
+    "disable_sni": false,
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    },
+    "reality": {
+      "enabled": true,
+      "public_key": "${PUBKEY}",
+      "short_id": "${SHORTID}"
+    }
+  }
+}
+EOF
+}
+
 _print_anytls_link() {
     has_anytls || return 1
     local AT_PORT AT_PASSWORD AT_SNI AT_PUBKEY AT_SHORTID SERVER_IP
@@ -1663,6 +1695,9 @@ _print_anytls_link() {
     echo -e "公钥   : ${AT_PUBKEY}"
     echo -e "ShortID: ${AT_SHORTID}"
     echo -e "伪装   : Reality"
+    echo ""
+    echo -e "${CYAN}sing-box 出站 JSON:${NC}"
+    _print_anytls_json "$SERVER_IP" "$AT_PORT" "$AT_PASSWORD" "$AT_SNI" "$AT_PUBKEY" "$AT_SHORTID"
     echo ""
     echo -e "${CYAN}客户端配置示例:${NC}"
     echo "anytls://${AT_PASSWORD}@${AT_HOST}:${AT_PORT}/?sni=${AT_SNI}&pbk=${AT_PUBKEY}&sid=${AT_SHORTID}&fp=chrome&security=reality#AnyTLS-${AT_PORT}"
@@ -2470,6 +2505,8 @@ show_info() {
         echo -e "公钥   : ${AT_PUBKEY_SHOW}"
         echo -e "ShortID: ${AT_SHORTID_SHOW}"
         echo -e "协议   : AnyTLS + Reality"
+        echo -e "${CYAN}sing-box 出站 JSON:${NC}"
+        _print_anytls_json "$PUBLIC_IP" "$AT_PORT_SHOW" "$AT_PASSWORD_SHOW" "$AT_SNI_SHOW" "$AT_PUBKEY_SHOW" "$AT_SHORTID_SHOW"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$AT_LINK_SHOW"
         echo ""
@@ -2745,7 +2782,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.11${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.12${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
