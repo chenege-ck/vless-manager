@@ -2,7 +2,9 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.9
+# VLESS 智能节点控制台 (sing-box) v2.0.11
+# 更新: v2.0.11 修 Alpine 上 Hy2 启动失败：HY_SERVICE 去掉 .service 后缀（rc-service 只认裸名）；
+# 更新: v2.0.10 装 Hy2 时自动调 UDP 缓冲（按内存 1/16，上限 25MB、下限 4MB，只升不降；卸载时删 sysctl 文件）；
 # 更新: v2.0.9 卸载补缺口：删 Hy2 日志 /var/log/hysteria-server.log(.err)，残留自检清单补全（hysteria.bak/.new、logrotate、/var/lib/sbox、sbox-expire 日志）；
 # 更新: v2.0.8 Hy2 按官网最新写法重做：端口二选一（单端口/端口段），删 masquerade，认证/混淆密码分开，链接跳端口进地址、mport 删、pinSHA256 替 insecure，YAML+链接双格式输出，版本固定 2.14.0；
 # 更新: v2.0.7 菜单 10 只显示固定密码节点（SS / Hy2 / AnyTLS），删掉 Reality 与 WS 两段（VLESS/WS 按用户有到期，链接走菜单 9）；
@@ -686,7 +688,8 @@ install_sbox() {
 # ============================================================
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.9 生成的内容）
+# v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.11 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -729,6 +732,7 @@ uninstall_sbox() {
         rm -f /tmp/sbox-cron.tmp
     fi
     rm -f /etc/logrotate.d/sbox-expire
+    rm -f /etc/sysctl.d/99-hy2-udp.conf
     rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
     rm -f /var/log/sing-box.log /var/log/sing-box.err
     rm -f /var/log/hysteria-server.log /var/log/hysteria-server.err
@@ -750,7 +754,7 @@ uninstall_sbox() {
     echo ""
     echo "残留自检："
     local leftover=0
-    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/hysteria.bak /usr/local/bin/hysteria.new /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/init.d/sing-box /etc/init.d/hysteria-server /etc/logrotate.d/sbox-expire /var/lib/sbox /var/www/masq /var/log/sing-box.log /var/log/sing-box.err /var/log/sbox-expire.log /var/log/hysteria-server.log /var/log/hysteria-server.err; do
+    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/hysteria.bak /usr/local/bin/hysteria.new /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/init.d/sing-box /etc/init.d/hysteria-server /etc/logrotate.d/sbox-expire /var/lib/sbox /var/www/masq /var/log/sing-box.log /var/log/sing-box.err /var/log/sbox-expire.log /var/log/hysteria-server.log /var/log/hysteria-server.err /etc/sysctl.d/99-hy2-udp.conf; do
         if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
     done
     if crontab -l 2>/dev/null | grep -q "check-expire"; then echo "  残留: cron check-expire"; leftover=1; fi
@@ -1243,7 +1247,7 @@ EOF
 # ============================================================
 HY_BIN="/usr/local/bin/hysteria"
 HY2_VERSION="2.14.0"
-HY_SERVICE="hysteria-server.service"
+HY_SERVICE="hysteria-server"
 HY_CONF="/etc/hysteria/config.yaml"
 HY_DIR="/etc/hysteria"
 HY_CERT_F="/etc/hysteria/server.crt"
@@ -1364,6 +1368,42 @@ _start_hy2_service(){
     fi
 }
 
+# 按内存自动调 Hy2 的 UDP 缓冲（QUIC 走 UDP，内核 TCP/BBR 参数管不到它；
+# rmem_max/wmem_max 只是上限、不预占内存，按内存 1/16 取，上限 25MB、下限 4MB；只升不降）
+_tune_hy2_udp(){
+    command -v sysctl >/dev/null 2>&1 || { warn "无 sysctl，跳过 UDP 缓冲调整"; return 0; }
+    local mem_kb target cur_rmem cur_wmem conf
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$mem_kb" && "$mem_kb" =~ ^[0-9]+$ ]]; then
+        target=$(( mem_kb / 16 * 1024 ))
+    else
+        target=16777216
+    fi
+    (( target > 26214400 )) && target=26214400
+    (( target < 4194304 )) && target=4194304
+    cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    cur_wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    if [[ "$cur_rmem" =~ ^[0-9]+$ && "$cur_wmem" =~ ^[0-9]+$ ]] && (( cur_rmem >= target && cur_wmem >= target )); then
+        info "UDP 缓冲已足够（rmem_max=${cur_rmem} wmem_max=${cur_wmem}），跳过调整"
+        return 0
+    fi
+    conf=/etc/sysctl.d/99-hy2-udp.conf
+    {
+        echo "# Hysteria2 UDP 缓冲（singbox_manager.sh 自动生成，按内存 1/16，上限 25MB）"
+        echo "net.core.rmem_max = $target"
+        echo "net.core.wmem_max = $target"
+    } > "$conf" || { warn "UDP 缓冲配置文件写入失败（$conf），跳过调整"; return 0; }
+    sysctl -w net.core.rmem_max="$target" >/dev/null 2>&1
+    sysctl -w net.core.wmem_max="$target" >/dev/null 2>&1
+    cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    cur_wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    if [[ "$cur_rmem" =~ ^[0-9]+$ && "$cur_wmem" =~ ^[0-9]+$ ]] && (( cur_rmem >= target && cur_wmem >= target )); then
+        info "UDP 缓冲已调到 $(( target / 1024 / 1024 ))MB（rmem_max/wmem_max，上限非预占）"
+    else
+        warn "UDP 缓冲已写入 $conf（重启生效），立即生效未成功（当前 ${cur_rmem}/${cur_wmem}），重启后生效"
+    fi
+}
+
 init_hy2() {
     title "配置 Hysteria2（独立官方 hysteria,BBR不限速）"
 
@@ -1451,6 +1491,7 @@ EOF2
     chmod 600 "$META_HY2" "$HY_CONF"
 
     install_hysteria || return 1
+    _tune_hy2_udp
     _setup_hy2_service || return 1
     _start_hy2_service || return 1
     info "HY2 ${PORT} ${HOP_RANGE}"
@@ -2704,7 +2745,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.9${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.11${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
