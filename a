@@ -2,7 +2,9 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.7
+# VLESS 智能节点控制台 (sing-box) v2.0.9
+# 更新: v2.0.9 卸载补缺口：删 Hy2 日志 /var/log/hysteria-server.log(.err)，残留自检清单补全（hysteria.bak/.new、logrotate、/var/lib/sbox、sbox-expire 日志）；
+# 更新: v2.0.8 Hy2 按官网最新写法重做：端口二选一（单端口/端口段），删 masquerade，认证/混淆密码分开，链接跳端口进地址、mport 删、pinSHA256 替 insecure，YAML+链接双格式输出，版本固定 2.14.0；
 # 更新: v2.0.7 菜单 10 只显示固定密码节点（SS / Hy2 / AnyTLS），删掉 Reality 与 WS 两段（VLESS/WS 按用户有到期，链接走菜单 9）；
 # 更新: v2.0.6 用户列表加编号，删除/禁用/启用/续期/查链接可输编号；normalize 去 BOM 与名字空白；
 # 更新: v2.0.5 修复首页颜色码原样打印（menu_row 先把字面 \033 换成真 ESC）；
@@ -682,7 +684,9 @@ install_sbox() {
 }
 
 # ============================================================
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.7 生成的内容）
+# v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
+# v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.9 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -727,6 +731,7 @@ uninstall_sbox() {
     rm -f /etc/logrotate.d/sbox-expire
     rm -f /var/log/sbox-expire.log /var/log/sbox-expire.log.*
     rm -f /var/log/sing-box.log /var/log/sing-box.err
+    rm -f /var/log/hysteria-server.log /var/log/hysteria-server.err
     rm -rf /var/lib/sbox
     # 6. 删脚本生成的其他文件
     rm -rf /var/www/masq
@@ -745,7 +750,7 @@ uninstall_sbox() {
     echo ""
     echo "残留自检："
     local leftover=0
-    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/init.d/sing-box /etc/init.d/hysteria-server /var/www/masq /var/log/sing-box.log; do
+    for f in /usr/local/bin/sing-box /usr/bin/sing-box /usr/local/bin/hysteria /usr/local/bin/hysteria.bak /usr/local/bin/hysteria.new /usr/local/bin/singbox_manager.sh /usr/local/bin/c /etc/sing-box /etc/hysteria /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria-server.service /etc/init.d/sing-box /etc/init.d/hysteria-server /etc/logrotate.d/sbox-expire /var/lib/sbox /var/www/masq /var/log/sing-box.log /var/log/sing-box.err /var/log/sbox-expire.log /var/log/hysteria-server.log /var/log/hysteria-server.err; do
         if [[ -e "$f" ]]; then echo "  残留: $f"; leftover=1; fi
     done
     if crontab -l 2>/dev/null | grep -q "check-expire"; then echo "  残留: cron check-expire"; leftover=1; fi
@@ -1237,6 +1242,7 @@ EOF
 # Hysteria2（独立官方 hysteria server v2.12.x，二次重构成独立服务体系，不走 sing-box）
 # ============================================================
 HY_BIN="/usr/local/bin/hysteria"
+HY2_VERSION="2.14.0"
 HY_SERVICE="hysteria-server.service"
 HY_CONF="/etc/hysteria/config.yaml"
 HY_DIR="/etc/hysteria"
@@ -1257,25 +1263,30 @@ detect_hyst_arch(){
 
 hy_installed_ver(){
     [[ -x "$HY_BIN" ]] || return 1
-    "$HY_BIN" version 2>/dev/null | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
+    "$HY_BIN" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'
 }
 install_hysteria(){
     title "安装官方 Hysteria"
     if ! command -v curl >/dev/null 2>&1; then
         if [[ "$OS_TYPE" == "alpine" ]]; then apk add --no-cache curl >/dev/null 2>&1; else apt-get install -y -qq curl >/dev/null 2>&1; fi
     fi
-    if [[ -x "$HY_BIN" ]]; then
-        info "已安装 Hysteria: $(hy_installed_ver || echo 未知)"
+    local CUR_VER
+    CUR_VER=$(hy_installed_ver 2>/dev/null || echo "")
+    if [[ "$CUR_VER" == "$HY2_VERSION" ]]; then
+        info "已安装 Hysteria: $CUR_VER"
         return 0
     fi
+    [[ -n "$CUR_VER" ]] && info "Hysteria 将从 ${CUR_VER} 升级到 ${HY2_VERSION}"
     local FN DOWNLOAD
     FN=$(detect_hyst_arch) || { error "不支持的架构: $(uname -m)"; return 1; }
-    DOWNLOAD="https://download.hysteria.network/app/latest/${FN}"
+    DOWNLOAD="https://github.com/apernet/hysteria/releases/download/app/v${HY2_VERSION}/${FN}"
     info "下载: ${DOWNLOAD}"
     curl -fsSL --max-time 120 "$DOWNLOAD" -o "$HY_BIN" || { error "下载失败"; return 1; }
     chmod +x "$HY_BIN"
     [[ -x "$HY_BIN" ]] || { error "安装失败"; return 1; }
-    info "hysteria 安装成功: $("$HY_BIN" version | head -1)"
+    CUR_VER=$(hy_installed_ver 2>/dev/null || echo "")
+    [[ "$CUR_VER" == "$HY2_VERSION" ]] || { error "安装后版本不符（期望 ${HY2_VERSION}，实际 ${CUR_VER:-未知}）"; return 1; }
+    info "hysteria 安装成功: v${CUR_VER}"
 }
 
 _gen_hy2_cert(){
@@ -1362,76 +1373,78 @@ init_hy2() {
         [[ "$C" != "y" && "$C" != "Y" ]] && warn "已取消" && return
     fi
 
-    local PORT SNI PASS HOP_ASK HOP_RANGE HOP_START HOP_END
-    read -rp "监听端口 [默认 443]: " PORT
-    PORT=${PORT:-443}
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-        error "端口必须是 1-65535"; return 1
+    local PORT SNI PASS_AUTH PASS_OBFS HOP_RANGE HOP_START HOP_END PORT_MODE RANGE_IN FINGERPRINT
+    echo "选择端口模式："
+    echo "  1. 单个端口（默认 443，自己填）"
+    echo "  2. 端口段（自己写，如 2000-3000）"
+    read -rp "选择 [1/2，默认1]: " PORT_MODE
+    PORT_MODE=${PORT_MODE:-1}
+    HOP_RANGE=""
+    if [[ "$PORT_MODE" == "2" ]]; then
+        read -rp "端口段 [如 2000-3000]: " RANGE_IN
+        if ! [[ "$RANGE_IN" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            error "端口段格式必须是 起始-结束，如 2000-3000"; return 1
+        fi
+        HOP_START="${BASH_REMATCH[1]}"; HOP_END="${BASH_REMATCH[2]}"
+        if (( HOP_START < 1 || HOP_END > 65535 || HOP_START >= HOP_END )); then
+            error "端口段无效（需 1 <= 起始 < 结束 <= 65535）"; return 1
+        fi
+        PORT=$HOP_START
+        HOP_RANGE="${HOP_START}-${HOP_END}"
+        check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
+        check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
+        info "Port-hop range ${HOP_RANGE}"
+    else
+        read -rp "监听端口 [默认 443]: " PORT
+        PORT=${PORT:-443}
+        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+            error "端口必须是 1-65535"; return 1
+        fi
+        check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
+        check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
     fi
-    check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
-    check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
 
     read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
     SNI=${SNI:-www.bing.com}
 
-
-    HOP_RANGE=""
-    read -rp "Enable UDP port hopping [y/N]: " HOP_ASK
-    if [[ "$HOP_ASK" == "y" || "$HOP_ASK" == "Y" ]]; then
-        HOP_START=$((RANDOM % 40000 + 10000))
-        HOP_END=$((HOP_START + 999))
-        # 跳端口范围不能撞主端口，也不能超出 65535
-        if (( HOP_START <= PORT && PORT <= HOP_END )) || (( HOP_END > 65535 )); then
-            HOP_START=$(( (PORT + 1000) % 40000 + 10000 ))
-            (( HOP_START <= PORT && PORT <= HOP_START + 999 )) && HOP_START=$(( (PORT + 5000) % 40000 + 10000 ))
-            HOP_END=$((HOP_START + 999))
-        fi
-        HOP_RANGE="${HOP_START}-${HOP_END}"
-        info "Port-hop range ${HOP_START}-${HOP_END}"
-    fi
-
-    PASS=$(openssl rand -hex 16)
-    [[ -n "$PASS" ]] || { error "密码生成失败"; return 1; }
+    PASS_AUTH=$(openssl rand -hex 16)
+    PASS_OBFS=$(openssl rand -hex 16)
+    [[ -n "$PASS_AUTH" && -n "$PASS_OBFS" ]] || { error "密码生成失败"; return 1; }
 
     if ! command -v openssl >/dev/null 2>&1; then
         if [[ "$OS_TYPE" == "alpine" ]]; then apk add --no-cache openssl >/dev/null 2>&1; else apt-get install -y -qq openssl >/dev/null 2>&1; fi
     fi
     _gen_hy2_cert "$SNI" || return 1
+    FINGERPRINT=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CERT_F" 2>/dev/null | sed 's/.*=//; s/://g')
+    [[ -n "$FINGERPRINT" ]] || { error "证书指纹获取失败"; return 1; }
 
     mkdir -p "$HY_DIR"
     local LISTEN_VALUE=":${PORT}"
-    [[ -n "$HOP_RANGE" ]] && LISTEN_VALUE=":${PORT},${HOP_RANGE}"
+    [[ -n "$HOP_RANGE" ]] && LISTEN_VALUE=":${HOP_RANGE}"
     cat > "$HY_CONF" <<'EOF'
 listen: :443
 obfs:
   type: salamander
   salamander:
     password: OBFSPASS
-ignoreClientBandwidth: false
-congestion:
-  type: bbr
 auth:
   type: password
   password: AUTH_PASSWORD
-masquerade:
-  type: proxy
-  proxy:
-    url: https://news.ycombinator.com/
-    rewriteHost: true
-
 tls:
   cert: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
 EOF
-    sed -i "s|OBFSPASS|${PASS}|g" "$HY_CONF"
-    sed -i "s|AUTH_PASSWORD|${PASS}|g" "$HY_CONF"
+    sed -i "s|OBFSPASS|${PASS_OBFS}|g" "$HY_CONF"
+    sed -i "s|AUTH_PASSWORD|${PASS_AUTH}|g" "$HY_CONF"
     sed -i "s|listen: :443|listen: ${LISTEN_VALUE}|g" "$HY_CONF"
 
     cat > "$META_HY2" <<EOF2
 HY2_PORT=${PORT}
 HY2_SNI=${SNI}
-HY2_PASSWORD=${PASS}
+HY2_PASSWORD=${PASS_AUTH}
+HY2_OBFS_PASSWORD=${PASS_OBFS}
 HY2_PORT_RANGE=${HOP_RANGE}
+HY2_FINGERPRINT=${FINGERPRINT}
 HY2_CERT=${HY_CERT_F}
 HY2_KEY=${HY_KEY_F}
 EOF2
@@ -1440,7 +1453,7 @@ EOF2
     install_hysteria || return 1
     _setup_hy2_service || return 1
     _start_hy2_service || return 1
-    info "HY2 BBR不限速 ${PORT} ${HOP_RANGE}"
+    info "HY2 ${PORT} ${HOP_RANGE}"
     _print_hy2_link
 }
 
@@ -1460,30 +1473,69 @@ remove_hy2() {
 }
 
 hy2_share_link() {
-    local SERVER=$1 PORT=$2 PASS=$3 SNI=$4 RANGE=${5:-}
+    local SERVER=$1 PORT=$2 AUTH=$3 SNI=$4 OBFS=$5 FP=$6 PORTS=${7:-$2}
     local HOST="$SERVER"
     [[ "$HOST" == *:* && "$HOST" != \[*\] ]] && HOST="[${HOST}]"
-    local QUERY="sni=${SNI}&insecure=1&obfs=salamander&obfs-password=${PASS}"
-    [[ -n "$RANGE" ]] && QUERY="${QUERY}&mport=${RANGE}"
-    printf 'hy2://%s@%s:%s/?%s#Hysteria2-%s\n' "$PASS" "$HOST" "$PORT" "$QUERY" "$PORT"
+    printf 'hy2://%s@%s:%s/?sni=%s&obfs=salamander&obfs-password=%s&pinSHA256=%s#Hysteria2-%s\n' "$AUTH" "$HOST" "$PORTS" "$SNI" "$OBFS" "$FP" "$PORT"
+}
+
+# 取 Hy2 证书指纹：优先读 meta（新版安装时写入），老 meta 没有时现算
+_hy2_fingerprint() {
+    local FP
+    FP=$(read_kv "$META_HY2" HY2_FINGERPRINT 2>/dev/null)
+    if [[ -z "$FP" && -s "$HY_CERT_F" ]]; then
+        FP=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CERT_F" 2>/dev/null | sed 's/.*=//; s/://g')
+    fi
+    printf '%s' "$FP"
+}
+
+# 取 Hy2 混淆密码：老 meta 没有独立混淆密码时，回退到认证密码（老版两者相同）
+_hy2_obfs_password() {
+    local OBFS
+    OBFS=$(read_kv "$META_HY2" HY2_OBFS_PASSWORD 2>/dev/null)
+    [[ -z "$OBFS" ]] && OBFS=$(read_kv "$META_HY2" HY2_PASSWORD 2>/dev/null)
+    printf '%s' "$OBFS"
+}
+
+# 打印 Hy2 的 Mihomo YAML（proxies: 块）：$1=服务器地址 $2=端口 $3=认证密码 $4=SNI $5=混淆密码 $6=指纹 $7=端口段（可空）
+_print_hy2_yaml() {
+    local SERVER=$1 PORT=$2 AUTH=$3 SNI=$4 OBFS=$5 FP=$6 RANGE=${7:-}
+    echo "YAML 配置（粘到 Mihomo 配置的 proxies: 下面）:"
+    echo "proxies:"
+    echo "  - name: \"Hysteria2-${PORT}\""
+    echo "    type: hysteria2"
+    echo "    server: ${SERVER}"
+    echo "    port: ${PORT}"
+    echo "    password: \"${AUTH}\""
+    echo "    sni: ${SNI}"
+    echo "    skip-cert-verify: false"
+    echo "    fingerprint: \"${FP}\""
+    echo "    obfs: salamander"
+    echo "    obfs-password: \"${OBFS}\""
+    echo "    hop-interval: 30"
+    [[ -n "$RANGE" ]] && echo "    ports: \"${RANGE}\""
 }
 
 _print_hy2_link() {
     has_hy2 || return 1
-    local PORT PASS SNI SERVER_IP RANGE
+    local PORT PASS SNI SERVER_IP RANGE OBFS FP PORTS
     PORT=$(read_kv "$META_HY2" HY2_PORT); PASS=$(read_kv "$META_HY2" HY2_PASSWORD)
     SNI=$(read_kv "$META_HY2" HY2_SNI); SERVER_IP=$(get_public_ip); RANGE=$(read_kv "$META_HY2" HY2_PORT_RANGE)
+    OBFS=$(_hy2_obfs_password); FP=$(_hy2_fingerprint)
+    PORTS="${RANGE:-$PORT}"
     echo ""
     echo -e "${GREEN}===== Hysteria2 信息 =====${NC}"
     echo -e "地址   : ${SERVER_IP}"
     echo -e "端口   : ${PORT} (UDP)"
     echo -e "密码   : ${PASS}"
+    echo -e "混淆密码: ${OBFS}"
     echo -e "SNI    : ${SNI}"
-    echo -e "证书   : 自签名，客户端需 insecure=1"
-    echo -e "混淆   : Salamander（密码同值）"
+    echo -e "证书   : 自签名，客户端校验指纹 pinSHA256"
+    echo -e "混淆   : Salamander"
     echo -e "Hop: ${RANGE:-none} (Clash ports)"
+    _print_hy2_yaml "$SERVER_IP" "$PORT" "$PASS" "$SNI" "$OBFS" "$FP" "$RANGE"
     echo -e "${CYAN}分享链接:${NC}"
-    hy2_share_link "$SERVER_IP" "$PORT" "$PASS" "$SNI" "$RANGE"
+    hy2_share_link "$SERVER_IP" "$PORT" "$PASS" "$SNI" "$OBFS" "$FP" "$PORTS"
     echo ""
 }
 
@@ -2335,20 +2387,25 @@ show_info() {
     fi
 
     if has_hy2; then
-        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_PORT_RANGE_SHOW HY2_LINK_SHOW
+        local HY2_STATUS HY2_PORT_SHOW HY2_PASSWORD_SHOW HY2_SNI_SHOW HY2_PORT_RANGE_SHOW HY2_OBFS_SHOW HY2_FP_SHOW HY2_PORTS_SHOW HY2_LINK_SHOW
         HY2_STATUS="inactive"; svc_active "$HY_SERVICE" && HY2_STATUS="active"
         HY2_PORT_SHOW=$(read_kv "$META_HY2" "HY2_PORT")
         HY2_PASSWORD_SHOW=$(read_kv "$META_HY2" "HY2_PASSWORD")
         HY2_SNI_SHOW=$(read_kv "$META_HY2" "HY2_SNI")
         HY2_PORT_RANGE_SHOW=$(read_kv "$META_HY2" "HY2_PORT_RANGE")
-        HY2_LINK_SHOW=$(hy2_share_link "$PUBLIC_IP" "$HY2_PORT_SHOW" "$HY2_PASSWORD_SHOW" "$HY2_SNI_SHOW" "$HY2_PORT_RANGE_SHOW")
+        HY2_OBFS_SHOW=$(_hy2_obfs_password)
+        HY2_FP_SHOW=$(_hy2_fingerprint)
+        HY2_PORTS_SHOW="${HY2_PORT_RANGE_SHOW:-$HY2_PORT_SHOW}"
+        HY2_LINK_SHOW=$(hy2_share_link "$PUBLIC_IP" "$HY2_PORT_SHOW" "$HY2_PASSWORD_SHOW" "$HY2_SNI_SHOW" "$HY2_OBFS_SHOW" "$HY2_FP_SHOW" "$HY2_PORTS_SHOW")
         echo -e "${CYAN}── Hysteria2 节点 ──${NC}"
         echo -e "状态   : $( [[ "$HY2_STATUS" == "active" ]] && echo -e "${GREEN}运行中${NC}" || echo -e "${RED}已停止${NC}" )"
         echo -e "地址   : ${PUBLIC_IP}"
         echo -e "端口   : ${HY2_PORT_SHOW} (UDP)"
         echo -e "密码   : ${HY2_PASSWORD_SHOW}"
+        echo -e "混淆密码: ${HY2_OBFS_SHOW}"
         echo -e "SNI    : ${HY2_SNI_SHOW}"
-        echo -e "协议   : Hysteria2（独立官方服务，自签名，客户端需 insecure=1）"
+        echo -e "协议   : Hysteria2（独立官方服务，自签名，客户端校验指纹 pinSHA256）"
+        _print_hy2_yaml "$PUBLIC_IP" "$HY2_PORT_SHOW" "$HY2_PASSWORD_SHOW" "$HY2_SNI_SHOW" "$HY2_OBFS_SHOW" "$HY2_FP_SHOW" "$HY2_PORT_RANGE_SHOW"
         echo -e "${CYAN}分享链接:${NC}"
         echo "$HY2_LINK_SHOW"
         echo ""
@@ -2647,7 +2704,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.7${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.9${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
