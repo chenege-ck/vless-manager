@@ -2,7 +2,8 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.6
+# VLESS 智能节点控制台 (sing-box) v2.0.7
+# 更新: v2.0.7 菜单 10 只显示固定密码节点（SS / Hy2 / AnyTLS），删掉 Reality 与 WS 两段（VLESS/WS 按用户有到期，链接走菜单 9）；
 # 更新: v2.0.6 用户列表加编号，删除/禁用/启用/续期/查链接可输编号；normalize 去 BOM 与名字空白；
 # 更新: v2.0.5 修复首页颜色码原样打印（menu_row 先把字面 \033 换成真 ESC）；
 # 更新: v2.0.4 首页加服务器状态（公网IP/负载/内存/交换/在线），菜单边框对齐重排；
@@ -681,7 +682,7 @@ install_sbox() {
 }
 
 # ============================================================
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.6 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.7 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -2306,37 +2307,6 @@ show_info() {
     echo -e "在线   : ${UPTIME_INFO:-N/A}"
     echo ""
 
-    if has_reality; then
-        local SHORTID
-        SHORTID=$(python3 -c "
-import json
-d=json.load(open('$SBOX_CONFIG', encoding='utf-8'))
-for i in d.get('inbounds',[]):
-    if i.get('tag')=='inbound-reality':
-        print(i['tls']['reality']['short_id'][0]); break
-" 2>/dev/null)
-        echo -e "${CYAN}── Reality 节点 ──${NC}"
-        echo -e "地址   : ${PUBLIC_IP}"
-        echo -e "端口   : ${REALITY_PORT}"
-        echo -e "公钥   : ${REALITY_PUBLIC_KEY}"
-        echo -e "SNI    : ${REALITY_SNI}"
-        echo -e "ShortID: ${SHORTID}"
-        echo -e "协议   : VLESS+Reality+TCP"
-        if [[ -f "$USER_DB" ]]; then
-            echo -e "${CYAN}分享链接:${NC}"
-            local RNAME RUUID REXP RSTATUS RNODE
-            while IFS=: read -r RNAME RUUID REXP RSTATUS RNODE RSSPASS _REST; do
-                [[ "$RSTATUS" != "active" ]] && continue
-                RNODE=${RNODE:-both}
-                [[ "$RNODE" != "reality" && "$RNODE" != "both" ]] && continue
-                local ENCODED_RNAME
-                ENCODED_RNAME=$(RNAME="$RNAME" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["RNAME"] + "-reality"))')
-                echo "[${RNAME}] vless://${RUUID}@${PUBLIC_HOST}:${REALITY_PORT}/?type=tcp&encryption=none&flow=xtls-rprx-vision&sni=${REALITY_SNI}&fp=chrome&security=reality&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORTID}#${ENCODED_RNAME}"
-            done < "$USER_DB"
-        fi
-        echo ""
-    fi
-
     if has_shadowsocks; then
         local SS_USERINFO_SHOW SS_LINK_SHOW
         SS_USERINFO_SHOW=$(printf '%s' "${SS_METHOD}:${SS_PASSWORD}" | b64_nw)
@@ -2361,15 +2331,6 @@ for i in d.get('inbounds',[]):
                 echo "[${SNAME}] ${SS_LK}"
             done < "$USER_DB"
         fi
-        echo ""
-    fi
-
-    if has_ws; then
-        echo -e "${CYAN}── WS+CF 节点 ──${NC}"
-        echo -e "域名   : ${WS_DOMAIN}"
-        echo -e "端口   : ${WS_CF_PORT:-443}"
-        echo -e "WS路径 : ${WS_PATH}"
-        echo -e "协议   : VLESS+WS+TLS"
         echo ""
     fi
 
@@ -2416,8 +2377,8 @@ for i in d.get('inbounds',[]):
         echo ""
     fi
 
-    if ! has_reality && ! has_shadowsocks && ! has_ws && ! has_hy2 && ! has_anytls; then
-        warn "尚未配置任何节点"
+    if ! has_shadowsocks && ! has_hy2 && ! has_anytls; then
+        warn "尚未配置固定密码节点（SS / Hy2 / AnyTLS）"
     fi
 }
 
@@ -2686,7 +2647,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.6${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.7${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
