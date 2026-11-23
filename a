@@ -2,22 +2,7 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.12
-# 更新: v2.0.12 AnyTLS 节点信息按模板出 sing-box 出站 JSON（tag 按 VLESS 的办法生成：AnyTLS-端口；端口/密码/SNI/公钥/short_id 填真实值）；
-# 更新: v2.0.11 修 Alpine 上 Hy2 启动失败：HY_SERVICE 去掉 .service 后缀（rc-service 只认裸名）；
-# 更新: v2.0.10 装 Hy2 时自动调 UDP 缓冲（按内存 1/16，上限 25MB、下限 4MB，只升不降；卸载时删 sysctl 文件）；
-# 更新: v2.0.9 卸载补缺口：删 Hy2 日志 /var/log/hysteria-server.log(.err)，残留自检清单补全（hysteria.bak/.new、logrotate、/var/lib/sbox、sbox-expire 日志）；
-# 更新: v2.0.8 Hy2 按官网最新写法重做：端口二选一（单端口/端口段），删 masquerade，认证/混淆密码分开，链接跳端口进地址、mport 删、pinSHA256 替 insecure，YAML+链接双格式输出，版本固定 2.14.0；
-# 更新: v2.0.7 菜单 10 只显示固定密码节点（SS / Hy2 / AnyTLS），删掉 Reality 与 WS 两段（VLESS/WS 按用户有到期，链接走菜单 9）；
-# 更新: v2.0.6 用户列表加编号，删除/禁用/启用/续期/查链接可输编号；normalize 去 BOM 与名字空白；
-# 更新: v2.0.5 修复首页颜色码原样打印（menu_row 先把字面 \033 换成真 ESC）；
-# 更新: v2.0.4 首页加服务器状态（公网IP/负载/内存/交换/在线），菜单边框对齐重排；
-# 更新: v2.0.3 修复 VLESS/WS 到期控制：注入时跳过已到期用户、Debian 下自动安装并启动 cron；
-# 更新: v2.0.2 修复 IPv6 下分享链接、Reality 备注 URL 编码；
-# 更新: v2.0.1 删除菜单 11 更新 sing-box、菜单 13 更新 Hysteria；
-#   发现新版本请卸载后重装脚本（重装即拉取最新版），不再在脚本内原地更新
-# 更新: v2.0.0 (Debian 11/12/13 + Alpine 双支持；移除菜单 16 网络优化；
-#   服务控制/安装/时间/端口检查全部按系统分支；卸载改为真卸载)
+# VLESS 智能节点控制台 (sing-box) v2.0.13
 # 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a
 # Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
@@ -690,7 +675,7 @@ install_sbox() {
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
 # v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.12 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.13 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1106,8 +1091,16 @@ init_reality() {
     gen_keypair || return 1
 
     while true; do
-        read -rp "监听端口 [默认 8443]: " REALITY_PORT
-        REALITY_PORT=${REALITY_PORT:-8443}
+        local _PORT_IN
+        read -rp "监听端口 [默认 443，输入 Y 确认，或输入其他端口号]: " _PORT_IN
+        if [[ "$_PORT_IN" == "y" || "$_PORT_IN" == "Y" ]]; then
+            REALITY_PORT=443
+        elif [[ "$_PORT_IN" =~ ^[0-9]+$ ]]; then
+            REALITY_PORT="$_PORT_IN"
+        else
+            warn "请输入 Y 确认使用 443，或输入 1-65535 的端口号"
+            continue
+        fi
         [[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || { warn "端口必须是 1-65535"; continue; }
         check_port "$REALITY_PORT" && break || warn "端口 ${REALITY_PORT} 已被占用"
     done
@@ -1126,11 +1119,30 @@ REALITY_SHORTID=${REALITY_SHORTID}
 EOF
     chmod 600 "$META_REALITY"
 
+    # 首次搭建（users.db 为空）时自动创建用户【自己】，到期 999 天，免得再回菜单建用户
+    local _AUTO_USER=0 _AUTO_UUID="" _AUTO_EXPIRE="" _AUTO_NODE="reality"
+    if [[ ! -s "$USER_DB" ]]; then
+        has_ws && _AUTO_NODE="both"
+        _AUTO_UUID=$(cat /proc/sys/kernel/random/uuid)
+        _AUTO_EXPIRE=$(expire_noon_str 999)
+        if [[ -n "$_AUTO_UUID" && -n "$_AUTO_EXPIRE" ]]; then
+            mkdir -p "$SBOX_DIR"
+            echo "自己:${_AUTO_UUID}:${_AUTO_EXPIRE}:active:${_AUTO_NODE}:" >> "$USER_DB"
+            _AUTO_USER=1
+            info "已自动创建用户【自己】（到期 999 天）"
+        else
+            warn "自动创建用户【自己】失败，请到菜单 3 手动添加"
+        fi
+    fi
+
     rebuild_config || return 1
     _inject_all_users
     _start_sbox || return 1
     info "Reality 节点配置完成"
     info "公钥: ${PUBLIC_KEY}"
+    if [[ "$_AUTO_USER" -eq 1 ]]; then
+        _print_link "自己" "$_AUTO_UUID" "$_AUTO_EXPIRE" "$_AUTO_NODE" ""
+    fi
 }
 
 # ============================================================
@@ -2782,7 +2794,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.12${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.13${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
