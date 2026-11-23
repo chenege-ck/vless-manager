@@ -2,7 +2,7 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.13
+# VLESS 智能节点控制台 (sing-box) v2.0.14
 # 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a
 # Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
@@ -675,7 +675,7 @@ install_sbox() {
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
 # v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.13 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.14 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1741,9 +1741,9 @@ init_config() {
     echo ""
     echo -e "  ${GREEN}1.${NC} 配置 VLESS + Reality"
     echo -e "  ${GREEN}2.${NC} 配置 Shadowsocks"
-    echo -e "  ${GREEN}3.${NC} 配置 VLESS + WS + TLS"
+    echo -e "  ${GREEN}3.${NC} 配置 VLESS + WS + TLS ${YELLOW}（需域名 + CF 优选 IP）${NC}"
     echo -e "  ${GREEN}4.${NC} 配置 Hysteria2"
-    echo -e "  ${GREEN}5.${NC} 配置 AnyTLS"
+    echo -e "  ${GREEN}5.${NC} 配置 AnyTLS ${YELLOW}（需设备支持 sing-box 内核）${NC}"
     has_reality     && echo -e "  ${RED}10.${NC} 移除 Reality"
     has_shadowsocks && echo -e "  ${RED}11.${NC} 移除 Shadowsocks"
     has_ws          && echo -e "  ${RED}12.${NC} 移除 WS+CF"
@@ -2794,7 +2794,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.13${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.14${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
