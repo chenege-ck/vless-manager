@@ -2,7 +2,7 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.14
+# VLESS 智能节点控制台 (sing-box) v2.0.15
 # 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a
 # Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
@@ -675,7 +675,7 @@ install_sbox() {
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
 # v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.14 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.15 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1092,13 +1092,13 @@ init_reality() {
 
     while true; do
         local _PORT_IN
-        read -rp "监听端口 [默认 443，输入 Y 确认，或输入其他端口号]: " _PORT_IN
-        if [[ "$_PORT_IN" == "y" || "$_PORT_IN" == "Y" ]]; then
+        read -rp "监听端口 [默认 443，回车确认，或输入其他端口号]: " _PORT_IN
+        if [[ -z "$_PORT_IN" || "$_PORT_IN" == "y" || "$_PORT_IN" == "Y" ]]; then
             REALITY_PORT=443
         elif [[ "$_PORT_IN" =~ ^[0-9]+$ ]]; then
             REALITY_PORT="$_PORT_IN"
         else
-            warn "请输入 Y 确认使用 443，或输入 1-65535 的端口号"
+            warn "请直接回车或输入 Y 确认使用 443，或输入 1-65535 的端口号"
             continue
         fi
         [[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || { warn "端口必须是 1-65535"; continue; }
@@ -2794,7 +2794,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.14${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.15${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
@@ -2810,7 +2810,6 @@ main_menu() {
         menu_row "  ${CYAN}用户${NC} ${GREEN}${ACTIVE_COUNT}${NC} 活跃 / ${USER_COUNT} 总计"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         menu_row "  ${CYAN}▣ 节点中心${NC}"
-        menu_row "   ${GREEN}1.${NC}  安装 sing-box 并配置节点"
         menu_row "   ${GREEN}2.${NC}  添加 / 移除协议节点"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         menu_row "  ${CYAN}▣ 用户中心${NC}"
@@ -2828,7 +2827,6 @@ main_menu() {
         read -r OPT
 
         case $OPT in
-            1)  check_system; set_shanghai_timezone; install_sbox; init_config; setup_cron ;;
             2)  init_config; setup_cron ;;
             3)  add_user ;;
             4)  delete_user ;;
@@ -2852,6 +2850,35 @@ main_menu() {
 }
 
 # ============================================================
+# 首次运行简介（未装 sing-box 时才显示）：功能 + 警告，确认后直接安装并配置节点
+# ============================================================
+first_run_intro() {
+    echo ""
+    echo -e "${CYAN}◆ VLESS 智能节点控制台 (sing-box)  v2.0.15${NC}"
+    echo ""
+    echo "功能：VLESS Reality / Shadowsocks / VLESS+WS / Hysteria2 / AnyTLS，"
+    echo "      用户管理（到期 / 禁用 / 续期），一键卸载。"
+    echo ""
+    echo -e "${YELLOW}警告：仅支持 Debian 11/12/13 或 Alpine，需 root 运行；${NC}"
+    echo -e "${YELLOW}      安装会下载 sing-box，配置写入 /etc/sing-box。${NC}"
+    echo ""
+    local _C
+    read -rp "确认安装？[Y/n]: " _C
+    case "$_C" in
+        ""|y|Y) ;;
+        *) info "已取消，输入 c 可随时重进菜单。"; return 1 ;;
+    esac
+    check_system; set_shanghai_timezone
+    if ! install_sbox; then
+        error "sing-box 安装失败，检查网络后重新运行一键命令，或输入 c 重进菜单重试"
+        return 1
+    fi
+    init_config
+    setup_cron
+    return 0
+}
+
+# ============================================================
 # 脚本入口
 # ============================================================
 # 先把快捷命令 c 装上，保证无论后面发生什么，c 都可用。
@@ -2859,4 +2886,8 @@ main_menu() {
 install_shortcut
 cleanup_legacy
 normalize_user_db
+# 首次运行（未装 sing-box）：先简介 + 确认，装完直接进配置；已装则跳过简介直接进菜单
+if ! detect_sbox_bin; then
+    first_run_intro || exit 0
+fi
 main_menu
