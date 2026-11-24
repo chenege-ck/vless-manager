@@ -24,6 +24,4 @@ bash <(curl -sL https://raw.githubusercontent.com/chenege-ck/vless-manager/main/
 - VLESS 默认端口 443，回车或 Y 确认，也可直接输其他端口。
 - VLESS + WS 需域名 + CF 优选 IP；AnyTLS 需设备支持 sing-box 内核。
 
-## 版本
 
-当前版本 v2.0.15。
