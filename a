@@ -2,7 +2,7 @@
 # 强制 UTF-8：菜单按显示宽度对齐要按字符数（中文算 2 列），
 # POSIX locale 下 bash 按字节数会算错，边框对不齐
 export LC_ALL=C.UTF-8
-# VLESS 智能节点控制台 (sing-box) v2.0.15
+# VLESS 智能节点控制台 (sing-box) v2.0.17
 # 更新地址: https://raw.githubusercontent.com/chenege-ck/vless-manager/main/a
 # Reality + SS + WS + Hysteria2 + AnyTLS + 用户管理（到期日期）
 
@@ -28,7 +28,7 @@ SERVICE_NAME="sing-box"
 
 # ============== 默认端口 ==============
 SS_PORT_DEFAULT=8668
-HY2_PORT_DEFAULT=8999
+HY2_PORT_DEFAULT=443
 ANYTLS_PORT_DEFAULT=8585
 
 # ============== 工具函数 ==============
@@ -675,7 +675,7 @@ install_sbox() {
 # v2.0.8 Hy2 按官网最新写法重做（端口二选一、删 masquerade、双密码、pinSHA256、双格式输出、固定 2.14.0）
 # v2.0.9 卸载补缺口：删 Hy2 日志，残留自检清单补全
 # v2.0.10 装 Hy2 自动调 UDP 缓冲（卸载删 sysctl 文件）
-# 卸载 sing-box（真卸载：只针对本脚本 v2.0.15 生成的内容）
+# 卸载 sing-box（真卸载：只针对本脚本 v2.0.17 生成的内容）
 # 删：sing-box/hysteria 二进制、管理脚本+c、/etc/sing-box、/etc/hysteria、
 #     systemd/OpenRC 服务文件、cron 到期检查、logrotate、相关日志与临时文件、
 #     Debian deb 包（apt purge）、fix_apt 留下的 sources.list 备份（先从最新备份恢复源）
@@ -1444,7 +1444,6 @@ init_hy2() {
         fi
         PORT=$HOP_START
         HOP_RANGE="${HOP_START}-${HOP_END}"
-        check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
         check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
         info "Port-hop range ${HOP_RANGE}"
     else
@@ -1453,12 +1452,11 @@ init_hy2() {
         if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
             error "端口必须是 1-65535"; return 1
         fi
-        check_port "$PORT" || { error "端口 ${PORT} 已被占用"; return 1; }
         check_port_udp "$PORT" || { error "UDP 端口 ${PORT} 已被占用"; return 1; }
     fi
 
-    read -rp "伪装域名（SNI）[默认 www.bing.com]: " SNI
-    SNI=${SNI:-www.bing.com}
+    read -rp "伪装域名（SNI）[默认 www.swift.org]: " SNI
+    SNI=${SNI:-www.swift.org}
 
     PASS_AUTH=$(openssl rand -hex 16)
     PASS_OBFS=$(openssl rand -hex 16)
@@ -2594,7 +2592,7 @@ install_shortcut() {
 # 设置 cron 到期检查
 # ============================================================
 setup_cron() {
-    local EXPIRE_CMD="*/5 * * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
+    local EXPIRE_CMD="0 0 * * * /usr/local/bin/singbox_manager.sh --check-expire >> /var/log/sbox-expire.log 2>&1"
     # Debian：先保证 cron 装好、服务在跑，否则下面写 crontab 只是写了张永远没人执行的表
     if [[ "$OS_TYPE" != "alpine" ]]; then
         if ! command -v crontab >/dev/null 2>&1; then
@@ -2624,7 +2622,7 @@ setup_cron() {
         error "crontab 校验失败，未找到 check-expire，到期检查未设置"
         return 1
     fi
-    info "已设置每 5 分钟自动检查到期用户"
+    info "已设置每天 24 时自动检查到期用户"
     if [[ "$OS_TYPE" == "alpine" ]]; then
         rc-service crond start >/dev/null 2>&1
         rc-update add crond default >/dev/null 2>&1
@@ -2794,7 +2792,7 @@ main_menu() {
         get_server_status
 
         echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.15${NC}"
+        menu_row "  ${CYAN}◆ 智能节点控制台 (sing-box)  v2.0.17${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════════╣${NC}"
         if (( ${#STATUS_IP} > 34 )); then
             menu_row "  ${CYAN}公网IP${NC}"
@@ -2854,7 +2852,7 @@ main_menu() {
 # ============================================================
 first_run_intro() {
     echo ""
-    echo -e "${CYAN}◆ VLESS 智能节点控制台 (sing-box)  v2.0.15${NC}"
+    echo -e "${CYAN}◆ VLESS 智能节点控制台 (sing-box)  v2.0.17${NC}"
     echo ""
     echo "功能：VLESS Reality / Shadowsocks / VLESS+WS / Hysteria2 / AnyTLS，"
     echo "      用户管理（到期 / 禁用 / 续期），一键卸载。"
